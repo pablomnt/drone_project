@@ -1,0 +1,3 @@
+[submodule "okvis2"]
+	path = okvis2
+	url = https://github.com/pablomnt/okvis2.git
