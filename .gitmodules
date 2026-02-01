@@ -1,3 +1,6 @@
 [submodule "okvis2"]
 	path = okvis2
 	url = https://github.com/pablomnt/okvis2.git
+[submodule "px4_msgs"]
+	path = px4_msgs
+	url = https://github.com/pablomnt/px4_msgs.git
