@@ -11,7 +11,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Joy
-from px4_msgs.msg import ManualControlSetpoint, VehicleCommand, VehicleStatus, VehicleRatesSetpoint, OffboardControlMode, TrajectorySetpoint, VehicleOdometry
+from px4_msgs.msg import ManualControlSetpoint, VehicleCommand, VehicleStatus, OffboardControlMode, TrajectorySetpoint, VehicleOdometry
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.time import Time
 import math
@@ -75,22 +75,7 @@ class CmdVelToManualControl(Node):
             px4_qos
         )
         
-        
-        # Publicador al topic ManualControlSetpoint
-        self.manual_control_pub = self.create_publisher(
-            ManualControlSetpoint,
-            '/fmu/in/manual_control_input', # input para sim (v1.16.0), setpoint para dron (1.14.4)
-            px4_qos
-        )
-        
-        # Publicador al topic VehicleRatesSetpoint
-        self.vehicle_rates_pub = self.create_publisher(
-            VehicleRatesSetpoint,
-            '/fmu/in/vehicle_rates_setpoint',
-            px4_qos
-        )
-        
-        # Publicador al topic VehicleCommand, utilizado para armar
+        # Publicador al topic VehicleCommand, utilizado para armar o activar modo offboard desde el script (no se hace en este caso)
         self.vehicle_command_publisher = self.create_publisher(
             VehicleCommand, 
             '/fmu/in/vehicle_command', 
@@ -144,18 +129,6 @@ class CmdVelToManualControl(Node):
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=0.0)
         self.get_logger().info('Disarm command sent')
 
-    def takeoff(self):
-        """Send a takeoff command to the vehicle."""
-        self.publish_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_NAV_TAKEOFF, param7=10.0)
-        self.get_logger().info('Takeoff command sent')
-
-    def engage_stabilized_mode(self):
-        """Switch to stabilized mode."""
-        self.publish_vehicle_command(
-            VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=7.0)
-        self.get_logger().info("Switching to stabilized mode")
-
     def engage_offboard_mode(self):
         """Switch to offboard mode."""
         self.publish_vehicle_command(
@@ -171,19 +144,6 @@ class CmdVelToManualControl(Node):
                 self.arm()
             elif(self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED):
                 self.disarm()
-
-        # if self.joy_input.buttons[8] == 1 and self.last_buttons[8] == 0:  # Boton share para takeoff
-            # self.takeoff()
-        
-        # if self.joy_input.buttons[3] == 1 and self.last_buttons[3] == 0:  # Cuadrado para stabilized mode
-            # self.engage_stabilized_mode()
-
-        
-        # if self.joy_input.buttons[1] == 1 and self.last_buttons[1] == 0:  # Circulo para offboard mode
-            # self.engage_offboard_mode()
-
-        # if self.joy_input.buttons[0] == 1 and self.last_buttons[0] == 0:  # X para publicar / no publicar comandos
-            # self.setpoint_publish = not self.setpoint_publish
         
         self.last_buttons = self.joy_input.buttons
 
