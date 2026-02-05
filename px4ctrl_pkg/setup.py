@@ -23,7 +23,8 @@ setup(
         'console_scripts': [
             "py_node = px4ctrl_pkg.py_node:main",
             "quad_py_node = px4ctrl_pkg.quad_py_node:main",
-            "quad_velocity_py_node = px4ctrl_pkg.quad_velocity_py_node:main"
+            "quad_velocity_py_node = px4ctrl_pkg.quad_velocity_py_node:main",
+            "rates_control_node = px4ctrl_pkg.rates_control_node:main",
         ],
     },
 )
