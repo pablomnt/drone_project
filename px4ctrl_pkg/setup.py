@@ -25,6 +25,7 @@ setup(
             "quad_py_node = px4ctrl_pkg.quad_py_node:main",
             "quad_velocity_py_node = px4ctrl_pkg.quad_velocity_py_node:main",
             "rates_control_node = px4ctrl_pkg.rates_control_node:main",
+            "attitude_control_node = px4ctrl_pkg.attitude_control_node:main"
         ],
     },
 )

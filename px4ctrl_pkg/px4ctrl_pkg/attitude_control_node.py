@@ -8,13 +8,15 @@
 
 
 
+from numpy import NaN
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Joy
-from px4_msgs.msg import VehicleRatesSetpoint, VehicleCommand, VehicleStatus, OffboardControlMode, TrajectorySetpoint, VehicleOdometry
+from px4_msgs.msg import VehicleAttitude, VehicleAttitudeSetpoint, VehicleCommand, VehicleStatus, OffboardControlMode, TrajectorySetpoint, VehicleOdometry
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.time import Time
+from tf_transformations import quaternion_from_euler, euler_from_quaternion
 import math
 
 class CmdVelToManualControl(Node):
@@ -38,16 +40,20 @@ class CmdVelToManualControl(Node):
         self.offboard_msg.position = False
         self.offboard_msg.velocity = False
         self.offboard_msg.acceleration = False
-        self.offboard_msg.attitude = False
-        self.offboard_msg.body_rate = True
+        self.offboard_msg.attitude = True
+        self.offboard_msg.body_rate = False
 
         # VehicleRatesSetpoint msg
-        self.rates_sp_msg = VehicleRatesSetpoint()
-        self.rates_sp_msg.roll = 0.0
-        self.rates_sp_msg.pitch = 0.0
-        self.rates_sp_msg.yaw = 0.0
-        self.rates_sp_msg.thrust_body = [0.0, 0.0, 0.0] # This is in FRD, not NED, even though it says NED in the documentation
-        self.rates_sp_msg.reset_integral = False
+        self.attitude_sp_msg = VehicleAttitudeSetpoint()
+        self.attitude_sp_msg.yaw_sp_move_rate = 0.0
+        self.attitude_sp_msg.q_d = [0.0, 0.0, 0.0, 1.0] # Identity quaternion
+        self.attitude_sp_msg.thrust_body = [0.0, 0.0, 0.0] 
+        self.desired_roll = 0.0
+        self.desired_pitch = 0.0
+
+        self.px4_yaw = 0.0
+        self.px4_roll = 0.0
+        self.px4_pitch = 0.0
 
         # Suscribirse al topic /joy
         self.joy_sub = self.create_subscription(
@@ -64,6 +70,12 @@ class CmdVelToManualControl(Node):
             px4_qos
         )
 
+        self.vehicle_attitude_sub = self.create_subscription(
+            VehicleAttitude,
+            '/fmu/out/vehicle_attitude',
+            self.vehicle_attitude_callback,
+            px4_qos
+        )
 
         self.yaw = 0.0
         self.create_subscription(
@@ -84,15 +96,15 @@ class CmdVelToManualControl(Node):
             '/fmu/in/offboard_control_mode', 
             px4_qos)
         
-        self.rates_sp_pub = self.create_publisher(
-            VehicleRatesSetpoint,
-            '/fmu/in/vehicle_rates_setpoint',
+        self.attitude_sp_pub = self.create_publisher(
+            VehicleAttitudeSetpoint,
+            '/fmu/in/vehicle_attitude_setpoint',
             px4_qos)
 
         
         # Temporizador para publicar mensajes continuamente a 166 Hz (cada 0.006 segundos)
-        self.timer = self.create_timer(0.006, self.publish_rates_setpoint)
-        self.get_logger().info("Nodo rates_control_node iniciado.")
+        self.timer = self.create_timer(0.006, self.publish_attitude_setpoint)
+        self.get_logger().info("Nodo attitude_control_node iniciado.")
 
     def publish_vehicle_command(self, command, **params) -> None:
             """Publish a vehicle command."""
@@ -159,31 +171,42 @@ class CmdVelToManualControl(Node):
         cosy_cosp = 1.0 - 2.0 * (y*y + z*z)
         self.yaw = math.atan2(siny_cosp, cosy_cosp)
 
-    def publish_rates_setpoint(self):
+    def vehicle_attitude_callback(self, msg):
+        self.q_px4 = msg.q
+        self.px4_roll, self.px4_pitch, self.px4_yaw = euler_from_quaternion([self.q_px4[1], self.q_px4[2], self.q_px4[3], self.q_px4[0]])
+        self.get_logger().info(f"Yaw: {self.px4_yaw}")
+    def publish_attitude_setpoint(self):
         # Always publish offboard control mode (optional low-rate)
         self.offboard_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.offboard_pub.publish(self.offboard_msg)
+        
 
-        # Map joystick to rates setpoint
+        # Map joystick to attitude setpoint (NED)
         if self.joy_input is not None:
-            roll_scale = 2.0  # rad/s per joystick unit
-            pitch_scale = 2.0
+            roll_scale = 0.5  # rad/s per joystick unit
+            pitch_scale = 0.5
             yaw_scale = 2.0
             thrust_scale = 1.0  # 0 to 1 range
 
-            self.rates_sp_msg.roll = -self.joy_input.axes[3] * roll_scale    # roll
-            self.rates_sp_msg.pitch = -self.joy_input.axes[4] * pitch_scale  # pitch
-            self.rates_sp_msg.yaw = -self.joy_input.axes[0] * yaw_scale      # yaw
+            self.desired_roll_angle = - self.joy_input.axes[3] * roll_scale    # roll
+            self.desired_pitch_angle = - self.joy_input.axes[4] * pitch_scale   # pitch
+            self.desired_yaw_angle = - self.joy_input.axes[0] * yaw_scale + self.px4_yaw    # yaw
+
+            
+
+
+            q = quaternion_from_euler(self.desired_roll_angle, self.desired_pitch_angle, self.desired_yaw_angle)
+            q_px4 = [float(q[3]), float(q[0]), float(q[1]), float(q[2])]
+            self.attitude_sp_msg.q_d = q_px4
             # throttle (-1 is max throttle, 0 is no throttle)
             thrust = - self.joy_input.axes[1] * thrust_scale
             # clip thrust to [-1.0, 0.0]
             thrust = max(-1.0, min(0.0, thrust))
-            self.rates_sp_msg.thrust_body[2] = thrust
+            self.attitude_sp_msg.thrust_body[2] = thrust
 
-        # Publish rates setpoint
-        self.rates_sp_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        # if self.setpoint_publish:
-        self.rates_sp_pub.publish(self.rates_sp_msg)
+        # Publish attitude setpoint
+        self.attitude_sp_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        self.attitude_sp_pub.publish(self.attitude_sp_msg)
 
     
 def main(args=None):
