@@ -11,7 +11,6 @@
 from numpy import NaN
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Joy
 from px4_msgs.msg import VehicleAttitude, VehicleAttitudeSetpoint, VehicleCommand, VehicleStatus, OffboardControlMode, TrajectorySetpoint, VehicleOdometry
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
