@@ -13,7 +13,7 @@ PositionControl::PositionControl() {
     _lim_vel_horz = 10.0;
     _lim_vel_up = 2.0;
     _lim_vel_down = 1.0;
-    _lim_tilt = 0.7; // ~45 degrees
+    _lim_tilt = 0.43; // ~25 degrees
     _hover_thrust = 0.5;
 }
 
@@ -103,22 +103,19 @@ void PositionControl::_velocityControl(double dt) {
 // ---------------------------------------------------------
 void PositionControl::_accelerationControl() {
     // 1. Add Gravity Compensation
-    // PX4: z_specific_force = -CONSTANTS_ONE_G + _acc_sp(2);
-    // In ROS (ENU), Gravity is -9.8, so we need to push UP (+9.8).
-    Eigen::Vector3d body_z = _acc_sp + Eigen::Vector3d(0, 0, 9.81);
+    // In ROS (ENU), Gravity is -9.8, so we need to push UP (+9.81).
+    Eigen::Vector3d thrust_vector = _acc_sp + Eigen::Vector3d(0, 0, 9.81);
 
     // 2. Calculate Thrust (Magnitude)
-    // Normalize: If we need 9.81 m/s^2, that is 1G, which equals 'hover_thrust'.
-    // Formula: thrust_output = (accel_needed / 9.81) * hover_thrust
-    double accel_norm = body_z.norm();
-    double thrust = (accel_norm / 9.81) * _hover_thrust;
+    double accel_norm = thrust_vector.norm();
+    _thrust_sp = (accel_norm / 9.81) * _hover_thrust;
     
     // Clamp thrust [0, 1]
-    thrust = std::clamp(thrust, 0.0, 1.0);
+    _thrust_sp = std::clamp(_thrust_sp, 0.0, 1.0);
 
     // 3. Calculate Orientation (Quaternion)
     // We want the drone's Z-axis to align with our desired acceleration vector.
-    body_z.normalize();
+    Eigen::Vector3d body_z = thrust_vector.normalized();
 
     // Desired Yaw direction
     Eigen::Vector3d y_C(-std::sin(_yaw_sp), std::cos(_yaw_sp), 0.0);
@@ -137,32 +134,18 @@ void PositionControl::_accelerationControl() {
     rot.col(1) = body_y;
     rot.col(2) = body_z;
 
-    _acc_sp = body_z; // Storing direction for debug
-    
-    // Save outputs
-    // We store these in member vars or getters. For now, we assume getters pull from here.
+    // SAVE THE OUTPUTS TO MEMBER VARIABLES
+    _attitude_sp = Eigen::Quaterniond(rot);
 }
 
 Eigen::Quaterniond PositionControl::getAttitudeSetpoint() {
-    // Re-calculate rotation from current _acc_sp to ensure sync
-    // (In a real optimized class, we would store the Quat in _accelerationControl)
-    Eigen::Vector3d body_z = _acc_sp + Eigen::Vector3d(0, 0, 9.81);
-    body_z.normalize();
-    Eigen::Vector3d y_C(-std::sin(_yaw_sp), std::cos(_yaw_sp), 0.0);
-    Eigen::Vector3d body_x = y_C.cross(body_z);
-    if (body_x.norm() < 0.0001) body_x << std::cos(_yaw_sp), std::sin(_yaw_sp), 0.0;
-    body_x.normalize();
-    Eigen::Vector3d body_y = body_z.cross(body_x);
-    Eigen::Matrix3d rot;
-    rot.col(0) = body_x; rot.col(1) = body_y; rot.col(2) = body_z;
-    return Eigen::Quaterniond(rot);
+    // Just return the pre-calculated value!
+    return _attitude_sp;
 }
 
 double PositionControl::getThrustSetpoint() {
-    Eigen::Vector3d body_z = _acc_sp + Eigen::Vector3d(0, 0, 9.81);
-    double accel_norm = body_z.norm();
-    double thrust = (accel_norm / 9.81) * _hover_thrust;
-    return std::clamp(thrust, 0.0, 1.0);
+    // Just return the pre-calculated value!
+    return _thrust_sp;
 }
 
 Eigen::Vector2d PositionControl::_constrainXY(const Eigen::Vector2d& v0, double max) {

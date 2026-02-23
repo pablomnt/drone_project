@@ -73,6 +73,9 @@ private:
     // -- Internal Targets (Calculated by the controller) --
     Eigen::Vector3d _vel_sp;  // Target Velocity (Calculated by Position Loop)
     Eigen::Vector3d _acc_sp;  // Target Acceleration (Calculated by Velocity Loop)
+
+    Eigen::Quaterniond _attitude_sp; // Final calculated orientation
+    double _thrust_sp;               // Final calculated thrust (0 to 1)
     
     // -- Integrator State --
     Eigen::Vector3d _vel_int; // Stores the accumulated error for I-term

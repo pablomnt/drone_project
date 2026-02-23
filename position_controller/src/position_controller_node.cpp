@@ -32,7 +32,11 @@ public:
         this->declare_parameter("MPC_Z_VEL_I", 2.0);
         this->declare_parameter("MPC_XY_VEL_D", 0.2);
         this->declare_parameter("MPC_Z_VEL_D", 0.0);
-        this->declare_parameter("MPC_HOVER_THRUST", 0.5);
+        this->declare_parameter("MPC_HOVER_THRUST", 0.7);
+        this->declare_parameter<std::vector<double>>(
+            "POS_SP", {1.0, 2.0, 3.0}
+        );
+
 
         // Update Library with these params
         updateParams();
@@ -95,6 +99,7 @@ private:
 
     // Data Storage
     bool has_odom_ = false;
+    bool has_setpoint_ = false;
     std::vector<int> last_buttons_ = std::vector<int>(12, 0);
     sensor_msgs::msg::Joy joy_input_;
     px4_msgs::msg::VehicleStatus vehicle_status_;
@@ -166,9 +171,7 @@ private:
     }
 
     void joyCallback(const sensor_msgs::msg::Joy::SharedPtr msg) {
-        joy_input_ = *msg;
-        RCLCPP_INFO(this->get_logger(), "Arming state: %d", vehicle_status_.arming_state);
-        
+        joy_input_ = *msg;        
         if(joy_input_.buttons[9]==1 && last_buttons_[9] == 0){
             if(vehicle_status_.arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED){
                 RCLCPP_INFO(this->get_logger(), "Disarming Command Sent");
@@ -233,8 +236,9 @@ private:
         double siny_cosp = 2.0 * (qw * qz + qx * qy);
         double cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz);
         double yaw_sp = std::atan2(siny_cosp, cosy_cosp);
-
+        
         controller_.setSetpoint(pos_sp, yaw_sp);
+        has_setpoint_ = true;
     }
 
     void controlLoop() {
@@ -249,6 +253,17 @@ private:
         pub_offboard_mode_->publish(hb_msg);
 
         if (!has_odom_) return;
+
+        // Get parameter as std::vector<double>
+        std::vector<double> pos_sp_vec =
+        this->get_parameter("POS_SP").as_double_array();    
+
+        Eigen::Vector3d pos_sp(pos_sp_vec[0], pos_sp_vec[1], pos_sp_vec[2]);
+        double yaw_sp = 0.0;
+        controller_.setSetpoint(pos_sp, yaw_sp);
+        has_setpoint_ = true; 
+
+        if(!has_setpoint_) return;
 
         // 2. Run Control Library
         controller_.update(0.02); // 50Hz = 0.02s
@@ -266,18 +281,29 @@ private:
         // Q_transform (ENU to NED) = [0, 1, 1, 0] normalized? 
         // Let's use Eigen rotation for safety:
         
+// 4. Convert ENU Quaternion -> NED Quaternion (for PX4)
         Eigen::Matrix3d R_enu = q_enu.toRotationMatrix();
-        Eigen::Matrix3d R_ned;
         
-        // Remap rotation matrix:
-        // NED X (North) = ENU Y
-        // NED Y (East)  = ENU X
-        // NED Z (Down)  = -ENU Z
-        R_ned.col(0) = R_enu.col(1);
-        R_ned.col(1) = R_enu.col(0);
-        R_ned.col(2) = -R_enu.col(2);
+        // Transform 1: World Frame (ENU -> NED)
+        // NED X = ENU Y, NED Y = ENU X, NED Z = -ENU Z
+        Eigen::Matrix3d R_world_enu_to_ned;
+        R_world_enu_to_ned << 0,  1,  0,
+                              1,  0,  0,
+                              0,  0, -1;
 
+        // Transform 2: Body Frame (FLU -> FRD)
+        // FRD X = FLU X, FRD Y = -FLU Y, FRD Z = -FLU Z
+        Eigen::Matrix3d R_body_flu_to_frd;
+        R_body_flu_to_frd << 1,  0,  0,
+                             0, -1,  0,
+                             0,  0, -1;
+
+        // Apply transformations: R_ned = World * R_enu * Body
+        Eigen::Matrix3d R_ned = R_world_enu_to_ned * R_enu * R_body_flu_to_frd;
+        
         Eigen::Quaterniond q_ned(R_ned);
+        q_ned.normalize(); // Ensure it remains a valid quaternion
+
         
         // 5. Publish to PX4
         px4_msgs::msg::VehicleAttitudeSetpoint att_msg;
@@ -286,16 +312,16 @@ private:
         att_msg.q_d[1] = q_ned.x();
         att_msg.q_d[2] = q_ned.y();
         att_msg.q_d[3] = q_ned.z();
-        
+
         // PX4 Thrust is technically axis-specific in newer versions, 
         // but 'thrust_body' usually takes [0,0,-thrust] for Z-axis in NED.
         // Or sometimes just positive Z depending on firmware version.
         // Standard PX4 v1.13+: thrust_body[2] = negative value for Up force.
         att_msg.thrust_body[0] = 0.0;
         att_msg.thrust_body[1] = 0.0;
-        att_msg.thrust_body[2] = -thrust; // NED: Negative Z is Up
+        att_msg.thrust_body[2] = -thrust; // NED: Negative Z is Up =thrust
 
-        //pub_attitude_->publish(att_msg);
+        pub_attitude_->publish(att_msg);
     }
 };
 
