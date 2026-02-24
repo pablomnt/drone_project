@@ -51,18 +51,18 @@ void PositionControl::update(double dt) {
 }
 
 // ---------------------------------------------------------
-// PX4 LOGIC: Position Loop -> Outputs Velocity Setpoint
+// Position Loop -> Outputs Velocity Setpoint
 // ---------------------------------------------------------
 void PositionControl::_positionControl() {
     // 1. Calculate Error (Target - Current)
     Eigen::Vector3d error = _pos_sp - _pos;
 
     // 2. Apply P Gain to get desired velocity
-    // PX4: vel_sp_position = (_pos_sp - _pos).emult(_gain_pos_p);
+    // vel_sp_position = (_pos_sp - _pos).emult(_gain_pos_p);
     Eigen::Vector3d vel_sp = error.cwiseProduct(_gain_pos_p);
 
     // 3. Constrain Velocity (Logic from ControlMath::constrainXY)
-    // PX4: _vel_sp.xy() = ControlMath::constrainXY(...)
+    // _vel_sp.xy() = ControlMath::constrainXY(...)
     Eigen::Vector2d vel_sp_xy = _constrainXY(vel_sp.head<2>(), _lim_vel_horz);
     
     // Constrain Z
@@ -72,7 +72,7 @@ void PositionControl::_positionControl() {
 }
 
 // ---------------------------------------------------------
-// PX4 LOGIC: Velocity Loop -> Outputs Acceleration Setpoint
+// Velocity Loop -> Outputs Acceleration Setpoint
 // ---------------------------------------------------------
 //Currently DOES NOT use D term
 void PositionControl::_velocityControl(double dt) {
@@ -80,7 +80,7 @@ void PositionControl::_velocityControl(double dt) {
     Eigen::Vector3d vel_error = _vel_sp - _vel;
 
     // 2. PID Calculation
-    // PX4: acc_sp_velocity = vel_error.emult(_gain_vel_p) + _vel_int - _vel_dot.emult(_gain_vel_d);
+    // acc_sp_velocity = vel_error.emult(_gain_vel_p) + _vel_int - _vel_dot.emult(_gain_vel_d);
     // Note: We ignore D-term here for simplicity (it requires computing derivative of velocity). 
     // You can add it later if needed.
     Eigen::Vector3d acc_sp = vel_error.cwiseProduct(_gain_vel_p) + _vel_int;
@@ -99,7 +99,7 @@ void PositionControl::_velocityControl(double dt) {
 
 
 // ---------------------------------------------------------
-// PX4 LOGIC: Acceleration -> Attitude & Thrust
+// Acceleration -> Attitude & Thrust
 // ---------------------------------------------------------
 void PositionControl::_accelerationControl() {
     // 1. Add Gravity Compensation
