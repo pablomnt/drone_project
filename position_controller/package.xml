@@ -14,6 +14,7 @@
   <depend>sensor_msgs</depend>
   <depend>px4_msgs</depend>
   <depend>eigen3_cmake_module</depend>
+  <depend>nav_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -13,6 +13,7 @@
 #include "px4_msgs/msg/vehicle_status.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "sensor_msgs/msg/joy.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 
 // Our Library
 #include "position_controller/PositionControl.hpp"
@@ -66,6 +67,10 @@ public:
             "/fmu/out/vehicle_status_v1", qos,
             std::bind(&PositionControllerNode::statusCallback, this, std::placeholders::_1));
 
+        sub_VIO_odometry = this->create_subscription<nav_msgs::msg::Odometry>(
+            "/okvis/okvis_odometry", 10,
+            std::bind(&PositionControllerNode::vioOdomCallback, this, std::placeholders::_1));
+
         // 4. Publishers
         // Send Attitude + Thrust to PX4
         pub_attitude_ = this->create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>(
@@ -92,6 +97,7 @@ private:
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr sub_odom_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_setpoint_;
     rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr sub_status_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_VIO_odometry;
     rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_mode_;
     rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_vehicle_command_;
@@ -222,6 +228,13 @@ private:
 
         controller_.setState(pos_enu, vel_enu, yaw_enu);
         has_odom_ = true;
+    }
+
+    void vioOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+        // This callback can be used to feed VIO odometry into the controller if needed.
+        // For now, we will just log it. You can choose to use this instead of PX4 odometry if you trust it more.
+        RCLCPP_INFO(this->get_logger(), "Received VIO Odometry: Position (%.2f, %.2f, %.2f)", 
+            msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
     }
 
     void setpointCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
