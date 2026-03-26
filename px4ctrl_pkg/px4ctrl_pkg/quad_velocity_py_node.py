@@ -1,5 +1,5 @@
 """ Pablo Paramio
-    This file in its current configuration allows the controlof the drone in ofboard mode in the following way:
+    This file in its current configuration allows the control of the drone in offboard mode in the following way:
     Horizontal control done with acceleration setpoints (pitch and roll joystick axes)
     Vertical control done with velocity setpoints (throttle joystick axis)
     For this to work, a line in the offboardCheck.cpp file of PX4 must be modified to allow velocity control without an estimate (line 57)

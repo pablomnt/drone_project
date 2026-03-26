@@ -11,6 +11,9 @@ find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
@@ -44,11 +47,16 @@ add_executable(prueba3_BC
   src/prueba3_BC.cpp
 )
 
+add_executable(prueba4_BC
+  src/prueba4_BC.cpp
+)
+
 # Instalar
 install(TARGETS
   prueba2
   prueba2_waypoints_node
   prueba3_BC
+  prueba4_BC
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -69,6 +77,13 @@ ament_target_dependencies(prueba3_BC
   rclcpp
   px4_msgs
   nav_msgs
+)
+ament_target_dependencies(prueba4_BC
+  rclcpp
+  px4_msgs
+  nav_msgs
+  tf2_geometry_msgs
+  tf2
 )
 
 ament_python_install_package(${PROJECT_NAME})
