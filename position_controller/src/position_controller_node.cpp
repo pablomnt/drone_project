@@ -39,7 +39,7 @@ public:
         this->declare_parameter("MPC_Z_VEL_D", 0.0);
         this->declare_parameter("MPC_HOVER_THRUST", 0.7);
         this->declare_parameter<std::vector<double>>(
-            "POS_SP", {1.0, 2.0, 3.0}
+            "POS_SP", {0.0, 0.0, 0.2}
         );
         
         // NEW: Simulation Mode Parameter (Default: false -> Uses VIO)
@@ -213,22 +213,36 @@ private:
         // If in simulation mode, feed PX4 data directly into the controller
         if (use_sim_mode_) {
             controller_.setState(pos_enu, vel_enu, yaw_enu);
+            RCLCPP_INFO(this->get_logger(),
+                "PX4 ENU Pos [m]: (%.2f, %.2f, %.2f) | Vel [m/s]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
+                pos_enu.x(), pos_enu.y(), pos_enu.z(),
+                vel_enu.x(), vel_enu.y(), vel_enu.z(),
+                yaw_enu * 180.0 / M_PI
+            );
         }
 
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "PX4 ENU Pos [m]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
-            pos_enu.x(), pos_enu.y(), pos_enu.z(), yaw_enu * 180.0 / M_PI
-        );
+
     }
 
     void vioOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+        // 1. Position is World Frame (ENU)
         Eigen::Vector3d pos_enu(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
-        Eigen::Vector3d vel_enu(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
-        auto q = msg->pose.pose.orientation;
+        
+        // 2. Velocity is Body Frame. We must rotate it!
+        Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
+        auto q_msg = msg->pose.pose.orientation;
+        Eigen::Quaterniond q_sensor_to_world(q_msg.w, q_msg.x, q_msg.y, q_msg.z);
+        
+        // Multiply the rotation matrix by the body velocity to get World Velocity
+        Eigen::Vector3d vel_enu = q_sensor_to_world.toRotationMatrix() * vel_body;
 
-        double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
-        double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-        double yaw_enu = std::atan2(siny_cosp, cosy_cosp);
+        // 3. Extract Yaw and apply the 90-degree OKVIS2 offset
+        double siny_cosp = 2.0 * (q_msg.w * q_msg.z + q_msg.x * q_msg.y);
+        double cosy_cosp = 1.0 - 2.0 * (q_msg.y * q_msg.y + q_msg.z * q_msg.z);
+        double yaw_enu = std::atan2(siny_cosp, cosy_cosp) + M_PI_2;
+
+        // Wrap the angle between -PI and PI so it doesn't jump out of bounds
+        yaw_enu = std::atan2(std::sin(yaw_enu), std::cos(yaw_enu));
 
         current_vio_yaw_enu_ = yaw_enu;
         has_vio_odom_ = true;
@@ -236,12 +250,13 @@ private:
         // If in normal mode, feed VIO data into the controller
         if (!use_sim_mode_) {
             controller_.setState(pos_enu, vel_enu, yaw_enu);
+            RCLCPP_INFO(this->get_logger(),
+                "VIO ENU Pos [m]: (%.2f, %.2f, %.2f) | Vel [m/s]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
+                pos_enu.x(), pos_enu.y(), pos_enu.z(),
+                vel_enu.x(), vel_enu.y(), vel_enu.z(),
+                yaw_enu * 180.0 / M_PI
+            );
         }
-
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "VIO ENU Pos [m]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
-            pos_enu.x(), pos_enu.y(), pos_enu.z(), yaw_enu * 180.0 / M_PI
-        );
     }
 
     void setpointCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -330,10 +345,16 @@ private:
         // ---------------------------------------------------------
         px4_msgs::msg::VehicleAttitudeSetpoint att_msg;
         att_msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+        
         att_msg.q_d[0] = q_ned.w();
         att_msg.q_d[1] = q_ned.x();
         att_msg.q_d[2] = q_ned.y();
         att_msg.q_d[3] = q_ned.z();
+        
+        //att_msg.q_d[0] = 1.0;
+        //att_msg.q_d[1] = 0.0;
+        //att_msg.q_d[2] = 0.0;
+        //att_msg.q_d[3] = 0.0;
         
         att_msg.thrust_body[0] = 0.0;
         att_msg.thrust_body[1] = 0.0;
