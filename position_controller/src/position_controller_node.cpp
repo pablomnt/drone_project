@@ -38,9 +38,7 @@ public:
         this->declare_parameter("MPC_XY_VEL_D", 0.2);
         this->declare_parameter("MPC_Z_VEL_D", 0.0);
         this->declare_parameter("MPC_HOVER_THRUST", 0.7);
-        this->declare_parameter<std::vector<double>>(
-            "POS_SP", {0.0, 0.0, 0.2}
-        );
+        this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
         
         // NEW: Simulation Mode Parameter (Default: false -> Uses VIO)
         this->declare_parameter<bool>("USE_SIM_MODE", false);
@@ -201,6 +199,8 @@ private:
         Eigen::Vector3d pos_enu(msg->position[1], msg->position[0], -msg->position[2]);
         Eigen::Vector3d vel_enu(msg->velocity[1], msg->velocity[0], -msg->velocity[2]);
 
+        use_sim_mode_ = this->get_parameter("USE_SIM_MODE").as_bool();
+
         auto q = msg->q; 
         double siny_cosp = 2.0 * (q[0] * q[3] + q[1] * q[2]);
         double cosy_cosp = 1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3]);
@@ -225,6 +225,8 @@ private:
     }
 
     void vioOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+
+        use_sim_mode_ = this->get_parameter("USE_SIM_MODE").as_bool();
         // 1. Position is World Frame (ENU)
         Eigen::Vector3d pos_enu(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
         
@@ -294,13 +296,35 @@ private:
         bool offboard_active = (vehicle_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
         if (!offboard_active) return;
 
-        std::vector<double> pos_sp_vec = this->get_parameter("POS_SP").as_double_array();    
-        Eigen::Vector3d pos_sp(pos_sp_vec[0], pos_sp_vec[1], pos_sp_vec[2]);
-        double yaw_sp = 0.0;
-        controller_.setSetpoint(pos_sp, yaw_sp);
-        has_setpoint_ = true; 
+        
+
+        // Get the current trajectory selection and set the setpoint
+        int trajectory_selector = this->get_parameter("TRAJECTORY_SELECTOR").as_int();
+        Eigen::Vector3d pos_sp;
+
+        if (trajectory_selector == 0) {
+            // Trajectory 0: Hover at origin area
+            pos_sp = Eigen::Vector3d(0.0, 0.0, 0.2);
+        } else if (trajectory_selector == 1) {
+            // Trajectory 1: Square flight pattern
+            pos_sp = Eigen::Vector3d(1.0, 1.0, 0.5);
+        } else if (trajectory_selector == 2) {
+            // Trajectory 2: Higher altitude hover
+            pos_sp = Eigen::Vector3d(0.0, 0.0, 1.0);
+        } else if (trajectory_selector == 3) {
+            // Trajectory 3: 
+            pos_sp = Eigen::Vector3d(-1.0, -1.0, 1.0);
+        } else {
+            // Default to trajectory 0
+            pos_sp = Eigen::Vector3d(0.0, 0.0, 0.2);
+        }
+
+        has_setpoint_ = true; // Ensure the controller knows we have a setpoint to track
 
         if(!has_setpoint_) return;
+
+        double yaw_sp = 0.0;
+        controller_.setSetpoint(pos_sp, yaw_sp);
 
         controller_.update(0.02); 
 
