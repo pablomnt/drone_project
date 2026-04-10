@@ -40,9 +40,6 @@ public:
         this->declare_parameter("MPC_HOVER_THRUST", 0.7);
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
         
-        // Bring back the custom position parameter!
-        this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 0.2});
-        
         // NEW: Simulation Mode Parameter (Default: false -> Uses VIO)
         this->declare_parameter<bool>("USE_SIM_MODE", false);
         use_sim_mode_ = this->get_parameter("USE_SIM_MODE").as_bool();
@@ -176,13 +173,6 @@ private:
         publishVehicleCommand(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6); 
     }
 
-    void landCommand() {
-        // PX4 Auto-Land Command
-        // Command: VEHICLE_CMD_NAV_LAND (Command ID 21)
-        publishVehicleCommand(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND); 
-        RCLCPP_INFO(this->get_logger(), "Auto-Land Command Sent! PX4 taking over descent.");
-    }
-
     void joyCallback(const sensor_msgs::msg::Joy::SharedPtr msg) {
         joy_input_ = *msg;        
         if(joy_input_.buttons[9]==1 && last_buttons_[9] == 0){
@@ -197,10 +187,6 @@ private:
         if(joy_input_.buttons[1] == 1 && last_buttons_[1] == 0){
             RCLCPP_INFO(this->get_logger(), "Offboard Mode Engage Command Sent");
             engageOffboardMode();
-        }
-        if(joy_input_.buttons[8]==1 && last_buttons_[8] == 0){
-            RCLCPP_INFO(this->get_logger(), "Land command sent");
-            landCommand();
         }
         last_buttons_ = joy_input_.buttons;
     }
@@ -234,6 +220,8 @@ private:
                 yaw_enu * 180.0 / M_PI
             );
         }
+
+
     }
 
     void vioOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -308,6 +296,8 @@ private:
         bool offboard_active = (vehicle_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
         if (!offboard_active) return;
 
+        
+
         // Get the current trajectory selection and set the setpoint
         int trajectory_selector = this->get_parameter("TRAJECTORY_SELECTOR").as_int();
         Eigen::Vector3d pos_sp;
@@ -324,10 +314,6 @@ private:
         } else if (trajectory_selector == 3) {
             // Trajectory 3: 
             pos_sp = Eigen::Vector3d(-1.0, -1.0, 1.0);
-        } else if (trajectory_selector == 4) {
-            // Trajectory 4: Custom setpoint from ROS parameter
-            std::vector<double> pos_sp_vec = this->get_parameter("POS_SP").as_double_array();
-            pos_sp = Eigen::Vector3d(pos_sp_vec[0], pos_sp_vec[1], pos_sp_vec[2]);
         } else {
             // Default to trajectory 0
             pos_sp = Eigen::Vector3d(0.0, 0.0, 0.2);
@@ -388,6 +374,11 @@ private:
         att_msg.q_d[1] = q_ned.x();
         att_msg.q_d[2] = q_ned.y();
         att_msg.q_d[3] = q_ned.z();
+        
+        //att_msg.q_d[0] = 1.0;
+        //att_msg.q_d[1] = 0.0;
+        //att_msg.q_d[2] = 0.0;
+        //att_msg.q_d[3] = 0.0;
         
         att_msg.thrust_body[0] = 0.0;
         att_msg.thrust_body[1] = 0.0;

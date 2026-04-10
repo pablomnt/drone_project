@@ -1,53 +1,51 @@
-import launch
-import launch_ros.actions
-import launch_ros.substitutions
-import launch.actions
 import os
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import ExecuteProcess, IncludeLaunchDescription
+from launch.launch_description_sources import AnyLaunchDescriptionSource
+from launch_ros.actions import Node
 
 def generate_launch_description():
-    # Get the config file path
+    # Expand the $HOME variable to get the absolute path to the config file
     config_file = os.path.expandvars('$HOME/ws_paramio/src/okvis2/config/realsense_D435i.yaml')
 
-    return launch.LaunchDescription([
-        # Launch the position controller node in a new terminal
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'xterm', '-hold', '-e', 'bash', '-lc',
-                'ros2 run position_controller position_controller_node'
-            ],
+    return LaunchDescription([
+        # 1. MicroXRCEAgent (External Process)
+        ExecuteProcess(
+            cmd=['MicroXRCEAgent', 'serial', '--dev', '/dev/ttyUSB0', '-b', '921600'],
             output='screen'
         ),
 
-        # Launch MicroXRCEAgent in a new terminal
-        launch.actions.ExecuteProcess(
-            cmd=['xterm', '-hold', '-e', 'bash', '-lc', 'MicroXRCEAgent udp4 -p 8888'],
+        # 2. Joy Node (Native ROS 2 Node with parameters)
+        Node(
+            package='joy',
+            executable='joy_node',
+            name='joy_node',
+            output='screen',
+            parameters=[{
+                'dev': '/dev/input/js0',
+                'deadzone': 0.15
+            }]
+        ),
+
+        # 3. Position Controller Node (Native ROS 2 Node)
+        Node(
+            package='position_controller',
+            executable='position_controller_node',
+            name='position_controller_node',
             output='screen'
         ),
 
-        # Launch the okvis node in a new terminal
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'xterm', '-hold', '-e', 'bash', '-lc',
-                f"ros2 launch okvis okvis_node_realsense.launch.xml config_filename:={config_file}"
-            ],
-            output='screen'
-        ),
-
-        # Launch the joystick node in a new terminal
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'xterm', '-hold', '-e', 'bash', '-lc',
-                'ros2 run joy joy_node --ros-args -p dev:=/dev/input/js0 -p deadzone:=0.15'
-            ],
-            output='screen'
-        ),
-
-        # Launch QGroundControl in a new terminal
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'xterm', '-hold', '-e', 'bash', '-lc',
-                'qgc'
-            ],
-            output='screen'
+        # 4. OKVIS Launch File (Included from the 'okvis' package)
+        IncludeLaunchDescription(
+            AnyLaunchDescriptionSource(
+                os.path.join(
+                    get_package_share_directory('okvis'),
+                    'launch', # Assuming the xml file is installed in the package's 'launch' directory
+                    'okvis_node_realsense.launch.xml'
+                )
+            ),
+            # Pass the configuration file path as a launch argument
+            launch_arguments={'config_filename': config_file}.items()
         )
     ])
