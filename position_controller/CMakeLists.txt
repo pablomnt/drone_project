@@ -20,6 +20,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)        # <--- This is what you actually need
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(nav_msgs REQUIRED)
 
 # 2. Include Directories
 include_directories(
@@ -42,6 +43,7 @@ ament_target_dependencies(position_controller_node
   px4_msgs
   geometry_msgs
   sensor_msgs
+  nav_msgs
 )
 
 # 5. Create the Test Executable (Optional, but good to keep)
@@ -58,6 +60,11 @@ install(TARGETS
 
 install(DIRECTORY include/
   DESTINATION include
+)
+
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}
 )
 
 ament_package()

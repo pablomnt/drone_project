@@ -1,6 +1,7 @@
 #include "position_controller/PositionControl.hpp"
 #include <cmath>
 #include <algorithm>
+#include <iostream>
 
 PositionControl::PositionControl() {
     // Default initialization to prevent crashing if you forget to set gains
@@ -56,6 +57,9 @@ void PositionControl::update(double dt) {
 void PositionControl::_positionControl() {
     // 1. Calculate Error (Target - Current)
     Eigen::Vector3d error = _pos_sp - _pos;
+    
+    // Print the error for debugging
+    // std::cout << "Position error: " << error.transpose() << std::endl;
 
     // 2. Apply P Gain to get desired velocity
     // vel_sp_position = (_pos_sp - _pos).emult(_gain_pos_p);
