@@ -79,4 +79,6 @@ private:
     
     // -- Integrator State --
     Eigen::Vector3d _vel_int; // Stores the accumulated error for I-term
+    // -- Derivator State --
+    Eigen::Vector3d _prev_vel_error;
 };

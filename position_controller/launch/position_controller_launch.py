@@ -20,7 +20,7 @@ def generate_launch_description():
 
         # Launch MicroXRCEAgent in a new terminal
         launch.actions.ExecuteProcess(
-            cmd=['xterm', '-hold', '-e', 'bash', '-lc', 'MicroXRCEAgent udp4 -p 8888'],
+            cmd=['xterm', '-hold', '-e', 'bash', '-lc', 'MicroXRCEAgent serial --dev /dev/ttyUSB0 -b 921600'],
             output='screen'
         ),
 
@@ -38,15 +38,6 @@ def generate_launch_description():
             cmd=[
                 'xterm', '-hold', '-e', 'bash', '-lc',
                 'ros2 run joy joy_node --ros-args -p dev:=/dev/input/js0 -p deadzone:=0.15'
-            ],
-            output='screen'
-        ),
-
-        # Launch QGroundControl in a new terminal
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'xterm', '-hold', '-e', 'bash', '-lc',
-                'qgc'
             ],
             output='screen'
         )

@@ -78,28 +78,22 @@ void PositionControl::_positionControl() {
 // ---------------------------------------------------------
 // Velocity Loop -> Outputs Acceleration Setpoint
 // ---------------------------------------------------------
-//Currently DOES NOT use D term
 void PositionControl::_velocityControl(double dt) {
-    // 1. Calculate Velocity Error
     Eigen::Vector3d vel_error = _vel_sp - _vel;
 
-    // 2. PID Calculation
-    // acc_sp_velocity = vel_error.emult(_gain_vel_p) + _vel_int - _vel_dot.emult(_gain_vel_d);
-    // Note: We ignore D-term here for simplicity (it requires computing derivative of velocity). 
-    // You can add it later if needed.
-    Eigen::Vector3d acc_sp = vel_error.cwiseProduct(_gain_vel_p) + _vel_int;
+    // Calculate the rate of change of the error (Derivative)
+    Eigen::Vector3d vel_derivative = (vel_error - _prev_vel_error) / dt;
+    _prev_vel_error = vel_error;
 
-    // 3. Update Integrator (I-term)
-    // PX4 uses sophisticated anti-windup. We do simple clamping for now.
+    // Now include the D-term in your acceleration setpoint
+    Eigen::Vector3d acc_sp = vel_error.cwiseProduct(_gain_vel_p) + _vel_int + vel_derivative.cwiseProduct(_gain_vel_d);
+
     _vel_int += vel_error.cwiseProduct(_gain_vel_i) * dt;
-    
-    // Clamp integrator to avoid it growing infinite
-    double int_limit = 5.0; // 5 m/s^2 limit
+    double int_limit = 5.0;
     _vel_int = _vel_int.cwiseMin(int_limit).cwiseMax(-int_limit);
 
     _acc_sp = acc_sp;
 }
-
 
 
 // ---------------------------------------------------------

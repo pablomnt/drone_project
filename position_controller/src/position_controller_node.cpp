@@ -29,17 +29,30 @@ public:
     PositionControllerNode() : Node("position_controller_node") {
         
         // 1. Declare Parameters (So you can tune PID without recompiling)
-        this->declare_parameter("MPC_XY_P", 0.95);
-        this->declare_parameter("MPC_Z_P", 1.0);
-        this->declare_parameter("MPC_XY_VEL_P", 1.8);
-        this->declare_parameter("MPC_Z_VEL_P", 4.0);
-        this->declare_parameter("MPC_XY_VEL_I", 0.4);
-        this->declare_parameter("MPC_Z_VEL_I", 2.0);
-        this->declare_parameter("MPC_XY_VEL_D", 0.2);
-        this->declare_parameter("MPC_Z_VEL_D", 0.0);
-        this->declare_parameter("MPC_HOVER_THRUST", 0.7);
-        this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
-        
+        //this->declare_parameter("MPC_XY_P", 0.95);
+        //this->declare_parameter("MPC_Z_P", 1.0);
+        //this->declare_parameter("MPC_XY_VEL_P", 1.8);
+        //this->declare_parameter("MPC_Z_VEL_P", 4.0);
+        //this->declare_parameter("MPC_XY_VEL_I", 0.4);
+        //this->declare_parameter("MPC_Z_VEL_I", 2.0);
+        //this->declare_parameter("MPC_XY_VEL_D", 0.2);
+        //this->declare_parameter("MPC_Z_VEL_D", 0.0);
+        //this->declare_parameter("MPC_HOVER_THRUST", 0.7);
+        //this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
+
+        // Horizontal (XY) - Keep close to PX4 defaults, VIO handles XY well
+        this->declare_parameter("MPC_XY_P", 0.95);      // Position P (Standard)
+        this->declare_parameter("MPC_XY_VEL_P", 1.8);   // Velocity P (Standard)
+        this->declare_parameter("MPC_XY_VEL_I", 0.4);   // Velocity I (Standard)
+        this->declare_parameter("MPC_XY_VEL_D", 0.2);   // Velocity D (Standard damping)
+
+        // Vertical (Z) - Soften the P-gain and add D-gain to absorb camera noise
+        this->declare_parameter("MPC_Z_P", 1.0);        // Position P (Standard)
+        this->declare_parameter("MPC_Z_VEL_P", 2.0);    // Velocity P (Lowered from 4.0 to stop noise spikes)
+        this->declare_parameter("MPC_Z_VEL_I", 0.5);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
+        this->declare_parameter("MPC_Z_VEL_D", 0.1);    // Velocity D (Raised from 0.0 to act as a shock absorber)
+
+
         // Bring back the custom position parameter!
         this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 0.2});
         
@@ -52,6 +65,9 @@ public:
         } else {
             RCLCPP_INFO(this->get_logger(), "NORMAL MODE ACTIVE: Using VIO (OKVIS2) for state estimation.");
         }
+
+        // Initialize state machine timer
+        step_start_time_ = this->get_clock()->now();
 
         // Update Library with these params
         updateParams();
@@ -121,6 +137,11 @@ private:
     double current_vio_yaw_enu_ = 0.0;
     sensor_msgs::msg::Joy joy_input_;
     px4_msgs::msg::VehicleStatus vehicle_status_;
+
+    // Sequence Trackers
+    int last_trajectory_selector_ = -1;
+    int trajectory_step_ = 0;
+    rclcpp::Time step_start_time_;
 
     // --------------------------------------------------------------------------------
     // Callbacks
@@ -227,7 +248,7 @@ private:
         // If in simulation mode, feed PX4 data directly into the controller
         if (use_sim_mode_) {
             controller_.setState(pos_enu, vel_enu, yaw_enu);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "PX4 ENU Pos [m]: (%.2f, %.2f, %.2f) | Vel [m/s]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
                 pos_enu.x(), pos_enu.y(), pos_enu.z(),
                 vel_enu.x(), vel_enu.y(), vel_enu.z(),
@@ -264,7 +285,7 @@ private:
         // If in normal mode, feed VIO data into the controller
         if (!use_sim_mode_) {
             controller_.setState(pos_enu, vel_enu, yaw_enu);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "VIO ENU Pos [m]: (%.2f, %.2f, %.2f) | Vel [m/s]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
                 pos_enu.x(), pos_enu.y(), pos_enu.z(),
                 vel_enu.x(), vel_enu.y(), vel_enu.z(),
@@ -310,6 +331,15 @@ private:
 
         // Get the current trajectory selection and set the setpoint
         int trajectory_selector = this->get_parameter("TRAJECTORY_SELECTOR").as_int();
+        
+        // Reset the state machine if the user switches sequences
+        if (trajectory_selector != last_trajectory_selector_) {
+            trajectory_step_ = 0;
+            step_start_time_ = this->get_clock()->now();
+            last_trajectory_selector_ = trajectory_selector;
+        }
+
+        double elapsed_time = (this->get_clock()->now() - step_start_time_).seconds();
         Eigen::Vector3d pos_sp;
 
         if (trajectory_selector == 0) {
@@ -328,6 +358,59 @@ private:
             // Trajectory 4: Custom setpoint from ROS parameter
             std::vector<double> pos_sp_vec = this->get_parameter("POS_SP").as_double_array();
             pos_sp = Eigen::Vector3d(pos_sp_vec[0], pos_sp_vec[1], pos_sp_vec[2]);
+        } else if (trajectory_selector == 5) {
+            // Trajectory 5: Sequence with Land
+            std::vector<Eigen::Vector3d> points = {
+                {0.0, 0.0, 0.3},
+                {0.0, 0.0, 0.5},
+                {0.0, 1.0, 0.5},
+                {0.0, 0.0, 0.5}
+            };
+            
+            if (trajectory_step_ < (int)points.size()) {
+                pos_sp = points[trajectory_step_];
+                if (elapsed_time >= 5.0) {
+                    trajectory_step_++;
+                    step_start_time_ = this->get_clock()->now();
+                }
+            } else {
+                // Sequence finished: hover at last point for 3 seconds, then land
+                pos_sp = points.back();
+                if (elapsed_time >= 5.0) {
+                    RCLCPP_INFO(this->get_logger(), "Trajectory 5 complete. Landing...");
+                    landCommand();
+                    this->set_parameter(rclcpp::Parameter("TRAJECTORY_SELECTOR", 0)); // Prevent spamming land
+                    return;
+                }
+            }
+        } else if (trajectory_selector == 6) {
+            // Trajectory 6: Sequence with Land
+            std::vector<Eigen::Vector3d> points = {
+                {0.0, 0.0, 0.3},
+                {0.0, 0.0, 0.5},
+                {0.0, 1.0, 0.5},
+                {0.5, 1.0, 0.5},
+                {0.5, 0.0, 0.5},
+                {0.0, 0.0, 0.5},
+                {0.0, 0.0, 0.3}
+            };
+            
+            if (trajectory_step_ < (int)points.size()) {
+                pos_sp = points[trajectory_step_];
+                if (elapsed_time >= 5.0) {
+                    trajectory_step_++;
+                    step_start_time_ = this->get_clock()->now();
+                }
+            } else {
+                // Sequence finished: hover at last point for 3 seconds, then land
+                pos_sp = points.back();
+                if (elapsed_time >= 5.0) {
+                    RCLCPP_INFO(this->get_logger(), "Trajectory 6 complete. Landing...");
+                    landCommand();
+                    this->set_parameter(rclcpp::Parameter("TRAJECTORY_SELECTOR", 0)); // Prevent spamming land
+                    return;
+                }
+            }
         } else {
             // Default to trajectory 0
             pos_sp = Eigen::Vector3d(0.0, 0.0, 0.2);
@@ -337,7 +420,7 @@ private:
 
         if(!has_setpoint_) return;
 
-        double yaw_sp = 0.0;
+        double yaw_sp = 3.1416/2;
         controller_.setSetpoint(pos_sp, yaw_sp);
 
         controller_.update(0.02); 
