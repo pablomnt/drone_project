@@ -161,6 +161,12 @@ void PositionControl::_accelerationControl() {
     _attitude_sp = Eigen::Quaterniond(rot);
 }
 
+void PositionControl::_updateHoverThrust() {
+    
+
+    _hover_thrust = 0.0;
+}
+
 Eigen::Quaterniond PositionControl::getAttitudeSetpoint() {
     // Just return the pre-calculated value!
     return _attitude_sp;

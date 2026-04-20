@@ -52,6 +52,7 @@ private:
     void _positionControl();
     void _velocityControl(double dt);
     void _accelerationControl();
+    void _updateHoverThrust();
 
     // Helper to clamp horizontal velocity (Logic from PX4 ControlMath.cpp)
     Eigen::Vector2d _constrainXY(const Eigen::Vector2d& v0, double max);

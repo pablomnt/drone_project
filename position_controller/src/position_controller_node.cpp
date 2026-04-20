@@ -41,6 +41,9 @@ public:
         //this->declare_parameter("MPC_Z_VEL_D", 0.0);
         //this->declare_parameter("MPC_HOVER_THRUST", 0.7);
         //this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
+        
+        // Note: MPC stands for Multi-copter Position Controller, not Model Predictive Control in this context. 
+        // These parameters directly influence the PID controller's behavior in the PositionControl library. 
 
         // Horizontal (XY) - Keep close to PX4 defaults, VIO handles XY well
         this->declare_parameter("MPC_XY_P", 0.95);      // Position P (Standard)
@@ -52,7 +55,7 @@ public:
         this->declare_parameter("MPC_Z_P", 1.0);        // Position P (Standard)
         this->declare_parameter("MPC_Z_VEL_P", 0.3);    // Velocity P (Lowered from 4.0 to stop noise spikes)
         this->declare_parameter("MPC_Z_VEL_I", 0.1);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
-        this->declare_parameter("MPC_Z_VEL_D", 0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
+        this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
         this->declare_parameter("MPC_HOVER_THRUST", 0.7);
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
@@ -118,7 +121,7 @@ public:
         pub_pid_i_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_i_term", 10);
         pub_pid_d_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_d_term", 10);
 
-        // 5. Main Loop (50Hz)
+        // 5. Main Loop (50Hz)rclcpp::ParameterTypeException'
         timer_ = this->create_wall_timer(20ms, std::bind(&PositionControllerNode::controlLoop, this));
 
         RCLCPP_INFO(this->get_logger(), "Position Controller Node Started (C++)");
