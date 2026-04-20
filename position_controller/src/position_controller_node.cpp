@@ -18,8 +18,11 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "geometry_msgs/msg/vector3_stamped.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
 #include "sensor_msgs/msg/joy.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "px4_msgs/msg/sensor_combined.hpp"
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 // Our Library
 #include "position_controller/PositionControl.hpp"
@@ -29,18 +32,6 @@ using namespace std::chrono_literals;
 class PositionControllerNode : public rclcpp::Node {
 public:
     PositionControllerNode() : Node("position_controller_node") {
-        
-        // 1. Declare Parameters (So you can tune PID without recompiling)
-        //this->declare_parameter("MPC_XY_P", 0.95);
-        //this->declare_parameter("MPC_Z_P", 1.0);
-        //this->declare_parameter("MPC_XY_VEL_P", 1.8);
-        //this->declare_parameter("MPC_Z_VEL_P", 4.0);
-        //this->declare_parameter("MPC_XY_VEL_I", 0.4);
-        //this->declare_parameter("MPC_Z_VEL_I", 2.0);
-        //this->declare_parameter("MPC_XY_VEL_D", 0.2);
-        //this->declare_parameter("MPC_Z_VEL_D", 0.0);
-        //this->declare_parameter("MPC_HOVER_THRUST", 0.7);
-        //this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
         
         // Note: MPC stands for Multi-copter Position Controller, not Model Predictive Control in this context. 
         // These parameters directly influence the PID controller's behavior in the PositionControl library. 
@@ -54,10 +45,11 @@ public:
         // Vertical (Z) - Soften the P-gain and add D-gain to absorb camera noise
         this->declare_parameter("MPC_Z_P", 1.0);        // Position P (Standard)
         this->declare_parameter("MPC_Z_VEL_P", 0.3);    // Velocity P (Lowered from 4.0 to stop noise spikes)
-        this->declare_parameter("MPC_Z_VEL_I", 0.1);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
+        this->declare_parameter("MPC_Z_VEL_I", 0.0);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
         this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
-        this->declare_parameter("MPC_HOVER_THRUST", 0.7);
+        this->declare_parameter("MPC_HOVER_THRUST", 0.3);
+        this->declare_parameter<double>("MPC_THRUST_LEARNING_RATE", 0.0005);
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
 
         // Bring back the custom position parameter!
@@ -79,6 +71,10 @@ public:
         // Update Library with these params
         updateParams();
 
+        // --- REGISTER THE CALLBACK ---
+        param_callback_handle_ = this->add_on_set_parameters_callback(
+            std::bind(&PositionControllerNode::parametersCallback, this, std::placeholders::_1));
+
         // 2. QoS Profiles (Must match PX4's Best Effort)
         rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
         auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
@@ -91,6 +87,10 @@ public:
         sub_odom_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
             "/fmu/out/vehicle_odometry", qos, 
             std::bind(&PositionControllerNode::px4OdomCallback, this, std::placeholders::_1));
+
+        sub_sensor_combined = this->create_subscription<px4_msgs::msg::SensorCombined>(
+            "/fmu/out/sensor_combined", qos, 
+            std::bind(&PositionControllerNode::sensorCombinedCallback, this, std::placeholders::_1));
 
         sub_setpoint_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/position_controller/setpoint", 10,
@@ -120,6 +120,7 @@ public:
         pub_pid_p_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_p_term", 10);
         pub_pid_i_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_i_term", 10);
         pub_pid_d_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_d_term", 10);
+        pub_thrust_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/debug/thrust", 10);
 
         // 5. Main Loop (50Hz)rclcpp::ParameterTypeException'
         timer_ = this->create_wall_timer(20ms, std::bind(&PositionControllerNode::controlLoop, this));
@@ -130,12 +131,35 @@ public:
 private:
     PositionControl controller_;
     
+    // --- NEW PARAMETER CALLBACK VARIABLES ---
+    OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+    bool params_changed_ = false;
+
+    // --- NEW PARAMETER CALLBACK FUNCTION ---
+    rcl_interfaces::msg::SetParametersResult parametersCallback(const std::vector<rclcpp::Parameter> &parameters) {
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = true;
+        result.reason = "success";
+
+        // Loop through and log what changed
+        for (const auto &param : parameters) {
+            RCLCPP_INFO(this->get_logger(), "Manual Parameter Override: %s set to %s", 
+                param.get_name().c_str(), param.value_to_string().c_str());
+        }
+
+        // Flag the control loop to update the controller on the next tick
+        params_changed_ = true;
+
+        return result;
+    }
+
     // Publishers & Subscribers
     rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_joy;
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr sub_odom_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_setpoint_;
     rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr sub_status_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_VIO_odometry;
+    rclcpp::Subscription<px4_msgs::msg::SensorCombined>::SharedPtr sub_sensor_combined;
     rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_mode_;
     rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_vehicle_command_;
@@ -145,6 +169,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_p_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_i_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_d_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_thrust_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     // Data Storage
@@ -152,6 +177,7 @@ private:
     bool was_armed_ = false;
     bool was_offboard_ = false;
     bool has_px4_odom_ = false;
+    bool has_sensor_combined_ = false;
     bool has_vio_odom_ = false;
     bool has_setpoint_ = false;
     std::vector<int> last_buttons_ = std::vector<int>(12, 0);
@@ -316,6 +342,13 @@ private:
         }
     }
 
+    void sensorCombinedCallback(const px4_msgs::msg::SensorCombined::SharedPtr msg) {
+        Eigen::Vector3d acc_enu(msg->accelerometer_m_s2[1], msg->accelerometer_m_s2[0], -msg->accelerometer_m_s2[2]);
+        acc_enu.z() -= 9.81; // Remove gravity to get actual acceleration
+        has_sensor_combined_ = true;
+        controller_.setCurrentAcceleration(acc_enu);
+    }
+
     void setpointCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         Eigen::Vector3d pos_sp(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
         
@@ -332,6 +365,12 @@ private:
     }
 
     void controlLoop() {
+        // --- UPDATE PARAMS IF FLAG IS TRIPPED ---
+        if (params_changed_) {
+            updateParams();
+            use_sim_mode_ = this->get_parameter("USE_SIM_MODE").as_bool();
+            params_changed_ = false;
+        }
         px4_msgs::msg::OffboardControlMode hb_msg;
         hb_msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
         hb_msg.position = false;
@@ -345,7 +384,7 @@ private:
         if (use_sim_mode_) {
             if (!has_px4_odom_) return; // Only need PX4 in sim
         } else {
-            if (!has_px4_odom_ || !has_vio_odom_) return; // Need both for VIO correction
+            if (!has_px4_odom_ || !has_sensor_combined_ || !has_vio_odom_) return; // Need all for VIO flight
         }
 
         // 1. Check current states
@@ -356,6 +395,9 @@ private:
         if ((was_armed_ && !is_armed) || (was_offboard_ && !offboard_active)) {
             RCLCPP_INFO(this->get_logger(), "Interruption detected (Disarmed or Left Offboard). Resetting PID and State.");
             controller_.reset();
+            has_px4_odom_ = false;
+            has_sensor_combined_ = false;
+            has_vio_odom_ = false;
             
             // Reset the state machine
             trajectory_step_ = 0;
@@ -529,6 +571,11 @@ private:
         publish_vector3(pub_pid_p_, controller_.getVelocityPTerm());
         publish_vector3(pub_pid_i_, controller_.getVelocityITerm());
         publish_vector3(pub_pid_d_, controller_.getVelocityDTerm());
+
+        std_msgs::msg::Float64MultiArray thrust_msg;
+        thrust_msg.data.push_back(controller_.getHoverThrust());
+        thrust_msg.data.push_back(thrust);
+        pub_thrust_->publish(thrust_msg);
 
         geometry_msgs::msg::Vector3Stamped acc_msg;
         acc_msg.header.stamp = this->get_clock()->now();

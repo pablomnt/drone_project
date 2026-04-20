@@ -4,6 +4,12 @@ import launch_ros.substitutions
 import launch.actions
 import os
 
+"""
+CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" make px4_sitl gz_x500
+qgc
+"""
+
+
 def generate_launch_description():
     # Get the config file path
     config_file = os.path.expandvars('$HOME/ws_paramio/src/okvis2/config/realsense_D435i.yaml')

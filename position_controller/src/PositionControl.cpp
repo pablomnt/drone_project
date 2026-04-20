@@ -21,6 +21,7 @@ PositionControl::PositionControl() {
     _lim_vel_down = 1.0;
     _lim_tilt = 0.43; // ~25 degrees
     _hover_thrust = 0.5;
+    _learning_rate = 0.0005;
 }
 
 void PositionControl::setPositionGains(const Eigen::Vector3d& P) { _gain_pos_p = P; }
@@ -37,10 +38,16 @@ void PositionControl::setConstraints(double vel_horizontal, double vel_up, doubl
 }
 void PositionControl::setHoverThrust(double hover_thrust) { _hover_thrust = hover_thrust; }
 
+void PositionControl::setThrustLearningRate(double learning_rate) { _learning_rate = learning_rate; }
+
 void PositionControl::setState(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double yaw) {
     _pos = pos;
     _vel = vel;
     _yaw = yaw;
+}
+
+void PositionControl::setCurrentAcceleration(const Eigen::Vector3d& acc) {
+    _acc = acc;
 }
 
 void PositionControl::setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp) {
@@ -54,6 +61,7 @@ void PositionControl::update(double dt) {
     _positionControl();
     _velocityControl(dt);
     _accelerationControl();
+    _updateHoverThrust();
 }
 
 void PositionControl::reset() {
@@ -162,9 +170,9 @@ void PositionControl::_accelerationControl() {
 }
 
 void PositionControl::_updateHoverThrust() {
-    
-
-    _hover_thrust = 0.0;
+    Eigen::Vector3d acc_error = _acc_sp - _acc;
+    double acc_error_z = acc_error.z();
+    _hover_thrust += acc_error_z * _learning_rate;
 }
 
 Eigen::Quaterniond PositionControl::getAttitudeSetpoint() {

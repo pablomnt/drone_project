@@ -20,10 +20,14 @@ public:
     // Sets the thrust needed to hover (0.0 to 1.0). Default is usually 0.5
     void setHoverThrust(double hover_thrust);
 
+    void setThrustLearningRate(double learning_rate);
+
 
     // -- Main Loop Inputs --
     // Call this every time you get a new Odometry message
     void setState(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double yaw);
+
+    void setCurrentAcceleration(const Eigen::Vector3d& acc);
 
     // Call this to update where you want to go
     void setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp);
@@ -42,6 +46,7 @@ public:
     Eigen::Vector3d getPositionSetpoint() { return _pos_sp; }
     Eigen::Vector3d getVelocitySetpoint() { return _vel_sp; }
     Eigen::Vector3d getAccelerationSetpoint() { return _acc_sp; }
+    double getHoverThrust() { return _hover_thrust; }
     Eigen::Vector3d getVelocityPTerm() { return _vel_p_term; }
     Eigen::Vector3d getVelocityITerm() { return _vel_int; }
     Eigen::Vector3d getVelocityDTerm() { return _vel_d_term; }
@@ -53,6 +58,7 @@ private:
     void _velocityControl(double dt);
     void _accelerationControl();
     void _updateHoverThrust();
+
 
     // Helper to clamp horizontal velocity (Logic from PX4 ControlMath.cpp)
     Eigen::Vector2d _constrainXY(const Eigen::Vector2d& v0, double max);
@@ -68,11 +74,14 @@ private:
     double _lim_vel_up;
     double _lim_vel_down;
     double _lim_tilt;
+
     double _hover_thrust;
+    double _learning_rate;
 
     // -- States (Where we are) --
     Eigen::Vector3d _pos;
     Eigen::Vector3d _vel;
+    Eigen::Vector3d _acc;
     double _yaw;
 
     // -- Setpoints (Where we want to be) --
