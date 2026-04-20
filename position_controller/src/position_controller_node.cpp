@@ -16,6 +16,8 @@
 #include "px4_msgs/msg/trajectory_setpoint.hpp"
 #include "px4_msgs/msg/vehicle_status.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/point_stamped.hpp"
+#include "geometry_msgs/msg/vector3_stamped.hpp"
 #include "sensor_msgs/msg/joy.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 
@@ -48,10 +50,12 @@ public:
 
         // Vertical (Z) - Soften the P-gain and add D-gain to absorb camera noise
         this->declare_parameter("MPC_Z_P", 1.0);        // Position P (Standard)
-        this->declare_parameter("MPC_Z_VEL_P", 2.0);    // Velocity P (Lowered from 4.0 to stop noise spikes)
-        this->declare_parameter("MPC_Z_VEL_I", 0.5);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
-        this->declare_parameter("MPC_Z_VEL_D", 0.1);    // Velocity D (Raised from 0.0 to act as a shock absorber)
-
+        this->declare_parameter("MPC_Z_VEL_P", 0.3);    // Velocity P (Lowered from 4.0 to stop noise spikes)
+        this->declare_parameter("MPC_Z_VEL_I", 0.1);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
+        this->declare_parameter("MPC_Z_VEL_D", 0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
+        
+        this->declare_parameter("MPC_HOVER_THRUST", 0.7);
+        this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
 
         // Bring back the custom position parameter!
         this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 0.2});
@@ -107,6 +111,13 @@ public:
         pub_vehicle_command_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
             "/fmu/in/vehicle_command", 10);
 
+        pub_target_pos_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/debug/target_position", 10);
+        pub_target_vel_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/target_velocity", 10);
+        pub_target_acc_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/target_acceleration", 10);
+        pub_pid_p_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_p_term", 10);
+        pub_pid_i_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_i_term", 10);
+        pub_pid_d_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_d_term", 10);
+
         // 5. Main Loop (50Hz)
         timer_ = this->create_wall_timer(20ms, std::bind(&PositionControllerNode::controlLoop, this));
 
@@ -125,10 +136,18 @@ private:
     rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_mode_;
     rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_vehicle_command_;
+    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_target_pos_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_target_vel_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_target_acc_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_p_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_i_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_d_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     // Data Storage
     bool use_sim_mode_ = false; // Mode flag
+    bool was_armed_ = false;
+    bool was_offboard_ = false;
     bool has_px4_odom_ = false;
     bool has_vio_odom_ = false;
     bool has_setpoint_ = false;
@@ -326,8 +345,29 @@ private:
             if (!has_px4_odom_ || !has_vio_odom_) return; // Need both for VIO correction
         }
 
+        // 1. Check current states
+        bool is_armed = (vehicle_status_.arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED);
         bool offboard_active = (vehicle_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
-        if (!offboard_active) return;
+
+        // 2. Edge Detection: Did we just disarm OR leave Offboard mode?
+        if ((was_armed_ && !is_armed) || (was_offboard_ && !offboard_active)) {
+            RCLCPP_INFO(this->get_logger(), "Interruption detected (Disarmed or Left Offboard). Resetting PID and State.");
+            controller_.reset();
+            
+            // Reset the state machine
+            trajectory_step_ = 0;
+            last_trajectory_selector_ = -1; 
+        }
+        
+        // Save states for the next loop
+        was_armed_ = is_armed; 
+        was_offboard_ = offboard_active;
+
+        // 3. Block the controller from running unless BOTH are true
+        if (!is_armed || !offboard_active) {
+            step_start_time_ = this->get_clock()->now(); 
+            return;
+        }
 
         // Get the current trajectory selection and set the setpoint
         int trajectory_selector = this->get_parameter("TRAJECTORY_SELECTOR").as_int();
@@ -460,6 +500,43 @@ private:
         
         Eigen::Quaterniond q_ned(R_ned);
         q_ned.normalize(); 
+
+        // ---------------------------------------------------------
+        // DEBUG TELEMETRY PUBLISHERS
+        // ---------------------------------------------------------
+        auto now = this->get_clock()->now();
+
+        geometry_msgs::msg::PointStamped pos_msg;
+        pos_msg.header.stamp = now;
+        pos_msg.point.x = controller_.getPositionSetpoint().x();
+        pos_msg.point.y = controller_.getPositionSetpoint().y();
+        pos_msg.point.z = controller_.getPositionSetpoint().z();
+        pub_target_pos_->publish(pos_msg);
+
+        auto publish_vector3 = [&](rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub, Eigen::Vector3d vec) {
+            geometry_msgs::msg::Vector3Stamped msg;
+            msg.header.stamp = now;
+            msg.vector.x = vec.x();
+            msg.vector.y = vec.y();
+            msg.vector.z = vec.z();
+            pub->publish(msg);
+        };
+
+        publish_vector3(pub_target_vel_, controller_.getVelocitySetpoint());
+        publish_vector3(pub_pid_p_, controller_.getVelocityPTerm());
+        publish_vector3(pub_pid_i_, controller_.getVelocityITerm());
+        publish_vector3(pub_pid_d_, controller_.getVelocityDTerm());
+
+        geometry_msgs::msg::Vector3Stamped acc_msg;
+        acc_msg.header.stamp = this->get_clock()->now();
+        
+        // Ask the controller for the acceleration!
+        Eigen::Vector3d current_acc_sp = controller_.getAccelerationSetpoint();
+        
+        acc_msg.vector.x = current_acc_sp.x();
+        acc_msg.vector.y = current_acc_sp.y();
+        acc_msg.vector.z = current_acc_sp.z();
+        pub_target_acc_->publish(acc_msg);
         
         // ---------------------------------------------------------
         // PUBLISH TO PX4

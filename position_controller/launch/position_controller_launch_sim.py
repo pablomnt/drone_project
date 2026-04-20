@@ -24,31 +24,12 @@ def generate_launch_description():
             output='screen'
         ),
 
-        # Launch the okvis node in a new terminal
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'xterm', '-hold', '-e', 'bash', '-lc',
-                f"ros2 launch okvis okvis_node_realsense.launch.xml config_filename:={config_file}"
-            ],
-            output='screen'
-        ),
-
         # Launch the joystick node in a new terminal
         launch.actions.ExecuteProcess(
             cmd=[
                 'xterm', '-hold', '-e', 'bash', '-lc',
                 'ros2 run joy joy_node --ros-args -p dev:=/dev/input/js0 -p deadzone:=0.15'
             ],
-            output='screen'
-        ),
-
-        # Launch simulator
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'xterm', '-hold', '-e', 'bash', '-lc',
-                'CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" make px4_sitl gz_x500'
-            ],
-            cwd='/home/dron/PX4-Autopilot',
             output='screen'
         )
     ])

@@ -5,7 +5,7 @@
 class PositionControl {
 public:
     PositionControl();
-
+    
     // -- Configuration --
     // Sets P gains for Position Control (x, y, z)
     void setPositionGains(const Eigen::Vector3d& P);
@@ -32,12 +32,20 @@ public:
     // -- The Loop --
     // Call this at a fixed rate (e.g., 50Hz). 'dt' is time since last call.
     void update(double dt);
-
+    void reset();
 
     // -- Outputs --
     // Send these to your drone via MAVROS
     Eigen::Quaterniond getAttitudeSetpoint();
     double getThrustSetpoint();
+    // Telemetry Getters
+    Eigen::Vector3d getPositionSetpoint() { return _pos_sp; }
+    Eigen::Vector3d getVelocitySetpoint() { return _vel_sp; }
+    Eigen::Vector3d getAccelerationSetpoint() { return _acc_sp; }
+    Eigen::Vector3d getVelocityPTerm() { return _vel_p_term; }
+    Eigen::Vector3d getVelocityITerm() { return _vel_int; }
+    Eigen::Vector3d getVelocityDTerm() { return _vel_d_term; }
+    
 
 private:
     // Internal functions (Logic from PX4 PositionControl.cpp)
@@ -81,4 +89,8 @@ private:
     Eigen::Vector3d _vel_int; // Stores the accumulated error for I-term
     // -- Derivator State --
     Eigen::Vector3d _prev_vel_error;
+    bool _first_update = true;
+
+    Eigen::Vector3d _vel_p_term;
+    Eigen::Vector3d _vel_d_term;
 };

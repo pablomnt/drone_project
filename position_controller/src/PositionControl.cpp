@@ -10,7 +10,12 @@ PositionControl::PositionControl() {
     _gain_vel_i.setZero();
     _gain_vel_d.setZero();
     _vel_int.setZero();
+    _prev_vel_error.setZero();
     
+    // Initialize our new telemetry variables
+    _vel_p_term.setZero();
+    _vel_d_term.setZero();
+
     _lim_vel_horz = 10.0;
     _lim_vel_up = 2.0;
     _lim_vel_down = 1.0;
@@ -51,6 +56,14 @@ void PositionControl::update(double dt) {
     _accelerationControl();
 }
 
+void PositionControl::reset() {
+    _vel_int.setZero();    
+    _pos_sp.setZero(); 
+    _vel_sp.setZero();
+    _acc_sp.setZero();
+    _first_update = true;
+}
+
 // ---------------------------------------------------------
 // Position Loop -> Outputs Velocity Setpoint
 // ---------------------------------------------------------
@@ -81,20 +94,32 @@ void PositionControl::_positionControl() {
 void PositionControl::_velocityControl(double dt) {
     Eigen::Vector3d vel_error = _vel_sp - _vel;
 
-    // Calculate the rate of change of the error (Derivative)
+    // --- PREVENT DERIVATIVE KICK ---
+    // If this is the very first loop, initialize the previous error 
+    // so the derivative doesn't see a massive artificial spike.
+    if (_first_update) {
+        _prev_vel_error = vel_error; 
+        _first_update = false;
+    }
+
+    // Calculate the rate of change of the error (Derivative) safely
     Eigen::Vector3d vel_derivative = (vel_error - _prev_vel_error) / dt;
     _prev_vel_error = vel_error;
 
-    // Now include the D-term in your acceleration setpoint
-    Eigen::Vector3d acc_sp = vel_error.cwiseProduct(_gain_vel_p) + _vel_int + vel_derivative.cwiseProduct(_gain_vel_d);
+    // 1. Calculate and store the individual PID terms for telemetry
+    _vel_p_term = vel_error.cwiseProduct(_gain_vel_p);
+    _vel_d_term = vel_derivative.cwiseProduct(_gain_vel_d);
 
+    // 2. Update Integrator (I-term)
     _vel_int += vel_error.cwiseProduct(_gain_vel_i) * dt;
+    
+    // Clamp integrator to prevent windup
     double int_limit = 5.0;
     _vel_int = _vel_int.cwiseMin(int_limit).cwiseMax(-int_limit);
 
-    _acc_sp = acc_sp;
+    // 3. Sum them all together for the final acceleration command
+    _acc_sp = _vel_p_term + _vel_int + _vel_d_term;
 }
-
 
 // ---------------------------------------------------------
 // Acceleration -> Attitude & Thrust
