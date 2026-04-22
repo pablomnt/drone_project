@@ -48,12 +48,12 @@ public:
         this->declare_parameter("MPC_Z_VEL_I", 0.0);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
         this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
-        this->declare_parameter("MPC_HOVER_THRUST", 0.3);
+        this->declare_parameter("MPC_HOVER_THRUST", 0.65);
         this->declare_parameter<double>("MPC_THRUST_LEARNING_RATE", 0.0005);
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
 
         // Bring back the custom position parameter!
-        this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 0.2});
+        this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 0.5});
         
         // NEW: Simulation Mode Parameter (Default: false -> Uses VIO)
         this->declare_parameter<bool>("USE_SIM_MODE", false);
@@ -68,10 +68,11 @@ public:
         // Initialize state machine timer
         step_start_time_ = this->get_clock()->now();
 
-        // Update Library with these params
-        updateParams();
+        // Initialize Library with these params
+        updatePIDGains();
+        controller_.setHoverThrust(this->get_parameter("MPC_HOVER_THRUST").as_double());
 
-        // --- REGISTER THE CALLBACK ---
+        // Register the callback
         param_callback_handle_ = this->add_on_set_parameters_callback(
             std::bind(&PositionControllerNode::parametersCallback, this, std::placeholders::_1));
 
@@ -114,6 +115,9 @@ public:
         pub_vehicle_command_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
             "/fmu/in/vehicle_command", 10);
 
+        pub_vehicle_command_mode_executor_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
+            "/fmu/in/vehicle_command_mode_executor", 10);
+
         pub_target_pos_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/debug/target_position", 10);
         pub_target_vel_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/target_velocity", 10);
         pub_target_acc_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/target_acceleration", 10);
@@ -131,24 +135,33 @@ public:
 private:
     PositionControl controller_;
     
-    // --- NEW PARAMETER CALLBACK VARIABLES ---
+    // --- PARAMETER CALLBACK VARIABLES ---
     OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
-    bool params_changed_ = false;
+    bool update_pid_gains_ = false;
+    bool override_hover_thrust_ = false;
+    double new_hover_thrust_ = 0.0;
 
-    // --- NEW PARAMETER CALLBACK FUNCTION ---
     rcl_interfaces::msg::SetParametersResult parametersCallback(const std::vector<rclcpp::Parameter> &parameters) {
         rcl_interfaces::msg::SetParametersResult result;
         result.successful = true;
         result.reason = "success";
 
-        // Loop through and log what changed
         for (const auto &param : parameters) {
-            RCLCPP_INFO(this->get_logger(), "Manual Parameter Override: %s set to %s", 
-                param.get_name().c_str(), param.value_to_string().c_str());
+            if (param.get_name() == "MPC_HOVER_THRUST") {
+                // Only flag the hover thrust if the user specifically touched this parameter
+                override_hover_thrust_ = true;
+                new_hover_thrust_ = param.as_double();
+                RCLCPP_INFO(this->get_logger(), "Manual Override: Hover thrust queued to %.2f", new_hover_thrust_);
+            } 
+            else if (param.get_name() == "POS_SP" || param.get_name() == "TRAJECTORY_SELECTOR" || param.get_name() == "USE_SIM_MODE") {
+                // Do nothing. The control loop reads these live anyway.
+                RCLCPP_INFO(this->get_logger(), "Setpoint/Mode changed to %s", param.value_to_string().c_str());
+            }
+            else {
+                // If it wasn't thrust or a setpoint, it must be a PID gain.
+                update_pid_gains_ = true;
+            }
         }
-
-        // Flag the control loop to update the controller on the next tick
-        params_changed_ = true;
 
         return result;
     }
@@ -163,6 +176,7 @@ private:
     rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_mode_;
     rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_vehicle_command_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_vehicle_command_mode_executor_;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_target_pos_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_target_vel_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_target_acc_;
@@ -181,6 +195,7 @@ private:
     bool has_vio_odom_ = false;
     bool has_setpoint_ = false;
     std::vector<int> last_buttons_ = std::vector<int>(12, 0);
+    std::vector<float> last_axes_ = std::vector<float>(8, 0.0);
     double current_px4_yaw_enu_ = 0.0;
     double current_vio_yaw_enu_ = 0.0;
     sensor_msgs::msg::Joy joy_input_;
@@ -195,7 +210,7 @@ private:
     // Callbacks
     // --------------------------------------------------------------------------------
 
-    void updateParams() {
+    void updatePIDGains() {
         Eigen::Vector3d pos_p(
             this->get_parameter("MPC_XY_P").as_double(),
             this->get_parameter("MPC_XY_P").as_double(),
@@ -216,7 +231,6 @@ private:
         Eigen::Vector3d vel_d(d_xy, d_xy, d_z);
 
         controller_.setVelocityGains(vel_p, vel_i, vel_d);
-        controller_.setHoverThrust(this->get_parameter("MPC_HOVER_THRUST").as_double());
     }
 
     void publishVehicleCommand(uint16_t command, float param1=0, float param2=0, float param3=0, float param4=0, float param5=0, float param6=0, float param7=0) {
@@ -231,6 +245,20 @@ private:
         cmd_msg.param6 = param6;
         cmd_msg.param7 = param7;
         pub_vehicle_command_->publish(cmd_msg);
+    }
+
+    void publishVehicleCommandModeExecutor(uint16_t command, float param1=0, float param2=0, float param3=0, float param4=0, float param5=0, float param6=0, float param7=0) {
+        px4_msgs::msg::VehicleCommand cmd_msg;
+        cmd_msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+        cmd_msg.command = command;
+        cmd_msg.param1 = param1;
+        cmd_msg.param2 = param2;
+        cmd_msg.param3 = param3;
+        cmd_msg.param4 = param4;
+        cmd_msg.param5 = param5;
+        cmd_msg.param6 = param6;
+        cmd_msg.param7 = param7;
+        pub_vehicle_command_mode_executor_->publish(cmd_msg);
     }
 
     void armCommand(){
@@ -252,6 +280,14 @@ private:
         RCLCPP_INFO(this->get_logger(), "Auto-Land Command Sent! PX4 taking over descent.");
     }
 
+    void takeoffCommand(float altitude) {
+        // PX4 Takeoff Command
+        // Command: VEHICLE_CMD_NAV_TAKEOFF (Command ID 22)
+        publishVehicleCommand(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, altitude);
+        publishVehicleCommandModeExecutor(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, altitude); 
+        RCLCPP_INFO(this->get_logger(), "Takeoff Command Sent! Ascending to %.2f meters.", altitude);
+    }
+
     void joyCallback(const sensor_msgs::msg::Joy::SharedPtr msg) {
         joy_input_ = *msg;        
         if(joy_input_.buttons[9]==1 && last_buttons_[9] == 0){
@@ -271,7 +307,12 @@ private:
             RCLCPP_INFO(this->get_logger(), "Land command sent");
             landCommand();
         }
+        if(joy_input_.axes[7] == 1 && last_buttons_[7] == 0){
+            RCLCPP_INFO(this->get_logger(), "Takeoff command sent");
+            takeoffCommand(1.0); // Takeoff to 1.0 meters
+        }
         last_buttons_ = joy_input_.buttons;
+        last_axes_ = joy_input_.axes;
     }
 
     void statusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr msg){
@@ -365,12 +406,19 @@ private:
     }
 
     void controlLoop() {
-        // --- UPDATE PARAMS IF FLAG IS TRIPPED ---
-        if (params_changed_) {
-            updateParams();
-            use_sim_mode_ = this->get_parameter("USE_SIM_MODE").as_bool();
-            params_changed_ = false;
+        // --- PROCESS PARAMETER CHANGES SAFELY ---
+        if (update_pid_gains_) {
+            updatePIDGains();
+            update_pid_gains_ = false;
+            RCLCPP_INFO(this->get_logger(), "PID Gains updated from parameter server.");
         }
+        
+        if (override_hover_thrust_) {
+            controller_.setHoverThrust(new_hover_thrust_);
+            override_hover_thrust_ = false;
+            // The estimator will now pick up from this new value!
+        }
+
         px4_msgs::msg::OffboardControlMode hb_msg;
         hb_msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
         hb_msg.position = false;
