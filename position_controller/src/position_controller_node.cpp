@@ -44,12 +44,12 @@ public:
 
         // Vertical (Z) - Soften the P-gain and add D-gain to absorb camera noise
         this->declare_parameter("MPC_Z_P", 1.0);        // Position P (Standard)
-        this->declare_parameter("MPC_Z_VEL_P", 0.3);    // Velocity P (Lowered from 4.0 to stop noise spikes)
+        this->declare_parameter("MPC_Z_VEL_P", 2.0);    // Velocity P (Lowered from 4.0 to stop noise spikes)
         this->declare_parameter("MPC_Z_VEL_I", 0.0);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
         this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
-        this->declare_parameter("MPC_HOVER_THRUST", 0.65);
-        this->declare_parameter<double>("MPC_THRUST_LEARNING_RATE", 0.0005);
+        this->declare_parameter("MPC_HOVER_THRUST", 0.74);
+        this->declare_parameter<double>("MPC_THRUST_LEARNING_RATE", 0.00001);
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
 
         // Bring back the custom position parameter!
