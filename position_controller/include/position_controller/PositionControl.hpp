@@ -57,7 +57,7 @@ private:
     void _positionControl();
     void _velocityControl(double dt);
     void _accelerationControl();
-    void _updateHoverThrust();
+    void _updateHoverThrust(double dt);
 
 
     // Helper to clamp horizontal velocity (Logic from PX4 ControlMath.cpp)
@@ -76,7 +76,10 @@ private:
     double _lim_tilt;
 
     double _hover_thrust;
+    double _filtered_thrust_cmd;
+    bool _reset_hover_filter;
     double _learning_rate;
+    double _hover_thrust_convergence_time;
 
     // -- States (Where we are) --
     Eigen::Vector3d _pos;

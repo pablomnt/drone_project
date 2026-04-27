@@ -21,7 +21,10 @@ PositionControl::PositionControl() {
     _lim_vel_down = 1.0;
     _lim_tilt = 0.43; // ~25 degrees
     _hover_thrust = 0.5;
-    _learning_rate = 0.0005;
+    _filtered_thrust_cmd = 0.5;
+    _reset_hover_filter = true;
+    _hover_thrust_convergence_time = 2.5; // Time constant for hover thrust learning rate convergence (seconds)
+    _learning_rate = 0.02;
 }
 
 void PositionControl::setPositionGains(const Eigen::Vector3d& P) { _gain_pos_p = P; }
@@ -61,7 +64,7 @@ void PositionControl::update(double dt) {
     _positionControl();
     _velocityControl(dt);
     _accelerationControl();
-    _updateHoverThrust();
+    _updateHoverThrust(dt);
 }
 
 void PositionControl::reset() {
@@ -70,6 +73,9 @@ void PositionControl::reset() {
     _vel_sp.setZero();
     _acc_sp.setZero();
     _first_update = true;
+
+    // Tell the estimator a new flight regime just started
+    _reset_hover_filter = true;
 }
 
 // ---------------------------------------------------------
@@ -106,7 +112,8 @@ void PositionControl::_velocityControl(double dt) {
     // If this is the very first loop, initialize the previous error 
     // so the derivative doesn't see a massive artificial spike.
     if (_first_update) {
-        _prev_vel_error = vel_error; 
+        _prev_vel_error = vel_error;
+        _learning_rate = dt/_hover_thrust_convergence_time;
         _first_update = false;
     }
 
@@ -169,13 +176,57 @@ void PositionControl::_accelerationControl() {
     _attitude_sp = Eigen::Quaterniond(rot);
 }
 
-void PositionControl::_updateHoverThrust() {
-    if(std::abs(_acc.z()) < 0.5 && std::abs(_acc_sp.z()) < 1.0) {
-        Eigen::Vector3d acc_error = _acc_sp - _acc;
-        double acc_error_z = acc_error.z();
-        _hover_thrust += acc_error_z * _learning_rate;
+
+void PositionControl::_updateHoverThrust(double dt) {
+    // Handle initialization transients (e.g., mid-air mode switches)
+    // to prevent the PT1 filter from spooling up from an invalid state.
+    if (_reset_hover_filter) {
+        _filtered_thrust_cmd = _thrust_sp;
+        _reset_hover_filter = false;
     }
+
+    // Suspend estimation when motors are idling or disarmed.
+    // Lock the filter state to the command to prevent divergence.
+    if (_thrust_sp < 0.1) {
+        _filtered_thrust_cmd = _thrust_sp;
+        return;
+    }
+
+    // Apply first-order low-pass filter to the commanded thrust.
+    // This models physical actuator phase lag (propeller spool-up time)
+    // to align the software control signal with measured IMU dynamics.
+    constexpr double tau = 0.05; // System motor time constant [s]
+    const double alpha = dt / (tau + dt);
+    
+    _filtered_thrust_cmd += alpha * (_thrust_sp - _filtered_thrust_cmd);
+
+    // Back-calculate theoretical hover thrust using idealized physics:
+    // a_z = g * (T / T_hover - 1)  =>  T_hover = T * g / (a_z + g)
+    // Note: _acc.z() already accounts for gravity (0.0 = static hover).
+    const double measured_az = _acc.z();
+    double inst_hover_thrust = (_filtered_thrust_cmd * 9.81) / (measured_az + 9.81);
+
+    // Constrain instantaneous estimate to physically plausible boundaries
+    // to prevent divergence during external physical disturbances.
+    inst_hover_thrust = std::clamp(inst_hover_thrust, 0.5, 0.9);
+
+    // Dynamic measurement covariance scaling.
+    // Degrade trust in the IMU measurements proportionally to vertical speed
+    // to account for unmodeled aerodynamic drag and prop-wash transients.
+    const double current_speed = std::abs(_vel.z());
+    double trust_factor = 1.0;
+    
+    if (current_speed > 0.5) {
+        trust_factor = 0.5 / current_speed;
+    }
+
+    // Update global estimate via Exponential Moving Average (EMA).
+    const double effective_learning_rate = _learning_rate * trust_factor;
+    
+    _hover_thrust = (_hover_thrust * (1.0 - effective_learning_rate)) + 
+                    (inst_hover_thrust * effective_learning_rate);
 }
+
 
 Eigen::Quaterniond PositionControl::getAttitudeSetpoint() {
     // Just return the pre-calculated value!
