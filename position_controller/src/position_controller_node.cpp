@@ -50,7 +50,7 @@ public:
         
         this->declare_parameter("MPC_HOVER_THRUST", 0.74);
         this->declare_parameter<double>("MPC_THRUST_LEARNING_RATE", 0.00001);
-        this->declare_parameter<int>("TRAJECTORY_SELECTOR", 0);
+        this->declare_parameter<int>("TRAJECTORY_SELECTOR", 4);
 
         // Bring back the custom position parameter!
         this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 0.5});

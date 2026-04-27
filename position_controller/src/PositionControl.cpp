@@ -170,9 +170,11 @@ void PositionControl::_accelerationControl() {
 }
 
 void PositionControl::_updateHoverThrust() {
-    Eigen::Vector3d acc_error = _acc_sp - _acc;
-    double acc_error_z = acc_error.z();
-    _hover_thrust += acc_error_z * _learning_rate;
+    if(std::abs(_acc.z()) < 0.5 && std::abs(_acc_sp.z()) < 1.0) {
+        Eigen::Vector3d acc_error = _acc_sp - _acc;
+        double acc_error_z = acc_error.z();
+        _hover_thrust += acc_error_z * _learning_rate;
+    }
 }
 
 Eigen::Quaterniond PositionControl::getAttitudeSetpoint() {
