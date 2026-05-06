@@ -49,7 +49,6 @@ public:
         this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
         this->declare_parameter("MPC_HOVER_THRUST", 0.74);
-        this->declare_parameter<double>("MPC_THRUST_LEARNING_RATE", 0.00001);
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 4);
 
         // Bring back the custom position parameter!

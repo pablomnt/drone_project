@@ -41,8 +41,6 @@ void PositionControl::setConstraints(double vel_horizontal, double vel_up, doubl
 }
 void PositionControl::setHoverThrust(double hover_thrust) { _hover_thrust = hover_thrust; }
 
-void PositionControl::setThrustLearningRate(double learning_rate) { _learning_rate = learning_rate; }
-
 void PositionControl::setState(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double yaw) {
     _pos = pos;
     _vel = vel;
