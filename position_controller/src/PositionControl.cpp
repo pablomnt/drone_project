@@ -88,10 +88,10 @@ void PositionControl::update(double dt) {
         // 2. Open-Loop Thrust Ramp
         // Ramp up the thrust aggressively (e.g., 20% to 60% over 1 second).
         // Adjust 0.3 (30% per second) based on your drone's weight.
-        _takeoff_ramp_thrust += (0.3 * dt); 
+        _takeoff_ramp_thrust += (0.4 * dt); 
         
         // Ensure we don't accidentally shoot to the moon if something gets stuck
-        _takeoff_ramp_thrust = std::min(_takeoff_ramp_thrust, 0.7); 
+        _takeoff_ramp_thrust = std::min(_takeoff_ramp_thrust, 0.83); 
 
         // Override the PID's thrust command
         _thrust_sp = _takeoff_ramp_thrust;
@@ -101,7 +101,7 @@ void PositionControl::update(double dt) {
         _vel_int.setZero();
 
         // 4. Check for Liftoff (Handoff to PID)
-        if (_in_air) {
+        if (_pos.z() > 1.0) {
             _is_taking_off = false; // We have left the ground!
             _takeoff_ramp_thrust = 0.0; // Reset for next time
             
@@ -128,7 +128,7 @@ void PositionControl::reset() {
     _is_taking_off = false;
     
     // Evaluate our physical state at the exact moment of reset
-    if (_pos.z() < 0.2 && _vel.z() < 0.1) {
+    if (_pos.z() < 0.2 && std::abs(_vel.z()) < 0.2) {
         _in_air = false;
         _takeoff_primed = true; // We are on the ground. Authorized for ONE takeoff.
     } else {
@@ -137,15 +137,11 @@ void PositionControl::reset() {
     }
 }
 
-// ---------------------------------------------------------
 // Position Loop -> Outputs Velocity Setpoint
-// ---------------------------------------------------------
 void PositionControl::_positionControl() {
     // 1. Calculate Error (Target - Current)
     Eigen::Vector3d error = _pos_sp - _pos;
     
-    // Print the error for debugging
-    // std::cout << "Position error: " << error.transpose() << std::endl;
 
     // 2. Apply P Gain to get desired velocity
     // vel_sp_position = (_pos_sp - _pos).emult(_gain_pos_p);
@@ -161,13 +157,11 @@ void PositionControl::_positionControl() {
     _vel_sp << vel_sp_xy.x(), vel_sp_xy.y(), vel_sp_z;
 }
 
-// ---------------------------------------------------------
 // Velocity Loop -> Outputs Acceleration Setpoint
-// ---------------------------------------------------------
 void PositionControl::_velocityControl(double dt) {
     Eigen::Vector3d vel_error = _vel_sp - _vel;
 
-    // --- PREVENT DERIVATIVE KICK ---
+    // PREVENT DERIVATIVE KICK
     // If this is the very first loop, initialize the previous error 
     // so the derivative doesn't see a massive artificial spike.
     if (_first_update) {
@@ -195,9 +189,7 @@ void PositionControl::_velocityControl(double dt) {
     _acc_sp = _vel_p_term + _vel_int + _vel_d_term;
 }
 
-// ---------------------------------------------------------
 // Acceleration -> Attitude & Thrust
-// ---------------------------------------------------------
 void PositionControl::_accelerationControl() {
     // 1. Add Gravity Compensation
     // In ROS (ENU), Gravity is -9.8, so we need to push UP (+9.81).

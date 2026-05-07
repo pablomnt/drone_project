@@ -48,11 +48,11 @@ public:
         this->declare_parameter("MPC_Z_VEL_I", 0.0);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
         this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
-        this->declare_parameter("MPC_HOVER_THRUST", 0.6); // 0.77
+        this->declare_parameter("MPC_HOVER_THRUST", 0.77); // 0.77
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 4);
 
         // Bring back the custom position parameter!
-        this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 0.5});
+        this->declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
         
         // NEW: Simulation Mode Parameter (Default: false -> Uses VIO)
         this->declare_parameter<bool>("USE_SIM_MODE", false);
@@ -206,10 +206,7 @@ private:
     int trajectory_step_ = 0;
     rclcpp::Time step_start_time_;
 
-    // --------------------------------------------------------------------------------
     // Callbacks
-    // --------------------------------------------------------------------------------
-
     void updatePIDGains() {
         Eigen::Vector3d pos_p(
             this->get_parameter("MPC_XY_P").as_double(),
@@ -406,7 +403,7 @@ private:
     }
 
     void controlLoop() {
-        // --- PROCESS PARAMETER CHANGES SAFELY ---
+        // PROCESS PARAMETER CHANGES SAFELY
         if (update_pid_gains_) {
             updatePIDGains();
             update_pid_gains_ = false;
@@ -576,9 +573,7 @@ private:
         Eigen::Matrix3d R_enu_vio = controller_.getAttitudeSetpoint().toRotationMatrix();
         double thrust = controller_.getThrustSetpoint();
 
-        // ---------------------------------------------------------
         // HEADING DRIFT CORRECTION (Pure ENU)
-        // ---------------------------------------------------------
         double yaw_drift_enu = 0.0;
         
         // Only calculate and apply drift if we are NOT in sim mode
@@ -591,9 +586,7 @@ private:
 
         Eigen::Matrix3d R_enu_aligned = R_yaw_correction * R_enu_vio;
 
-        // ---------------------------------------------------------
         // CONVERT FROM ALIGNED ENU TO PX4's NED/FRD
-        // ---------------------------------------------------------
         Eigen::Matrix3d R_world_enu_to_ned;
         R_world_enu_to_ned << 0,  1,  0,
                               1,  0,  0,
@@ -609,9 +602,7 @@ private:
         Eigen::Quaterniond q_ned(R_ned);
         q_ned.normalize(); 
 
-        // ---------------------------------------------------------
         // DEBUG TELEMETRY PUBLISHERS
-        // ---------------------------------------------------------
         auto now = this->get_clock()->now();
 
         geometry_msgs::msg::PointStamped pos_msg;
@@ -651,9 +642,7 @@ private:
         acc_msg.vector.z = current_acc_sp.z();
         pub_target_acc_->publish(acc_msg);
         
-        // ---------------------------------------------------------
         // PUBLISH TO PX4
-        // ---------------------------------------------------------
         px4_msgs::msg::VehicleAttitudeSetpoint att_msg;
         att_msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
         
