@@ -1,2 +1,2 @@
 # drone_project
-Repositorio Droneantes
+Repository for autonomous vision-based quadcopter
