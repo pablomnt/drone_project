@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 
+
 PositionControl::PositionControl() {
     // Default initialization to prevent crashing if you forget to set gains
     _gain_pos_p.setZero();
@@ -57,11 +58,60 @@ void PositionControl::setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp) 
 }
 
 void PositionControl::update(double dt) {
-    if (dt <= 0.001) return; // Safety check
+    if (dt <= 0.001) return;
 
     _positionControl();
     _velocityControl(dt);
     _accelerationControl();
+
+    if (_takeoff_primed && _pos_sp.z() > 0.5) {
+    _is_taking_off = true;     // Start the open-loop ramp
+    _takeoff_primed = false;   // CONSUME the authorization. Only way to re-prime is through a reset on the ground
+    }
+
+    // TAKEOFF OVERRIDE
+    if (_is_taking_off) {
+        // 1. Force the drone perfectly level so it physically CANNOT skid.
+        // We override the PID's attitude calculation with a flat quaternion (no tilt).
+        // Only allow Yaw to pass through.
+        Eigen::Vector3d y_C(-std::sin(_yaw_sp), std::cos(_yaw_sp), 0.0);
+        Eigen::Vector3d body_x = y_C.cross(Eigen::Vector3d(0, 0, 1)); // Z is perfectly up
+        body_x.normalize();
+        Eigen::Vector3d body_y = Eigen::Vector3d(0, 0, 1).cross(body_x);
+        
+        Eigen::Matrix3d flat_rot;
+        flat_rot.col(0) = body_x;
+        flat_rot.col(1) = body_y;
+        flat_rot.col(2) = Eigen::Vector3d(0, 0, 1);
+        _attitude_sp = Eigen::Quaterniond(flat_rot);
+
+        // 2. Open-Loop Thrust Ramp
+        // Ramp up the thrust aggressively (e.g., 20% to 60% over 1 second).
+        // Adjust 0.3 (30% per second) based on your drone's weight.
+        _takeoff_ramp_thrust += (0.3 * dt); 
+        
+        // Ensure we don't accidentally shoot to the moon if something gets stuck
+        _takeoff_ramp_thrust = std::min(_takeoff_ramp_thrust, 0.7); 
+
+        // Override the PID's thrust command
+        _thrust_sp = _takeoff_ramp_thrust;
+
+        // 3. Freeze the PID Integrators
+        // Keep the I-terms at zero so they don't wind up while we are overriding them.
+        _vel_int.setZero();
+
+        // 4. Check for Liftoff (Handoff to PID)
+        if (_in_air) {
+            _is_taking_off = false; // We have left the ground!
+            _takeoff_ramp_thrust = 0.0; // Reset for next time
+            
+            // Seamlessly initialize the hover thrust filter to exactly what 
+            // the ramp used to get us off the ground.
+            _filtered_thrust_cmd = _thrust_sp; 
+        }
+    }
+
+    // Finally, run the hover thrust estimator
     _updateHoverThrust(dt);
 }
 
@@ -74,6 +124,17 @@ void PositionControl::reset() {
 
     // Tell the estimator a new flight regime just started
     _reset_hover_filter = true;
+    _takeoff_ramp_thrust = 0.0;
+    _is_taking_off = false;
+    
+    // Evaluate our physical state at the exact moment of reset
+    if (_pos.z() < 0.2 && _vel.z() < 0.1) {
+        _in_air = false;
+        _takeoff_primed = true; // We are on the ground. Authorized for ONE takeoff.
+    } else {
+        _in_air = true;
+        _takeoff_primed = false; // We switched modes mid-air. DO NOT take off.
+    }
 }
 
 // ---------------------------------------------------------
@@ -188,6 +249,25 @@ void PositionControl::_updateHoverThrust(double dt) {
     if (_thrust_sp < 0.1) {
         _filtered_thrust_cmd = _thrust_sp;
         return;
+    }
+
+    // New in-air detection logic
+    if (!_in_air) {
+        // We consider the drone to be flying if it has climbed 0.5 meters
+        // OR if it is actively moving upwards faster than 0.2 m/s.
+        if (_pos.z() > 0.2 || _vel.z() > 0.2) {
+            _in_air = true;
+        } else {
+            // We are still on the ground. Keep the filter pre-charged to the 
+            // current thrust command so there is no math glitch when we do take off.
+            _filtered_thrust_cmd = _thrust_sp;
+            return; // DO NOT RUN THE ESTIMATOR MATH
+        }
+    }
+
+    // Optional Safety: If we land or fall out of the sky, turn the flag off
+    if (_pos.z() < 0.2 && _vel.z() < 0.1 && _thrust_sp < 0.2) {
+        _in_air = false;
     }
 
     // Apply first-order low-pass filter to the commanded thrust.

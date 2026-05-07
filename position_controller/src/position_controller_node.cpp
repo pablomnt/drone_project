@@ -48,7 +48,7 @@ public:
         this->declare_parameter("MPC_Z_VEL_I", 0.0);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
         this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
-        this->declare_parameter("MPC_HOVER_THRUST", 0.74);
+        this->declare_parameter("MPC_HOVER_THRUST", 0.6); // 0.77
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 4);
 
         // Bring back the custom position parameter!
@@ -188,6 +188,7 @@ private:
     // Data Storage
     bool use_sim_mode_ = false; // Mode flag
     bool was_armed_ = false;
+    bool controller_running = false;
     bool was_offboard_ = false;
     bool has_px4_odom_ = false;
     bool has_sensor_combined_ = false;
@@ -429,9 +430,15 @@ private:
 
         // Check dependencies based on the current mode
         if (use_sim_mode_) {
-            if (!has_px4_odom_) return; // Only need PX4 in sim
+            if (!has_px4_odom_){
+                controller_running = false; // Update flag, controller isn't running
+                return; // Only need PX4 in sim
+            }
         } else {
-            if (!has_px4_odom_ || !has_sensor_combined_ || !has_vio_odom_) return; // Need all for VIO flight
+            if (!has_px4_odom_ || !has_sensor_combined_ || !has_vio_odom_) {
+                controller_running = false; // Update flag, controller isn't running
+                return; // Need all for VIO flight
+            }
         }
 
         // 1. Check current states
@@ -457,9 +464,18 @@ private:
 
         // 3. Block the controller from running unless BOTH are true
         if (!is_armed || !offboard_active) {
-            step_start_time_ = this->get_clock()->now(); 
+            step_start_time_ = this->get_clock()->now();
+            controller_running = false; // Update flag, controller isn't running
             return;
         }
+        
+        // Check if controller started running for the first time to log it and reset the controller
+        // Reset is also used to prime the takeoff sequence
+        if(controller_running==false){
+            RCLCPP_INFO(this->get_logger(), "Controller Activated! Starting trajectory execution.");
+            controller_.reset();
+        }
+        controller_running = true;
 
         // Get the current trajectory selection and set the setpoint
         int trajectory_selector = this->get_parameter("TRAJECTORY_SELECTOR").as_int();
