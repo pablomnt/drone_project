@@ -111,16 +111,23 @@ private:
 
         RCLCPP_INFO(this->get_logger(), "Attempting to plan path...");
 
-        if (planner.planPath(start, goal, result_path)) {
-            RCLCPP_INFO(this->get_logger(), "Path Found! Points: %zu", result_path.size());
+    if (planner.planPath(start, goal, result_path)) {
+        RCLCPP_INFO(this->get_logger(), "RRT* Path Found! Points: %zu", result_path.size());
 
-            // Construct a path message to visualize the result
+        // --- NEW SFC PIPELINE ---
+        global_planner::SfcOptimizer optimizer(octree_ptr_);
+        std::vector<std::vector<double>> smooth_trajectory;
+        
+        // Target 2.0 m/s average speed
+        if (optimizer.generateTrajectory(result_path, 2.0, smooth_trajectory)) {
+            RCLCPP_INFO(this->get_logger(), "Trajectory Optimized! Points: %zu", smooth_trajectory.size());
+
+            // Publish the OPTIMIZED trajectory to RViz, not the raw RRT* path
             nav_msgs::msg::Path path_msg;
             path_msg.header.stamp = this->now();
             path_msg.header.frame_id = "map";
 
-            // Convert the raw planner output into pose stamped messages
-            for (const auto& point : result_path) {
+            for (const auto& point : smooth_trajectory) {
                 geometry_msgs::msg::PoseStamped pose;
                 pose.pose.position.x = point[0];
                 pose.pose.position.y = point[1];
@@ -128,7 +135,9 @@ private:
                 path_msg.poses.push_back(pose);
             }
             path_pub_->publish(path_msg);
-        } else {
+        }
+    }
+        else {
             RCLCPP_ERROR(this->get_logger(), "Planner failed to find a path.");
         }
     }

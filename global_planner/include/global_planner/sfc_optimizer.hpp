@@ -5,33 +5,32 @@
 #include <Eigen/Dense>
 #include <octomap/octomap.h>
 
-// DecompUtil headers (assuming standard DecompROS installation)
-#include <decomp_util/line_segment_decomp.h>
+// Use the exact file names we found in your include folder
+#include <decomp_util/line_segment.h>
 #include <decomp_geometry/polyhedron.h>
 
 namespace global_planner {
 
+// These type aliases ensure Eigen memory alignment
+typedef LineSegment<3> LineSegment3D;
+
 class SfcOptimizer {
 public:
-    // Initialize with the OctoMap
     SfcOptimizer(const std::shared_ptr<octomap::OcTree>& octree);
     ~SfcOptimizer() = default;
 
-    // The main pipeline function called by your ROS node
     bool generateTrajectory(const std::vector<std::vector<double>>& path_waypoints,
                             double desired_speed,
                             std::vector<std::vector<double>>& optimized_trajectory);
 
 private:
     std::shared_ptr<octomap::OcTree> octree_ptr_;
-    
-    // Extracted polyhedra (the Ax <= b matrices)
     vec_E<Polyhedron3D> safe_corridors_;
 
-    // Pipeline steps
-    std::vector<Eigen::Vector3d> extractObstaclesFromMap();
-    bool generateConvexCorridors(const std::vector<Eigen::Vector3d>& eigen_path);
-    bool solveMinimumSnapQP(const std::vector<Eigen::Vector3d>& eigen_path, 
+    // Use vec_E to satisfy the compiler's alignment requirements
+    vec_Vecf<3> extractObstaclesFromMap();
+    bool generateConvexCorridors(const vec_Vecf<3>& eigen_path);
+    bool solveMinimumSnapQP(const vec_Vecf<3>& eigen_path, 
                             double speed, 
                             std::vector<std::vector<double>>& final_traj);
 };

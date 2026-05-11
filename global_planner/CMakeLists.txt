@@ -17,51 +17,47 @@ find_package(geometry_msgs REQUIRED)
 find_package(ompl REQUIRED)
 find_package(octomap REQUIRED)
 find_package(visualization_msgs REQUIRED)
-find_package(DecompUtil REQUIRED)
+find_package(Eigen3 REQUIRED)
 
-# Add the new optimizer library alongside the existing planner
+# Define the targets
 add_library(ompl_planner_lib src/ompl_rrt_core.cpp)
 add_library(sfc_optimizer_lib src/sfc_optimizer.cpp)
 add_executable(global_planner_node src/planner_node.cpp)
 
-# Include directories for the planner library
+# Point to your local include folder where we just copied the files
 target_include_directories(ompl_planner_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   ${OMPL_INCLUDE_DIRS}
   ${OCTOMAP_INCLUDE_DIRS}
 )
 
-# Include directories for the optimizer library
 target_include_directories(sfc_optimizer_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  ${DecompUtil_INCLUDE_DIRS}
   ${OCTOMAP_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIR}
 )
 
-# Include directories for the main executable node
 target_include_directories(global_planner_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
-# Link external libraries to the planner
+# Link math and system libraries
 target_link_libraries(ompl_planner_lib 
   ${OMPL_LIBRARIES} 
   ${OCTOMAP_LIBRARIES}
 )
 
-# Link external libraries to the optimizer
-target_link_libraries(sfc_optimizer_lib 
-  ${DecompUtil_LIBRARIES}
+target_link_libraries(sfc_optimizer_lib
+  Eigen3::Eigen
   ${OCTOMAP_LIBRARIES}
 )
 
-# Link internal libraries to the main executable node
 target_link_libraries(global_planner_node 
   ompl_planner_lib
   sfc_optimizer_lib
 )
 
-# Link ROS dependencies to the main executable node
+# Link ROS dependencies
 ament_target_dependencies(global_planner_node
   rclcpp
   octomap_msgs
@@ -70,7 +66,6 @@ ament_target_dependencies(global_planner_node
   visualization_msgs
 )
 
-# Install rules for all targets
 install(TARGETS
   ompl_planner_lib
   sfc_optimizer_lib
