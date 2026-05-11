@@ -6,7 +6,7 @@ namespace global_planner {
 OmplPlanner::OmplPlanner(const std::shared_ptr<octomap::OcTree>& octree) 
     : octree_ptr_(octree) {
     
-    // We define an SE3 state space (x, y, z + orientation)
+    // We define an SE3 state space (x, y, z + orientation), in case the shape of the drone is not symmetrical.
     space_ = std::make_shared<ompl::base::SE3StateSpace>();
 
     // Set boundaries for the office map
@@ -30,8 +30,6 @@ OmplPlanner::OmplPlanner(const std::shared_ptr<octomap::OcTree>& octree)
         return isStateValid(state);
     });
 
-    // This forces OMPL to check for collisions every 2cm along a path
-    // instead of only at the endpoints of a segment.
     si_->setStateValidityCheckingResolution(0.01);
 
     si_->setup();
@@ -44,7 +42,7 @@ bool OmplPlanner::isStateValid(const ompl::base::State* state) {
     const auto* pos = se3state->as<ompl::base::RealVectorStateSpace::StateType>(0);
 
     // Reduce safety distance slightly to 0.2m to help with tight doors
-    double safety_dist = 0.2; 
+    double safety_dist = 0.4; 
     double res = octree_ptr_->getResolution();
 
     for (double dx = -safety_dist; dx <= safety_dist; dx += res) {
@@ -83,7 +81,6 @@ bool OmplPlanner::planPath(const std::vector<double>& start_vec,
 
     // Tell OMPL to find the shortest path possible
     pdef->setOptimizationObjective(std::make_shared<ompl::base::PathLengthOptimizationObjective>(si_));
-
     // Use RRT*
     auto planner = std::make_shared<ompl::geometric::RRTstar>(si_);
     planner->setProblemDefinition(pdef);
