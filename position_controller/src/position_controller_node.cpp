@@ -48,7 +48,7 @@ public:
         this->declare_parameter("MPC_Z_VEL_I", 0.0);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
         this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
-        this->declare_parameter("MPC_HOVER_THRUST", 0.77); // 0.77
+        this->declare_parameter("MPC_HOVER_THRUST", 0.74); // 0.74
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 4);
 
         // Bring back the custom position parameter!
@@ -367,6 +367,11 @@ private:
 
         current_vio_yaw_enu_ = yaw_enu;
         has_vio_odom_ = true;
+        
+        // --- ADD THIS FOR REAL-TIME DEBUGGING ---
+        RCLCPP_INFO(this->get_logger(), "DEBUG Vel ENU [m/s] -> X: %+.2f | Y: %+.2f | Z: %+.2f", 
+                    vel_enu.x(), vel_enu.y(), vel_enu.z());
+        // ----------------------------------------
 
         // If in normal mode, feed VIO data into the controller
         if (!use_sim_mode_) {
@@ -489,13 +494,13 @@ private:
 
         if (trajectory_selector == 0) {
             // Trajectory 0: Hover at origin area
-            pos_sp = Eigen::Vector3d(0.0, 0.0, 0.2);
+            pos_sp = Eigen::Vector3d(0.0, 0.0, 0.5);
         } else if (trajectory_selector == 1) {
             // Trajectory 1: Square flight pattern
-            pos_sp = Eigen::Vector3d(1.0, 1.0, 0.5);
+            pos_sp = Eigen::Vector3d(1.0, 1.0, 1.0);
         } else if (trajectory_selector == 2) {
             // Trajectory 2: Higher altitude hover
-            pos_sp = Eigen::Vector3d(0.0, 0.0, 1.0);
+            pos_sp = Eigen::Vector3d(0.0, 0.0, 1.5);
         } else if (trajectory_selector == 3) {
             // Trajectory 3: 
             pos_sp = Eigen::Vector3d(-1.0, -1.0, 1.0);
@@ -506,10 +511,9 @@ private:
         } else if (trajectory_selector == 5) {
             // Trajectory 5: Sequence with Land
             std::vector<Eigen::Vector3d> points = {
-                {0.0, 0.0, 0.3},
-                {0.0, 0.0, 0.5},
-                {0.0, 1.0, 0.5},
-                {0.0, 0.0, 0.5}
+                {0.0, 0.0, 1.0},
+                {0.0, 1.0, 1.0},
+                {0.0, 0.0, 1.0}
             };
             
             if (trajectory_step_ < (int)points.size()) {
@@ -531,13 +535,12 @@ private:
         } else if (trajectory_selector == 6) {
             // Trajectory 6: Sequence with Land
             std::vector<Eigen::Vector3d> points = {
-                {0.0, 0.0, 0.3},
-                {0.0, 0.0, 0.5},
-                {0.0, 1.0, 0.5},
-                {0.5, 1.0, 0.5},
-                {0.5, 0.0, 0.5},
-                {0.0, 0.0, 0.5},
-                {0.0, 0.0, 0.3}
+                {0.0, 0.0, 0.8},
+                {0.0, 0.0, 1.0},
+                {0.0, 1.0, 1.0},
+                {0.5, 1.0, 1.0},
+                {0.5, 0.0, 1.0},
+                {0.0, 0.0, 1.0}
             };
             
             if (trajectory_step_ < (int)points.size()) {
