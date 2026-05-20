@@ -18,7 +18,7 @@ find_package(ompl REQUIRED)
 find_package(octomap REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
-
+find_package(mav_trajectory_generation REQUIRED)
 # Define the targets
 add_library(ompl_planner_lib src/ompl_rrt_core.cpp)
 add_library(sfc_optimizer_lib src/sfc_optimizer.cpp)
@@ -48,6 +48,7 @@ target_link_libraries(ompl_planner_lib
 )
 
 target_link_libraries(sfc_optimizer_lib
+  ${mav_trajectory_generation_LIBRARIES}
   Eigen3::Eigen
   ${OCTOMAP_LIBRARIES}
 )
@@ -64,6 +65,7 @@ ament_target_dependencies(global_planner_node
   nav_msgs
   geometry_msgs
   visualization_msgs
+  mav_trajectory_generation
 )
 
 install(TARGETS
