@@ -39,20 +39,20 @@ bool TrajectoryOptimizer::generateTrajectory(const std::vector<std::vector<doubl
     Eigen::VectorXd coeffs_y = solveKKT(wp_y, times);
     Eigen::VectorXd coeffs_z = solveKKT(wp_z, times);
 
-    // sample the resulting polynomials
-    double dt = 0.1;
-    for (int i = 0; i < num_segments; ++i) {
+    // dynamically sample 20 points per segment instead of using fixed dt
+    int samples_per_segment = 50;
+    
+    for (size_t i = 0; i < times.size(); ++i) {
         double T = times[i];
         int idx = i * 8;
         
-        for (double t = 0; t < T; t += dt) {
+        double dt = T / samples_per_segment;
+        
+        for (int s = 0; s <= samples_per_segment; ++s) {
+            double t = s * dt; // Calculate continuous time
+            
             std::vector<double> point(3);
-            double t2 = t*t;
-            double t3 = t2*t;
-            double t4 = t3*t;
-            double t5 = t4*t;
-            double t6 = t5*t;
-            double t7 = t6*t;
+            double t2 = t*t, t3 = t2*t, t4 = t3*t, t5 = t4*t, t6 = t5*t, t7 = t6*t;
 
             point[0] = coeffs_x(idx) + coeffs_x(idx+1)*t + coeffs_x(idx+2)*t2 + coeffs_x(idx+3)*t3 + 
                        coeffs_x(idx+4)*t4 + coeffs_x(idx+5)*t5 + coeffs_x(idx+6)*t6 + coeffs_x(idx+7)*t7;
@@ -67,6 +67,68 @@ bool TrajectoryOptimizer::generateTrajectory(const std::vector<std::vector<doubl
         }
     }
 
+    return true;
+}
+
+double TrajectoryOptimizer::computeTotalSnap(const std::vector<std::vector<double>>& waypoints, const std::vector<double>& times) {
+    std::vector<double> wp_x(waypoints.size());
+    std::vector<double> wp_y(waypoints.size());
+    std::vector<double> wp_z(waypoints.size());
+
+    for (size_t i = 0; i < waypoints.size(); ++i) {
+        wp_x[i] = waypoints[i][0];
+        wp_y[i] = waypoints[i][1];
+        wp_z[i] = waypoints[i][2];
+    }
+
+    Eigen::VectorXd cx = solveKKT(wp_x, times);
+    Eigen::VectorXd cy = solveKKT(wp_y, times);
+    Eigen::VectorXd cz = solveKKT(wp_z, times);
+
+    double cost = 0.0;
+    cost += cx.norm() + cy.norm() + cz.norm(); 
+
+    return cost;
+}
+
+bool TrajectoryOptimizer::generateTrajectoryWithTimes(const std::vector<std::vector<double>>& waypoints,
+                                                      const std::vector<double>& times,
+                                                      std::vector<std::vector<double>>& trajectory_out) {
+    std::vector<double> wp_x(waypoints.size());
+    std::vector<double> wp_y(waypoints.size());
+    std::vector<double> wp_z(waypoints.size());
+
+    for (size_t i = 0; i < waypoints.size(); ++i) {
+        wp_x[i] = waypoints[i][0];
+        wp_y[i] = waypoints[i][1];
+        wp_z[i] = waypoints[i][2];
+    }
+
+    Eigen::VectorXd coeffs_x = solveKKT(wp_x, times);
+    Eigen::VectorXd coeffs_y = solveKKT(wp_y, times);
+    Eigen::VectorXd coeffs_z = solveKKT(wp_z, times);
+
+    double dt = 0.1;
+    for (size_t i = 0; i < times.size(); ++i) {
+        double T = times[i];
+        int idx = i * 8;
+        
+        for (double t = 0; t < T; t += dt) {
+            std::vector<double> point(3);
+            double t2 = t*t, t3 = t2*t, t4 = t3*t, t5 = t4*t, t6 = t5*t, t7 = t6*t;
+
+            point[0] = coeffs_x(idx) + coeffs_x(idx+1)*t + coeffs_x(idx+2)*t2 + coeffs_x(idx+3)*t3 + 
+                       coeffs_x(idx+4)*t4 + coeffs_x(idx+5)*t5 + coeffs_x(idx+6)*t6 + coeffs_x(idx+7)*t7;
+                       
+            point[1] = coeffs_y(idx) + coeffs_y(idx+1)*t + coeffs_y(idx+2)*t2 + coeffs_y(idx+3)*t3 + 
+                       coeffs_y(idx+4)*t4 + coeffs_y(idx+5)*t5 + coeffs_y(idx+6)*t6 + coeffs_y(idx+7)*t7;
+                       
+            point[2] = coeffs_z(idx) + coeffs_z(idx+1)*t + coeffs_z(idx+2)*t2 + coeffs_z(idx+3)*t3 + 
+                       coeffs_z(idx+4)*t4 + coeffs_z(idx+5)*t5 + coeffs_z(idx+6)*t6 + coeffs_z(idx+7)*t7;
+
+            trajectory_out.push_back(point);
+        }
+    }
     return true;
 }
 

@@ -1,4 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
+#include <ompl/util/Console.h>
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -6,8 +7,9 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+
 #include "global_planner/ompl_rrt_core.hpp"
-#include "global_planner/trajectory_optimizer.hpp"
+#include "global_planner/nlopt_trajectory_optimizer.hpp"
 
 class GlobalPlannerNode : public rclcpp::Node {
 public:
@@ -129,10 +131,11 @@ private:
             raw_path_pub_->publish(raw_path_msg);
             waypoints_pub_->publish(waypoints_msg);
             
-            global_planner::TrajectoryOptimizer optimizer;
+            global_planner::NLOptTrajectoryOptimizer optimizer;
             std::vector<std::vector<double>> smooth_trajectory;
             
-            if (optimizer.generateTrajectory(result_path, 2.0, smooth_trajectory)) {
+            if (optimizer.generateOptimizedTrajectory(result_path, smooth_trajectory)) {
+                RCLCPP_INFO(this->get_logger(), "OPTIMIZATION HAS RAN SUCCESSFULLY");
 
                 nav_msgs::msg::Path path_msg;
                 path_msg.header.stamp = this->now();
@@ -160,6 +163,8 @@ private:
 };
 
 int main(int argc, char** argv) {
+    
+    ompl::msg::setLogLevel(ompl::msg::LOG_WARN);
     
     rclcpp::init(argc, argv);
     auto node = std::make_shared<GlobalPlannerNode>();

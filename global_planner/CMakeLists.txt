@@ -19,14 +19,17 @@ find_package(octomap REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(osqp_vendor REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(NLOPT REQUIRED nlopt)
 
-# define the targets
+# define targets
 add_library(ompl_planner_lib src/ompl_rrt_core.cpp)
 add_library(trajectory_optimizer_lib src/trajectory_optimizer.cpp)
-add_library(osqp_trajectory_optimizer_lib src/osqp_trajectory_optimizer.cpp) # ADD THIS LINE
+add_library(osqp_trajectory_optimizer_lib src/osqp_trajectory_optimizer.cpp)
+add_library(nlopt_trajectory_optimizer_lib src/nlopt_trajectory_optimizer.cpp)
 add_executable(global_planner_node src/planner_node.cpp)
 
-# point to local include folder
+# configure include directories
 target_include_directories(ompl_planner_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   ${OMPL_INCLUDE_DIRS}
@@ -47,7 +50,12 @@ target_include_directories(osqp_trajectory_optimizer_lib PUBLIC
   ${EIGEN3_INCLUDE_DIR}
 )
 
-# link math and system libraries
+target_include_directories(nlopt_trajectory_optimizer_lib PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${NLOPT_INCLUDE_DIRS}
+)
+
+# link math and external libraries
 target_link_libraries(ompl_planner_lib 
   ${OMPL_LIBRARIES} 
   ${OCTOMAP_LIBRARIES}
@@ -58,27 +66,45 @@ target_link_libraries(trajectory_optimizer_lib
 )
 
 target_link_libraries(osqp_trajectory_optimizer_lib
-  osqp_vendor::osqp
+  Eigen3::Eigen
+)
+
+target_link_libraries(nlopt_trajectory_optimizer_lib
+  ${NLOPT_LIBRARIES}
+  trajectory_optimizer_lib
 )
 
 target_link_libraries(global_planner_node 
   ompl_planner_lib
   trajectory_optimizer_lib
   osqp_trajectory_optimizer_lib
+  nlopt_trajectory_optimizer_lib
 )
 
 # link ros dependencies
+ament_target_dependencies(osqp_trajectory_optimizer_lib
+  osqp_vendor
+)
+
 ament_target_dependencies(global_planner_node
   rclcpp
   octomap_msgs
   nav_msgs
   geometry_msgs
   visualization_msgs
+  osqp_vendor
 )
 
+ament_target_dependencies(nlopt_trajectory_optimizer_lib
+  rclcpp
+)
+
+# set install destinations
 install(TARGETS
   ompl_planner_lib
   trajectory_optimizer_lib
+  osqp_trajectory_optimizer_lib
+  nlopt_trajectory_optimizer_lib
   global_planner_node
   DESTINATION lib/${PROJECT_NAME}
 )
