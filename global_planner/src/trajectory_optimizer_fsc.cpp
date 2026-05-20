@@ -1,6 +1,4 @@
-#include <mav_trajectory_generation/polynomial_optimization_nonlinear.h>
-#include <mav_trajectory_generation_ros2/ros_conversions.h>
-
+/*
 bool SfcOptimizer::solveMinimumSnapQP(const vec_Vecf<3>& eigen_path, 
                                       double speed, 
                                       std::vector<std::vector<double>>& final_traj) {
@@ -39,3 +37,4 @@ bool SfcOptimizer::solveMinimumSnapQP(const vec_Vecf<3>& eigen_path,
 
     return true;
 }
+*/

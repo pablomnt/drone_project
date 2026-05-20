@@ -18,22 +18,23 @@ find_package(ompl REQUIRED)
 find_package(octomap REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(mav_trajectory_generation REQUIRED)
-# Define the targets
+find_package(osqp_vendor REQUIRED)
+
+# define the targets
 add_library(ompl_planner_lib src/ompl_rrt_core.cpp)
-add_library(sfc_optimizer_lib src/sfc_optimizer.cpp)
+add_library(trajectory_optimizer_lib src/trajectory_optimizer.cpp)
+add_library(osqp_trajectory_optimizer_lib src/osqp_trajectory_optimizer.cpp) # ADD THIS LINE
 add_executable(global_planner_node src/planner_node.cpp)
 
-# Point to your local include folder where we just copied the files
+# point to local include folder
 target_include_directories(ompl_planner_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   ${OMPL_INCLUDE_DIRS}
   ${OCTOMAP_INCLUDE_DIRS}
 )
 
-target_include_directories(sfc_optimizer_lib PUBLIC
+target_include_directories(trajectory_optimizer_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  ${OCTOMAP_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
 )
 
@@ -41,36 +42,43 @@ target_include_directories(global_planner_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
-# Link math and system libraries
+target_include_directories(osqp_trajectory_optimizer_lib PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  ${EIGEN3_INCLUDE_DIR}
+)
+
+# link math and system libraries
 target_link_libraries(ompl_planner_lib 
   ${OMPL_LIBRARIES} 
   ${OCTOMAP_LIBRARIES}
 )
 
-target_link_libraries(sfc_optimizer_lib
-  ${mav_trajectory_generation_LIBRARIES}
+target_link_libraries(trajectory_optimizer_lib
   Eigen3::Eigen
-  ${OCTOMAP_LIBRARIES}
+)
+
+target_link_libraries(osqp_trajectory_optimizer_lib
+  osqp_vendor::osqp
 )
 
 target_link_libraries(global_planner_node 
   ompl_planner_lib
-  sfc_optimizer_lib
+  trajectory_optimizer_lib
+  osqp_trajectory_optimizer_lib
 )
 
-# Link ROS dependencies
+# link ros dependencies
 ament_target_dependencies(global_planner_node
   rclcpp
   octomap_msgs
   nav_msgs
   geometry_msgs
   visualization_msgs
-  mav_trajectory_generation
 )
 
 install(TARGETS
   ompl_planner_lib
-  sfc_optimizer_lib
+  trajectory_optimizer_lib
   global_planner_node
   DESTINATION lib/${PROJECT_NAME}
 )

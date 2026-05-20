@@ -95,7 +95,8 @@ bool OmplPlanner::planPath(const std::vector<double>& start_vec,
         // Smooth the jagged RRT* lines
         ompl::geometric::PathSimplifier simplifier(si_);
         simplifier.simplifyMax(*path);
-        simplifier.smoothBSpline(*path);
+        //B-spline is removed to prevent number of waypoints from increasing too much and keeping the original waypoints for minimum snap trajectory generation
+        //simplifier.smoothBSpline(*path);
 
         // Convert OMPL states back to a simple vector for ROS
         for (std::size_t i = 0; i < path->getStateCount(); ++i) {
