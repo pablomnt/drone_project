@@ -106,7 +106,7 @@ public:
 
         // 4. Publishers
         pub_attitude_ = this->create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>(
-            "/fmu/in/vehicle_attitude_setpoint", 10);
+            "/fmu/in/vehicle_attitude_setpoint_v1", 10);
 
         pub_offboard_mode_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>(
             "/fmu/in/offboard_control_mode", 10);

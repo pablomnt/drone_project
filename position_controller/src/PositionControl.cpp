@@ -89,9 +89,11 @@ void PositionControl::update(double dt) {
         // Ramp up the thrust aggressively (e.g., 20% to 60% over 1 second).
         // Adjust 0.3 (30% per second) based on your drone's weight.
         _takeoff_ramp_thrust += (0.4 * dt); 
-        
-        // Ensure we don't accidentally shoot to the moon if something gets stuck
-        _takeoff_ramp_thrust = std::min(_takeoff_ramp_thrust, 0.83); 
+    
+
+        if (_vel.z() < 1.0){
+            _takeoff_ramp_thrust = std::min(_takeoff_ramp_thrust, 0.78);
+        }
 
         // Override the PID's thrust command
         _thrust_sp = _takeoff_ramp_thrust;

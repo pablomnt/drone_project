@@ -78,8 +78,8 @@ void Subscriber::setNodeHandle(std::shared_ptr<rclcpp::Node> node)
         30 * parameters_.nCameraSystem.numCameras(),
         std::bind(&Subscriber::imageCallback, this, std::placeholders::_1, i));
   }
-
-  subImu_ = node_->create_subscription<sensor_msgs::msg::Imu>("/okvis/imu0", 1000, 
+auto qos_imu = rclcpp::QoS(rclcpp::KeepLast(1000)).best_effort(); // O .reliable() según pida el error
+  subImu_ = node_->create_subscription<sensor_msgs::msg::Imu>("/okvis/imu0", qos_imu, 
       std::bind(&Subscriber::imuCallback, this, std::placeholders::_1));
 }
 

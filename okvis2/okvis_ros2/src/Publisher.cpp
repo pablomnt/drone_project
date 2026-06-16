@@ -117,7 +117,7 @@ void Publisher::setBodyTransform(const okvis::kinematics::Transformation& T_BS) 
 
   // publish pose:
   geometry_msgs::msg::TransformStamped poseMsg; // Pose message.
-  poseMsg.child_frame_id = "sensor";
+  poseMsg.child_frame_id = "camera_link";
   poseMsg.header.frame_id = "body";
   poseMsg.header.stamp = node_->now();
 
