@@ -84,6 +84,7 @@ private:
     bool _in_air{false};
     bool _is_taking_off{false};
     double _takeoff_ramp_thrust{0.0};
+    int _takeoff_phase{1};
     bool _takeoff_primed{false};
 
     // -- States (Where we are) --

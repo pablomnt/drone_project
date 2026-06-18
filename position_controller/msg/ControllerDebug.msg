@@ -1,0 +1,13 @@
+geometry_msgs/Point pos
+float64 yaw
+float64 yaw_px4
+geometry_msgs/Vector3 vel
+geometry_msgs/Vector3 acc
+geometry_msgs/Point pos_sp
+geometry_msgs/Vector3 vel_sp
+geometry_msgs/Vector3 acc_sp
+float64 thrust_cmd
+float64 hover_thrust
+geometry_msgs/Vector3 pid_vel_p_term
+geometry_msgs/Vector3 pid_vel_i_term
+geometry_msgs/Vector3 pid_vel_d_term

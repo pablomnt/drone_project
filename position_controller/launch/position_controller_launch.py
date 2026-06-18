@@ -28,7 +28,7 @@ def generate_launch_description():
         launch.actions.ExecuteProcess(
             cmd=[
                 'xterm', '-hold', '-e', 'bash', '-lc',
-                f"ros2 launch okvis okvis_node_subscriber.launch.xml config_filename:={config_file}"
+                f"ros2 launch okvis okvis_node_realsense.launch.xml config_filename:={config_file}"
             ],
             output='screen'
         ),

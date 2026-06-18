@@ -21,7 +21,7 @@ PositionControl::PositionControl() {
     _lim_vel_up = 2.0;
     _lim_vel_down = 1.0;
     _lim_tilt = 0.43; // ~25 degrees
-    _hover_thrust = 0.5;
+    _hover_thrust = 0.4;
     _filtered_thrust_cmd = 0.5;
     _reset_hover_filter = true;
     _hover_thrust_convergence_time = 2.5; // Time constant for hover thrust learning rate convergence (seconds)
@@ -68,7 +68,6 @@ void PositionControl::update(double dt) {
     _is_taking_off = true;     // Start the open-loop ramp
     _takeoff_primed = false;   // CONSUME the authorization. Only way to re-prime is through a reset on the ground
     }
-
     // TAKEOFF OVERRIDE
     if (_is_taking_off) {
         // 1. Force the drone perfectly level so it physically CANNOT skid.
@@ -86,14 +85,16 @@ void PositionControl::update(double dt) {
         _attitude_sp = Eigen::Quaterniond(flat_rot);
 
         // 2. Open-Loop Thrust Ramp
-        // Ramp up the thrust aggressively (e.g., 20% to 60% over 1 second).
-        // Adjust 0.3 (30% per second) based on your drone's weight.
-        _takeoff_ramp_thrust += (0.4 * dt); 
-    
-
-        if (_vel.z() < 1.0){
-            _takeoff_ramp_thrust = std::min(_takeoff_ramp_thrust, 0.78);
+        if(_takeoff_phase == 1 && _vel.z() < 0.6) { // Phase 1, increase throttle until 1 m/s^2 acceleration is detected
+            _takeoff_ramp_thrust += (0.3 * dt); 
+        }else{
+            _takeoff_phase = 2;
+            if(_vel.z() > 0.6){
+                _takeoff_ramp_thrust -= (0.1 * dt);
+            }
         }
+
+        _takeoff_ramp_thrust = std::min(_takeoff_ramp_thrust, 0.4);
 
         // Override the PID's thrust command
         _thrust_sp = _takeoff_ramp_thrust;
@@ -104,8 +105,9 @@ void PositionControl::update(double dt) {
 
         // 4. Check for Liftoff (Handoff to PID)
         if (_pos.z() > 1.0) {
-            _is_taking_off = false; // We have left the ground!
-            _takeoff_ramp_thrust = 0.0; // Reset for next time
+            _is_taking_off = false; // We have left the ground
+            _takeoff_phase = 1;
+            _takeoff_ramp_thrust = 0.15; // Reset for next time
             
             // Seamlessly initialize the hover thrust filter to exactly what 
             // the ramp used to get us off the ground.
@@ -126,7 +128,8 @@ void PositionControl::reset() {
 
     // Tell the estimator a new flight regime just started
     _reset_hover_filter = true;
-    _takeoff_ramp_thrust = 0.0;
+    _takeoff_ramp_thrust = 0.15;
+    _takeoff_phase = 1;
     _is_taking_off = false;
     
     // Evaluate our physical state at the exact moment of reset
@@ -280,7 +283,7 @@ void PositionControl::_updateHoverThrust(double dt) {
 
     // Constrain instantaneous estimate to physically plausible boundaries
     // to prevent divergence during external physical disturbances.
-    inst_hover_thrust = std::clamp(inst_hover_thrust, 0.5, 0.9);
+    inst_hover_thrust = std::clamp(inst_hover_thrust, 0.2, 0.5);
 
     // Dynamic measurement covariance scaling.
     // Degrade trust in the IMU measurements proportionally to vertical speed

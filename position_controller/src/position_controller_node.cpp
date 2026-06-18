@@ -23,6 +23,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "px4_msgs/msg/sensor_combined.hpp"
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
+#include "position_controller/msg/controller_debug.hpp"
 
 // Our Library
 #include "position_controller/PositionControl.hpp"
@@ -45,10 +46,10 @@ public:
         // Vertical (Z) - Soften the P-gain and add D-gain to absorb camera noise
         this->declare_parameter("MPC_Z_P", 1.0);        // Position P (Standard)
         this->declare_parameter("MPC_Z_VEL_P", 2.0);    // Velocity P (Lowered from 4.0 to stop noise spikes)
-        this->declare_parameter("MPC_Z_VEL_I", 0.0);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
-        this->declare_parameter("MPC_Z_VEL_D", 0.0);    // Velocity D (Raised from 0.0 to act as a shock absorber)
+        this->declare_parameter("MPC_Z_VEL_I", 0.5);    // Velocity I (Lowered from 2.0 to prevent deep wind-up during wobble)
+        this->declare_parameter("MPC_Z_VEL_D", 0.2);    // Velocity D (Raised from 0.0 to act as a shock absorber)
         
-        this->declare_parameter("MPC_HOVER_THRUST", 0.74); // 0.74
+        this->declare_parameter("MPC_HOVER_THRUST", 0.35);
         this->declare_parameter<int>("TRAJECTORY_SELECTOR", 4);
 
         // Bring back the custom position parameter!
@@ -117,13 +118,7 @@ public:
         pub_vehicle_command_mode_executor_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
             "/fmu/in/vehicle_command_mode_executor", 10);
 
-        pub_target_pos_ = this->create_publisher<geometry_msgs::msg::PointStamped>("/debug/target_position", 10);
-        pub_target_vel_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/target_velocity", 10);
-        pub_target_acc_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/target_acceleration", 10);
-        pub_pid_p_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_p_term", 10);
-        pub_pid_i_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_i_term", 10);
-        pub_pid_d_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>("/debug/pid_d_term", 10);
-        pub_thrust_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/debug/thrust", 10);
+        pub_debug_ = this->create_publisher<position_controller::msg::ControllerDebug>("/debug/telemetry", 10);
 
         // 5. Main Loop (50Hz)rclcpp::ParameterTypeException'
         timer_ = this->create_wall_timer(20ms, std::bind(&PositionControllerNode::controlLoop, this));
@@ -176,13 +171,7 @@ private:
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_mode_;
     rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_vehicle_command_;
     rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_vehicle_command_mode_executor_;
-    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr pub_target_pos_;
-    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_target_vel_;
-    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_target_acc_;
-    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_p_;
-    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_i_;
-    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub_pid_d_;
-    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_thrust_;
+    rclcpp::Publisher<position_controller::msg::ControllerDebug>::SharedPtr pub_debug_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     // Data Storage
@@ -196,10 +185,15 @@ private:
     bool has_setpoint_ = false;
     std::vector<int> last_buttons_ = std::vector<int>(12, 0);
     std::vector<float> last_axes_ = std::vector<float>(8, 0.0);
-    double current_px4_yaw_enu_ = 0.0;
-    double current_vio_yaw_enu_ = 0.0;
     sensor_msgs::msg::Joy joy_input_;
     px4_msgs::msg::VehicleStatus vehicle_status_;
+    
+    Eigen::Vector3d pos_enu{0.0, 0.0, 0.0};
+    Eigen::Vector3d vel_enu{0.0, 0.0, 0.0};
+    Eigen::Vector3d acc_enu{0.0, 0.0, 0.0};
+    double yaw_enu = 0.0;
+    double yaw_enu_px4 = 0.0;
+    double yaw_enu_vio = 0.0;
 
     // Sequence Trackers
     int last_trajectory_selector_ = -1;
@@ -317,8 +311,8 @@ private:
     }
 
     void px4OdomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
-        Eigen::Vector3d pos_enu(msg->position[1], msg->position[0], -msg->position[2]);
-        Eigen::Vector3d vel_enu(msg->velocity[1], msg->velocity[0], -msg->velocity[2]);
+        Eigen::Vector3d pos_enu_px4(msg->position[1], msg->position[0], -msg->position[2]);
+        Eigen::Vector3d vel_enu_px4(msg->velocity[1], msg->velocity[0], -msg->velocity[2]);
 
         use_sim_mode_ = this->get_parameter("USE_SIM_MODE").as_bool();
 
@@ -326,13 +320,17 @@ private:
         double siny_cosp = 2.0 * (q[0] * q[3] + q[1] * q[2]);
         double cosy_cosp = 1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3]);
         double yaw_ned = std::atan2(siny_cosp, cosy_cosp);
-        double yaw_enu = -yaw_ned + M_PI_2;
 
-        current_px4_yaw_enu_ = yaw_enu;
+        yaw_enu_px4 = -yaw_ned + M_PI_2;
+        // Wrap the angle between -PI and PI so it doesn't jump out of bounds
+        yaw_enu_px4 = std::atan2(std::sin(yaw_enu_px4), std::cos(yaw_enu_px4));
         has_px4_odom_ = true;
 
         // If in simulation mode, feed PX4 data directly into the controller
         if (use_sim_mode_) {
+            pos_enu = pos_enu_px4;
+            vel_enu = vel_enu_px4;
+            yaw_enu = yaw_enu_px4;
             controller_.setState(pos_enu, vel_enu, yaw_enu);
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "PX4 ENU Pos [m]: (%.2f, %.2f, %.2f) | Vel [m/s]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
@@ -347,7 +345,7 @@ private:
 
         use_sim_mode_ = this->get_parameter("USE_SIM_MODE").as_bool();
         // 1. Position is World Frame (ENU)
-        Eigen::Vector3d pos_enu(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+        Eigen::Vector3d pos_enu_vio(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
         
         // 2. Velocity is Body Frame. We must rotate it!
         Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
@@ -355,26 +353,23 @@ private:
         Eigen::Quaterniond q_sensor_to_world(q_msg.w, q_msg.x, q_msg.y, q_msg.z);
         
         // Multiply the rotation matrix by the body velocity to get World Velocity
-        Eigen::Vector3d vel_enu = q_sensor_to_world.toRotationMatrix() * vel_body;
+        Eigen::Vector3d vel_enu_vio = q_sensor_to_world.toRotationMatrix() * vel_body;
 
         // 3. Extract Yaw and apply the 90-degree OKVIS2 offset
         double siny_cosp = 2.0 * (q_msg.w * q_msg.z + q_msg.x * q_msg.y);
         double cosy_cosp = 1.0 - 2.0 * (q_msg.y * q_msg.y + q_msg.z * q_msg.z);
-        double yaw_enu = std::atan2(siny_cosp, cosy_cosp) + M_PI_2;
+        yaw_enu_vio = std::atan2(siny_cosp, cosy_cosp) + M_PI_2;
 
         // Wrap the angle between -PI and PI so it doesn't jump out of bounds
-        yaw_enu = std::atan2(std::sin(yaw_enu), std::cos(yaw_enu));
+        yaw_enu_vio = std::atan2(std::sin(yaw_enu_vio), std::cos(yaw_enu_vio));
 
-        current_vio_yaw_enu_ = yaw_enu;
         has_vio_odom_ = true;
-        
-        // --- ADD THIS FOR REAL-TIME DEBUGGING ---
-        RCLCPP_INFO(this->get_logger(), "DEBUG Vel ENU [m/s] -> X: %+.2f | Y: %+.2f | Z: %+.2f", 
-                    vel_enu.x(), vel_enu.y(), vel_enu.z());
-        // ----------------------------------------
 
         // If in normal mode, feed VIO data into the controller
         if (!use_sim_mode_) {
+            pos_enu = pos_enu_vio;
+            vel_enu = vel_enu_vio;
+            yaw_enu = yaw_enu_vio;
             controller_.setState(pos_enu, vel_enu, yaw_enu);
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "VIO ENU Pos [m]: (%.2f, %.2f, %.2f) | Vel [m/s]: (%.2f, %.2f, %.2f) | Yaw [deg]: %.2f",
@@ -386,7 +381,7 @@ private:
     }
 
     void sensorCombinedCallback(const px4_msgs::msg::SensorCombined::SharedPtr msg) {
-        Eigen::Vector3d acc_enu(msg->accelerometer_m_s2[1], msg->accelerometer_m_s2[0], -msg->accelerometer_m_s2[2]);
+        acc_enu << msg->accelerometer_m_s2[1], msg->accelerometer_m_s2[0], -msg->accelerometer_m_s2[2];
         acc_enu.z() -= 9.81; // Remove gravity to get actual acceleration
         has_sensor_combined_ = true;
         controller_.setCurrentAcceleration(acc_enu);
@@ -577,12 +572,9 @@ private:
         double thrust = controller_.getThrustSetpoint();
 
         // HEADING DRIFT CORRECTION (Pure ENU)
-        double yaw_drift_enu = 0.0;
-        
-        // Only calculate and apply drift if we are NOT in sim mode
-        if (!use_sim_mode_) {
-            yaw_drift_enu = current_px4_yaw_enu_ - current_vio_yaw_enu_;
-        }
+        double yaw_drift_enu = yaw_enu_px4 - yaw_enu;
+        // Wrap the angle between -PI and PI so it doesn't jump out of bounds
+        yaw_drift_enu = std::atan2(std::sin(yaw_drift_enu), std::cos(yaw_drift_enu));
 
         Eigen::Matrix3d R_yaw_correction;
         R_yaw_correction = Eigen::AngleAxisd(yaw_drift_enu, Eigen::Vector3d::UnitZ());
@@ -606,44 +598,52 @@ private:
         q_ned.normalize(); 
 
         // DEBUG TELEMETRY PUBLISHERS
-        auto now = this->get_clock()->now();
+        position_controller::msg::ControllerDebug debug_msg;
 
-        geometry_msgs::msg::PointStamped pos_msg;
-        pos_msg.header.stamp = now;
-        pos_msg.point.x = controller_.getPositionSetpoint().x();
-        pos_msg.point.y = controller_.getPositionSetpoint().y();
-        pos_msg.point.z = controller_.getPositionSetpoint().z();
-        pub_target_pos_->publish(pos_msg);
+        debug_msg.pos.x = pos_enu.x();
+        debug_msg.pos.y = pos_enu.y();
+        debug_msg.pos.z = pos_enu.z();
 
-        auto publish_vector3 = [&](rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr pub, Eigen::Vector3d vec) {
-            geometry_msgs::msg::Vector3Stamped msg;
-            msg.header.stamp = now;
-            msg.vector.x = vec.x();
-            msg.vector.y = vec.y();
-            msg.vector.z = vec.z();
-            pub->publish(msg);
-        };
+        debug_msg.yaw = yaw_enu;
+        debug_msg.yaw_px4 = yaw_enu_px4;
 
-        publish_vector3(pub_target_vel_, controller_.getVelocitySetpoint());
-        publish_vector3(pub_pid_p_, controller_.getVelocityPTerm());
-        publish_vector3(pub_pid_i_, controller_.getVelocityITerm());
-        publish_vector3(pub_pid_d_, controller_.getVelocityDTerm());
+        debug_msg.vel.x = vel_enu.x();
+        debug_msg.vel.y = vel_enu.y();
+        debug_msg.vel.z = vel_enu.z();
 
-        std_msgs::msg::Float64MultiArray thrust_msg;
-        thrust_msg.data.push_back(controller_.getHoverThrust());
-        thrust_msg.data.push_back(thrust);
-        pub_thrust_->publish(thrust_msg);
+        debug_msg.acc.x = acc_enu.x();
+        debug_msg.acc.y = acc_enu.y();
+        debug_msg.acc.z = acc_enu.z();
 
-        geometry_msgs::msg::Vector3Stamped acc_msg;
-        acc_msg.header.stamp = this->get_clock()->now();
-        
-        // Ask the controller for the acceleration!
+        debug_msg.pos_sp.x = controller_.getPositionSetpoint().x();
+        debug_msg.pos_sp.y = controller_.getPositionSetpoint().y();
+        debug_msg.pos_sp.z = controller_.getPositionSetpoint().z();
+
+        debug_msg.vel_sp.x = controller_.getVelocitySetpoint().x();
+        debug_msg.vel_sp.y = controller_.getVelocitySetpoint().y();
+        debug_msg.vel_sp.z = controller_.getVelocitySetpoint().z();
+
         Eigen::Vector3d current_acc_sp = controller_.getAccelerationSetpoint();
-        
-        acc_msg.vector.x = current_acc_sp.x();
-        acc_msg.vector.y = current_acc_sp.y();
-        acc_msg.vector.z = current_acc_sp.z();
-        pub_target_acc_->publish(acc_msg);
+        debug_msg.acc_sp.x = current_acc_sp.x();
+        debug_msg.acc_sp.y = current_acc_sp.y();
+        debug_msg.acc_sp.z = current_acc_sp.z();
+
+        debug_msg.thrust_cmd = thrust;
+        debug_msg.hover_thrust = controller_.getHoverThrust();
+
+        debug_msg.pid_vel_p_term.x = controller_.getVelocityPTerm().x();
+        debug_msg.pid_vel_p_term.y = controller_.getVelocityPTerm().y();
+        debug_msg.pid_vel_p_term.z = controller_.getVelocityPTerm().z();
+
+        debug_msg.pid_vel_i_term.x = controller_.getVelocityITerm().x();
+        debug_msg.pid_vel_i_term.y = controller_.getVelocityITerm().y();
+        debug_msg.pid_vel_i_term.z = controller_.getVelocityITerm().z();
+
+        debug_msg.pid_vel_d_term.x = controller_.getVelocityDTerm().x();
+        debug_msg.pid_vel_d_term.y = controller_.getVelocityDTerm().y();
+        debug_msg.pid_vel_d_term.z = controller_.getVelocityDTerm().z();
+
+        pub_debug_->publish(debug_msg);
         
         // PUBLISH TO PX4
         px4_msgs::msg::VehicleAttitudeSetpoint att_msg;

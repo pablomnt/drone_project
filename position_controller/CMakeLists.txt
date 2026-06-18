@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.8)
 project(position_controller)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Default to C++17
+# Set default C++ standard
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -11,28 +11,34 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-
-# 1. Find Dependencies
+# Find necessary dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(px4_msgs REQUIRED)        # <--- This is what you actually need
+find_package(px4_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 
-# 2. Include Directories
+# Generate custom messages
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/ControllerDebug.msg"
+  DEPENDENCIES geometry_msgs
+)
+
+# Include external directories
 include_directories(
   include
   ${Eigen3_INCLUDE_DIRS}
 )
 
-# 3. Create the Math Library
+# Compile the position control math library
 add_library(position_control_lib src/PositionControl.cpp)
 target_link_libraries(position_control_lib Eigen3::Eigen)
 
-# 4. Create the ROS 2 Node
+# Build the main ROS node
 add_executable(position_controller_node src/position_controller_node.cpp)
 target_link_libraries(position_controller_node 
   position_control_lib
@@ -46,15 +52,24 @@ ament_target_dependencies(position_controller_node
   nav_msgs
 )
 
-# 5. Create the Test Executable (Optional, but good to keep)
+# Link the generated message headers to the node
+rosidl_target_interfaces(position_controller_node
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp"
+)
+
+# Build the test executable
 add_executable(test_library src/test_library.cpp)
 target_link_libraries(test_library position_control_lib)
 
-# 6. Install Rules
-install(TARGETS 
-  position_control_lib
-  position_controller_node
-  test_library
+# Define install rules for the library and executables
+install(TARGETS position_control_lib
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+install(TARGETS position_controller_node test_library
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -66,5 +81,7 @@ install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}
 )
+
+set_target_properties(position_controller_node PROPERTIES INSTALL_RPATH "$ORIGIN/..")
 
 ament_package()
