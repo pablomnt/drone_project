@@ -75,9 +75,9 @@ frontend_parameters:
 # estimator parameters
 estimator_parameters:
     num_keyframes: 5 # number of keyframes in optimisation window
-    num_loop_closure_frames: 5 # number of loop closure frames in optimisation window
+    num_loop_closure_frames: 0 # number of loop closure frames in optimisation window
     num_imu_frames: 3 # number of frames linked by most recent nonlinear IMU error terms
-    do_loop_closures: true # whether to do VI-SLAM or VIO
+    do_loop_closures: false # whether to do VI-SLAM or VIO
     do_final_ba: true # Whether to run a full final BA
     enforce_realtime: true # whether to limit the time budget for optimisation 
     realtime_min_iterations: 3 # minimum number of iterations always performed
@@ -86,7 +86,7 @@ estimator_parameters:
     realtime_num_threads: 2 # number of threads for the realtime optimisation
     full_graph_iterations: 15 # don't do more than these for the full (background) optimisation
     full_graph_num_threads: 2 # number of threads for the full (background) optimisation
-    p_dbow: 0.4 # Match threshold for dBoW -- unfortunately this varies with setups.
+    p_dbow: 0.0 # Match threshold for dBoW -- unfortunately this varies with setups.
     drift_percentage_heuristic: 1.35 # % allowed drift in loop closures rel. to dist. travelled.
 
 # some options for how and what to output
