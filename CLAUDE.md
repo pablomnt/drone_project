@@ -1,0 +1,207 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+`drone_project`: software for an autonomous vision-based quadcopter. The drone runs PX4 firmware,
+uses a RealSense D435i + OKVIS2 for visual-inertial state estimation and RTAB-Map for SLAM/mapping,
+plans with RRT* + minimum-snap trajectories, and tracks them with a custom cascaded-PID /
+differential-flatness controller that outputs attitude + collective thrust to PX4 over uXRCE-DDS.
+
+The repo is split into **two top-level domains** (this `src/` is the only git repo; the colcon
+workspace root `~/ws_paramio` holds `build/`, `install/`, `log/` and is not under version control):
+
+1. **`core/` — the ROS-free autonomy core (`drone_core`).** Pure C++17, plain CMake, **builds and
+   unit-tests with zero ROS installed**. Depends only on ROS-free libraries: Eigen, octomap (the
+   library, not `octomap_msgs`), OMPL, NLopt. This is where all guidance and control logic lives.
+   It carries a `COLCON_IGNORE` so colcon never tries to build it.
+2. **`ros2/` — thin ROS wrappers + vendored third-party ROS packages.** The colcon/ament side. The
+   one first-party node (`autonomy_node`) does only message↔core-type translation, frame
+   conversions, and PX4 I/O; the heavy third-party packages (`okvis`, `px4_msgs`) live under
+   `ros2/third_party/` as in-tree copies of their upstream repos.
+
+The long-term goal is a clean, startup-grade codebase that can drop ROS (and eventually PX4)
+without rewriting the autonomy logic — hence ROS is confined to the I/O shell and PX4's failsafe is
+**not** relied upon (the core has its own watchdog; see below).
+
+**Deployment/operation**: the onboard computer is an Intel NUC (i5, 16GB RAM, no GPU) — this drives
+the tuning choices noted under *NUC resource constraints*. The operator controls the NUC over SSH
+in a tmux session, with the laptop and NUC tethered to a phone hotspot; Foxglove (`foxglove_bridge`
+on port 8765) is used for remote visualization. This workflow is manual and not codified in the
+repo — there are no tmux/SSH/Foxglove config files to find.
+
+## Directory layout
+
+```
+src/
+├── core/                       # ROS-FREE autonomy core (plain CMake, COLCON_IGNORE)
+│   ├── common/                 # types.hpp, frames.{hpp,cpp}, logging.hpp
+│   ├── control/                # position_control, flatness_mapper, trajectory_tracker
+│   ├── planning/               # rrt_star_planner, min_snap_trajectory
+│   └── autonomy/               # autonomy_core (the orchestrator)
+└── ros2/                       # everything colcon/ament
+    ├── autonomy_node/          # the one first-party ROS node + launch files
+    ├── drone_interfaces/       # custom msgs (ControllerDebug)
+    ├── third_party/            # okvis2 (pkg name 'okvis'), px4_msgs  (vendored copies)
+    ├── sim/pc_publisher/       # sim-only static .pcd publisher
+    └── tools/system_monitor_pkg/   # python CPU/RAM telemetry
+```
+
+## Build
+
+Two steps: build+install the standalone core, then colcon-build the ROS side pointing at it.
+
+```bash
+# 1. Build + install the ROS-free core (plain CMake). Do this with ROS NOT sourced to prove it.
+cmake -S src/core -B build/core -DCMAKE_BUILD_TYPE=Release
+cmake --build build/core
+cmake --install build/core --prefix install_core      # any prefix; put it on CMAKE_PREFIX_PATH below
+
+# 2. Build the ROS wrappers, pointing find_package(drone_core) at the core install.
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_NN=OFF \
+  -DCMAKE_PREFIX_PATH=$PWD/install_core
+source install/setup.bash
+```
+
+`autonomy_node` links the core's **static** libs (`drone_core::autonomy` etc.), so there is no
+runtime dependency on the core install — only a build-time one via `CMAKE_PREFIX_PATH`.
+
+The `--cmake-args` that matter (all consumed by `okvis2`; other packages ignore them):
+
+- **`-DUSE_NN=OFF` — required to build.** `okvis2` defaults `USE_NN=ON`, which needs LibTorch
+  (not installed, no GPU). The runtime config disables the CNN anyway (`use_cnn: false`), so this
+  costs nothing.
+- **`-DCMAKE_BUILD_TYPE=Release` — strongly wanted.** `okvis2` only *warns* otherwise, but VIO+SLAM
+  are too slow on the NUC un-optimized. Also build the core Release for flight.
+- **`-DBUILD_ROS2=ON` — redundant** (already the okvis2 default).
+
+Package names vs. directories mostly match, except `ros2/third_party/okvis2/` whose package name is
+`okvis`. `okvis2` is a large vendored VIO library with its own `external/` deps (ceres, brisk,
+DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake options.
+
+## Test / Lint
+
+- **Core unit tests (no ROS).** This is the primary test path and the proof the core is ROS-free:
+  ```bash
+  cmake -S src/core -B build/core -DDRONE_CORE_BUILD_TESTS=ON
+  cmake --build build/core
+  ctest --test-dir build/core --output-on-failure
+  ```
+  Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
+  OFF ≡ baseline), `flatness_mapper`, `planner`, `autonomy_core` (plan→track→watchdog).
+- ROS packages use `ament_lint_auto` / `ament_lint_common` via `colcon test`; the python packages
+  (`pc_publisher` C++ aside, `system_monitor_pkg`) carry the standard flake8/pep257/copyright triplet.
+
+## Runtime architecture
+
+The pipeline is now fully connected: perception → mapping → **planning → control** → PX4.
+
+```
+RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (/rtabmap/cloud_map)
+         → octomap_server (/octomap_binary)
+                                   │
+                      ┌────────────┴───────────── autonomy_node (thin ROS wrapper) ─────────────┐
+                      │  subscribes: octomap, okvis odom, px4 odom, sensor_combined,            │
+                      │              vehicle_status, /planner/goal, /joy                         │
+                      │  owns a drone_core::autonomy::AutonomyCore, drives it at 50 Hz,          │
+                      │  converts ENU↔NED/FRD at the boundary, publishes attitude+thrust to PX4  │
+                      └────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                  PX4 (via MicroXRCEAgent, serial /dev/ttyUSB0 or UDP for SITL)
+```
+
+Launch files live in `ros2/autonomy_node/launch/`: `autonomy_vision_launch.py` (real flight, full
+camera/VIO/mapping stack + Foxglove + the `body→camera_link` static TF), `autonomy_launch.py`
+(xterm-per-process variant), `autonomy_sim_launch.py` (`USE_SIM_MODE:=true`, `MicroXRCEAgent udp4`).
+
+### The autonomy core (`core/`)
+
+`AutonomyCore` (`core/autonomy/`) is the orchestrator and the object a host (the ROS node, a sim
+harness, or a test) drives. It is middleware-free and runs **three internal cadences**:
+
+- **RRT\* geometric replanning (~0.2 Hz)** and **minimum-snap trajectory generation (~1 Hz)** on a
+  **background worker thread** (receding-horizon: trajgen re-anchors to the current state). The fast
+  control path never blocks on planning; finished trajectories are handed over by an **atomic swap**.
+- **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
+
+Module roles:
+
+- **`common`** — shared plain types (`State`, `Reference`, `Command`, `Trajectory`, `Goal`,
+  `MapHandle`) and **`frames`**, which holds *all* ENU↔NED/FRD and OKVIS-yaw conversions (extracted
+  from the old node so they are unit-testable). `logging.hpp` replaces ROS logging in the core.
+- **`planning`** — `RrtStarPlanner` (OMPL SE(3) RRT* over an octree, X/Y ±15 m, Z 0.3–2.5 m, 0.4 m
+  inflation, 3 s budget) and `MinSnapTrajectory` / `MinSnapTimeOptimizer` (KKT min-snap + NLopt
+  BOBYQA time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a
+  `Trajectory` of **per-segment polynomial coefficients + durations** (not sampled points) so the
+  flatness mapper can differentiate it analytically.
+- **`control`** — see the flight-critical note below.
+
+### control (`core/control/`) — flight-critical, be careful
+
+**`position_control.{hpp,cpp}` holds flight-tested logic for a real vehicle.** The PID gains,
+hover-thrust estimator constants, and open-loop takeoff ramp have been tuned and proven stable in
+flight ("Drone flies :)"). Do not change the gains or control math unless the task specifically
+requires it; validate any change in `USE_SIM_MODE`/SITL first. Notable behavior:
+
+- **Open-loop takeoff override**: on a ground `reset()` it primes a takeoff; when a setpoint above
+  0.5 m arrives it ramps thrust open-loop (flat attitude) until liftoff, then hands to the PID —
+  because closed-loop control near the ground with noisy VIO causes skidding.
+- **Online hover-thrust estimation**: back-calculates hover thrust from filtered command + measured
+  vertical accel, de-weighting the estimate at high vertical speed; overridable via `MPC_HOVER_THRUST`.
+- **Differential-flatness feed-forward (added on top, default OFF)**: `setReference()` accepts
+  `vel_ff`/`acc_ff`; with feed-forward disabled the controller is byte-identical to the baseline
+  (the `feedforward` unit test asserts this). Toggle live with the `ENABLE_FEEDFORWARD` parameter.
+  Feed-forward is suppressed during the takeoff ramp. The accel→attitude/thrust map *is* the flatness
+  output stage and already existed — that's why trajectory tracking didn't require a new controller.
+
+`flatness_mapper` samples the trajectory for pos/vel/acc and derives **yaw from the velocity
+heading** (camera leads the motion), holding the last yaw only when slow *and* the heading is
+spinning. `trajectory_tracker` composes the mapper + controller and runs the **watchdog state
+machine**: `kDirect` (explicit setpoint — takeoff/manual hover), `kTracking` (follow a fresh planner
+trajectory), `kHoverHold` (failsafe: latch current position when guidance goes stale, i.e. the
+planner stalled/died). The stale fallback hovers; it does not land (PX4 rejects offboard land).
+
+### autonomy_node (`ros2/autonomy_node/`)
+
+Thin wrapper. Per 50 Hz tick: publishes the offboard heartbeat, checks arm/offboard (resets the
+core on disarm or leaving offboard, re-priming takeoff), assembles an ENU `State` from the active
+estimator (VIO in normal mode; PX4 odom in `USE_SIM_MODE`), feeds the core, reads back the `Command`,
+applies the **yaw-drift correction** (toward PX4's yaw) and the ENU→NED/FRD conversion via
+`core/common/frames`, and publishes the attitude setpoint + `ControllerDebug` telemetry. Goals
+arrive on `/planner/goal`; a `POS_SP` parameter provides the default takeoff/hover setpoint. All
+PX4 message types and frame conversions are confined to this file.
+
+### px4_msgs / okvis (`ros2/third_party/`)
+
+Vendored in-tree copies of upstream repos (kept as copies, **not** git submodules). `px4_msgs`
+matches the PX4 v1.17 topic set. Don't hand-edit these; they mirror upstream.
+
+## Hardware / external process dependencies
+
+Required at runtime, referenced by path/command in the launch files:
+
+- `MicroXRCEAgent` — ROS2 ⇄ PX4 uORB bridge, serial (`/dev/ttyUSB0`) or UDP (`8888`, SITL).
+- `realsense2_camera`, `rtabmap_launch`, `octomap_server`, `foxglove_bridge`, `joy`, `tf2_ros` —
+  external ROS2 packages launched from the autonomy_node launch files.
+- The OKVIS config (`ros2/third_party/okvis2/config/realsense_D435i.yaml`) and the cpu monitor are
+  referenced by expanded `$HOME` paths in the launch files — update those paths if the workspace moves.
+- **Map-frame consistency (verify before flying planned trajectories)**: the octomap/RTAB-Map "map"
+  frame must share an origin with the controller's VIO-rooted ENU. The TF tree is patched by a
+  `body→camera_link` static transform (`--pitch -1.5708 --roll 1.5708`), now folded into
+  `autonomy_vision_launch.py` rather than run by hand.
+
+### NUC resource constraints
+
+The NUC (i5, 16GB, no GPU) is tight for VIO + SLAM + planning at once — keep this in mind before
+suggesting higher resolution/rate/quality:
+
+- Camera capped at 640×480@15fps (depth/infra/RGB) in `autonomy_vision_launch.py`.
+- `okvis2/config/realsense_D435i.yaml`: `use_cnn: false` (no GPU), ≤400 keypoints, `octaves: 0`,
+  2 optimization threads, 40 ms realtime budget.
+- RTAB-Map tuned light (`rtabmap_viz:=false`, `--Vis/MinInliers 12`, `--Rtabmap/DetectionRate 1`);
+  OctoMap at 0.05 m. Min-snap trajgen is ms-cheap; RRT* runs on its own thread (≤3 s) so it never
+  stalls the 50 Hz control loop.
+- `system_monitor_pkg/cpu_monitor.py` publishes `/telemetry/cpu_usage_total` and
+  `/telemetry/ram_usage_total` at 2 Hz (it does not write a file; the root `cpu_log.csv` is an
+  unrelated one-off `dstat` capture).
