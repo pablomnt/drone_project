@@ -134,6 +134,25 @@ def generate_launch_description():
                 f'{cpu_script_path}'
             ],
             output='screen'
+        ),
+
+        # Clear the startup phantom voxels. The body->camera_link static TF isn't on the wire
+        # when RTAB-Map/octomap process their first clouds, so those frames get inserted without
+        # the optical->body rotation and land ~90 deg off to the side; octomap's octree is
+        # cumulative so they persist. Once the TF tree has settled, reset RTAB-Map so the map
+        # rebuilds clean. `ros2 service call` waits for the service, so the period is just a floor.
+        # (Automates the manual `ros2 service call /rtabmap/rtabmap/reset std_srvs/srv/Empty "{}"`.)
+        launch.actions.TimerAction(
+            period=5.0,
+            actions=[
+                launch.actions.ExecuteProcess(
+                    cmd=[
+                        'ros2', 'service', 'call', '/rtabmap/rtabmap/reset',
+                        'std_srvs/srv/Empty', '{}'
+                    ],
+                    output='screen'
+                )
+            ]
         )
-        
+
     ])

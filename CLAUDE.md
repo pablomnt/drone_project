@@ -59,8 +59,13 @@ cmake --build build/core
 cmake --install build/core --prefix install_core      # any prefix; put it on CMAKE_PREFIX_PATH below
 
 # 2. Build the ROS wrappers, pointing find_package(drone_core) at the core install.
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_NN=OFF \
-  -DCMAKE_PREFIX_PATH=$PWD/install_core
+#    Put install_core on the CMAKE_PREFIX_PATH *env var* with an ABSOLUTE path — colcon manages
+#    that var per-package, so this reliably reaches autonomy_node. Do NOT rely on
+#    `--cmake-args -DCMAKE_PREFIX_PATH=$PWD/install_core`: $PWD must be exactly the ws root, and
+#    colcon can shadow the -D cache override, so find_package(drone_core) fails ("Could not find ...
+#    drone_coreConfig.cmake") even though the core installed fine.
+export CMAKE_PREFIX_PATH=/home/dron/ws_paramio/install_core:$CMAKE_PREFIX_PATH
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_NN=OFF
 source install/setup.bash
 ```
 

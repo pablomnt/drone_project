@@ -134,17 +134,22 @@ RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (/rtabmap/cloud_m
 
 ## Build
 
-Two steps: build+install the standalone core, then colcon-build the ROS side pointing at it.
+Because the core is no longer a ROS package (it carries `COLCON_IGNORE`), building is **two steps**:
+build+install the standalone core with plain CMake, then colcon-build the ROS side pointing at that
+install. Run everything from the **colcon workspace root** (`~/ws_paramio`), not from this `src/`.
 
 ```bash
+cd ~/ws_paramio
+
 # 1. Build + install the ROS-free core (plain CMake). Do this with ROS NOT sourced to prove it.
 cmake -S src/core -B build/core -DCMAKE_BUILD_TYPE=Release
 cmake --build build/core
 cmake --install build/core --prefix install_core    # any prefix; goes on CMAKE_PREFIX_PATH below
 
-# 2. Build the ROS wrappers, pointing find_package(drone_core) at the core install.
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_NN=OFF \
-  -DCMAKE_PREFIX_PATH=$PWD/install_core
+# 2. Build the ROS wrappers. Put install_core on the CMAKE_PREFIX_PATH *env var* with an ABSOLUTE
+#    path so find_package(drone_core) resolves — see the warning below.
+export CMAKE_PREFIX_PATH=/home/dron/ws_paramio/install_core:$CMAKE_PREFIX_PATH
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_NN=OFF
 source install/setup.bash
 ```
 
@@ -152,6 +157,19 @@ source install/setup.bash
 only a build-time one via `CMAKE_PREFIX_PATH`. `-DUSE_NN=OFF` is required (okvis2 defaults it on,
 which needs LibTorch); `-DCMAKE_BUILD_TYPE=Release` is strongly wanted (VIO+SLAM are too slow on the
 NUC un-optimized).
+
+**Pointing colcon at the core — use the env var, not `-D`.** Do *not* rely on
+`--cmake-args -DCMAKE_PREFIX_PATH=$PWD/install_core`: `$PWD` has to be exactly the workspace root, and
+colcon manages `CMAKE_PREFIX_PATH` per-package and can shadow the `-D` cache override, so
+`find_package(drone_core)` fails with *"Could not find a package configuration file ... drone_core"*
+even though the core installed correctly. Exporting an absolute `CMAKE_PREFIX_PATH` (as above) is
+reliable because colcon *extends* that env var for every package.
+
+**After the restructure, wipe stale colcon dirs once.** The old `build/`, `install/`, `log/` were
+generated against the pre-restructure paths and colcon will refuse to reuse them ("source ... does
+not match the source ... used to generate cache"). They are not version-controlled:
+`rm -rf build install log` from the workspace root, then rebuild from step 1. Expect `px4_msgs`
+(a large generated package, ~4–5 min) to dominate a clean build.
 
 ## Test
 
