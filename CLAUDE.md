@@ -177,10 +177,32 @@ applies the **yaw-drift correction** (toward PX4's yaw) and the ENU→NED/FRD co
 arrive on `/planner/goal`; a `POS_SP` parameter provides the default takeoff/hover setpoint. All
 PX4 message types and frame conversions are confined to this file.
 
+### Frames & TF (OKVIS ↔ RTAB-Map) — why odom can look fine while the voxel map is wrong
+
+A RealSense depth point reaches the world through
+`world ──(OKVIS VIO)──▶ body ──(static body→camera_link)──▶ camera_link ──(RealSense REP-103)──▶ *_optical_frame`.
+OKVIS estimates `world→body` (the trajectory); `body→camera_link` is the fixed camera mount, a
+**pure rotation with zero translation** (`pitch -1.5708, roll 1.5708`) published by the
+`static_transform_publisher` in `autonomy_vision_launch.py`; RTAB-Map (base `camera_link`) assembles
+`/rtabmap/cloud_map`, octomap_server voxelizes it.
+
+Because that edge has **zero translation**, `body` and `camera_link` share an origin: the trajectory
+(a sequence of origins) is unaffected by a wrong rotation, but the voxels (depth projected along the
+camera's *orientation*) swing 90° when it's wrong — so a bad extrinsic gives correct-looking odometry
+with a sideways map. **The bug:** OKVIS *also* broadcast `body→camera_link`, set to `T_BS` (identity
+in our config), colliding with the launch's publisher — two latched `/tf_static` publishers of the
+same edge race nondeterministically per run (random 90°-off maps; pre-publishing the static TF or
+post-hoc map resets can't fix it). **The fix:** leave `T_BS` alone (it also defines OKVIS's estimation
+body frame, so rotating it would rotate the controller's odometry) and instead drop OKVIS's broadcast
+(local patch in `Publisher.cpp::setBodyTransform`, RViz-mesh-only and unused). The launch now solely
+owns the edge; RTAB-Map's `wait_for_transform:=3.0` blocks for the latched TF before its first cloud.
+
 ### px4_msgs / okvis (`ros2/third_party/`)
 
 Vendored in-tree copies of upstream repos (kept as copies, **not** git submodules). `px4_msgs`
-matches the PX4 v1.17 topic set. Don't hand-edit these; they mirror upstream.
+matches the PX4 v1.17 topic set. Don't hand-edit these; they mirror upstream — **except one
+deliberate local patch**: `okvis2/okvis_ros2/src/Publisher.cpp` (`setBodyTransform`) no longer
+broadcasts `body→camera_link` (see *Frames & TF* above). Re-apply it if you re-vendor okvis2.
 
 ## Hardware / external process dependencies
 

@@ -95,6 +95,11 @@ def generate_launch_description():
                 'approx_sync:=true '
                 'publish_tf_odom:=false '
                 'odom_topic:=/okvis/okvis_odometry '
+                # Block on TF lookups for up to 3s instead of the 0.2s default. /tf_static is
+                # latched, so once the body->camera_link static publisher is up the transform is
+                # available for all timestamps; waiting removes the startup race that otherwise
+                # placed the first clouds ~90 deg off (no map reset needed).
+                'wait_for_transform:=3.0 '
                 'args:=" -d --Vis/MinInliers 12 --Rtabmap/DetectionRate 1 --Rtabmap/ImagesBufferSize 10 --Rtabmap/TimeThr 0 --Rtabmap/MemoryThr 0"'
             ],
             output='screen'
@@ -108,6 +113,8 @@ def generate_launch_description():
             ],
             output='screen'
         ),
+
+        
 
         # Start Foxglove WebSocket bridge for remote visualization
         launch.actions.ExecuteProcess(
@@ -134,25 +141,7 @@ def generate_launch_description():
                 f'{cpu_script_path}'
             ],
             output='screen'
-        ),
-
-        # Clear the startup phantom voxels. The body->camera_link static TF isn't on the wire
-        # when RTAB-Map/octomap process their first clouds, so those frames get inserted without
-        # the optical->body rotation and land ~90 deg off to the side; octomap's octree is
-        # cumulative so they persist. Once the TF tree has settled, reset RTAB-Map so the map
-        # rebuilds clean. `ros2 service call` waits for the service, so the period is just a floor.
-        # (Automates the manual `ros2 service call /rtabmap/rtabmap/reset std_srvs/srv/Empty "{}"`.)
-        launch.actions.TimerAction(
-            period=5.0,
-            actions=[
-                launch.actions.ExecuteProcess(
-                    cmd=[
-                        'ros2', 'service', 'call', '/rtabmap/rtabmap/reset',
-                        'std_srvs/srv/Empty', '{}'
-                    ],
-                    output='screen'
-                )
-            ]
         )
 
     ])
+    

@@ -109,7 +109,10 @@ Custom message definitions (`ControllerDebug.msg`). Message generation has to st
 
 Vendored in-tree copies of upstream repos (kept as copies, not git submodules): `okvis2` (package
 name `okvis`, a large VIO library with its own `external/` deps) and `px4_msgs` (matching the PX4
-v1.17 topic set). Don't hand-edit these; they mirror upstream.
+v1.17 topic set). Don't hand-edit these; they mirror upstream — with **one deliberate local patch**:
+`okvis_ros2/src/Publisher.cpp` (`setBodyTransform`) no longer broadcasts the `body→camera_link` static
+TF, because it collided with the launch's static publisher and randomly corrupted the voxel map (see
+*Frames & TF* below). If you ever re-vendor okvis2 from upstream, re-apply that change.
 
 ### `sim/`, `tools/`
 
@@ -131,6 +134,49 @@ RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (/rtabmap/cloud_m
                                    │
                                   PX4 (via MicroXRCEAgent, serial /dev/ttyUSB0 or UDP for SITL)
 ```
+
+## Frames & TF (OKVIS ↔ RTAB-Map)
+
+Two different things get placed into the world, and they depend on *different* transforms — which is
+why a broken camera extrinsic corrupted the voxel map while the odometry/trajectory still looked
+perfectly correct. A depth point measured by the RealSense reaches the world frame through this chain:
+
+```
+world ──(OKVIS VIO, dynamic)──▶ body ──(static: body→camera_link)──▶ camera_link ──(RealSense, REP-103)──▶ camera_*_optical_frame
+```
+
+- OKVIS estimates the pose of `body` in `world` and publishes it as `/okvis/okvis_odometry` — this is
+  the trajectory RTAB-Map tracks against.
+- `body→camera_link` is the fixed camera-mount transform — a **pure rotation, zero translation**
+  (`pitch -1.5708, roll 1.5708`), published by the `static_transform_publisher` in
+  `autonomy_vision_launch.py`.
+- The RealSense driver supplies `camera_link → *_optical_frame` (the standard REP-103 optical rotation).
+- RTAB-Map (base frame `camera_link`) assembles `/rtabmap/cloud_map` in the `map` frame; octomap_server
+  voxelizes that into `/occupied_cells_vis_array`.
+
+**Why the odometry was fine but the voxels weren't.** Because `body→camera_link` has **zero
+translation**, `body` and `camera_link` share an origin — only their *orientation* differs. So the
+trajectory, which is the sequence of frame **origins**, is identical whether that rotation is right or
+wrong, and the path always looked correct. The voxels, however, are depth points projected outward
+along the camera's **orientation**; get that rotation wrong by 90° and every point swings 90° about the
+trajectory, so the whole map lands off to the side ("trash on the right") even though the path it was
+built from is perfect.
+
+**The bug (fixed).** OKVIS *also* broadcast `body→camera_link`, setting it to `T_BS` from
+`okvis2/config/realsense_D435i.yaml` — which is **identity** (no rotation). That collided with the
+launch's correct static publisher: two latched `/tf_static` publishers of the *same* edge, and tf2
+keeps whichever it received last, nondeterministically per run. Identity winning → 90°-off map; the
+launch's value winning → good map; a late overwrite → correct map with a few phantom startup voxels.
+This is exactly why pre-publishing the static TF didn't help and why a post-hoc RTAB-Map/octomap reset
+was an unreliable band-aid.
+
+**The fix.** We do **not** touch `T_BS` — it also defines OKVIS's body frame for state estimation, so
+rotating it would rotate the odometry the controller consumes. Instead we removed OKVIS's broadcast of
+that edge — a local patch in `ros2/third_party/okvis2/okvis_ros2/src/Publisher.cpp` (`setBodyTransform`);
+it only existed to hang the camera mesh in RViz, which we don't use (we visualize in Foxglove). The
+launch's `static_transform_publisher` is now the single, authoritative owner of `body→camera_link`, and
+RTAB-Map's `wait_for_transform:=3.0` makes it block for that latched static TF before assembling its
+first cloud. (This is a deliberate edit to vendored third-party code — see the `third_party/` note.)
 
 ## Build
 

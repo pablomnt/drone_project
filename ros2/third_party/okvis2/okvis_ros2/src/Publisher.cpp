@@ -133,8 +133,14 @@ void Publisher::setBodyTransform(const okvis::kinematics::Transformation& T_BS) 
   poseMsg.transform.translation.x = r[0];
   poseMsg.transform.translation.y = r[1];
   poseMsg.transform.translation.z = r[2];
-  static tf2_ros::StaticTransformBroadcaster br(node_);
-  br.sendTransform(poseMsg);
+  // LOCAL PATCH (not upstream): do NOT broadcast body->camera_link here. Our config has T_BS =
+  // identity, so this published an identity body->camera_link that collided with the deliberate
+  // static_transform_publisher (pitch -1.5708, roll 1.5708) in autonomy_vision_launch.py. Two
+  // latched /tf_static publishers of the same edge race nondeterministically, giving random
+  // 90-deg-off maps. This TF only existed to hang the camera mesh in RViz (unused; we use
+  // Foxglove), so drop it and let the launch own body->camera_link.
+  // static tf2_ros::StaticTransformBroadcaster br(node_);
+  // br.sendTransform(poseMsg);
 }
 
 void Publisher::setCsvFile(const std::string & filename, bool rpg)
