@@ -1,6 +1,8 @@
 #include "drone_core/planning/rrt_star_planner.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <limits>
 #include <utility>
 
@@ -71,36 +73,37 @@ RrtStarPlanner::RrtStarPlanner(const MapHandle& octree, double planning_time)
 }
 
 bool RrtStarPlanner::isStateValid(const ompl::base::State* state) {
-  if (!octree_ptr_) return false;
-
   const auto* se3state = state->as<ompl::base::SE3StateSpace::StateType>();
   const auto* pos = se3state->as<ompl::base::RealVectorStateSpace::StateType>(0);
 
-  // Obstacle inflation [m]: obstacles are grown by `margin` so the vehicle keeps
-  // clearance. The full safety_dist applies everywhere except a sphere around the
-  // start, where the reduced start_safety_dist applies instead — a parked or
-  // lifting drone sits within safety_dist of the mapped floor/clutter, so without
-  // this relaxation it could never root the search. start_safety_dist still
-  // inflates by its own amount: 0 lets the path touch up to, but never enter, an
-  // obstacle voxel; raise it for more startup clearance, exactly as safety_dist
-  // tunes the rest of the path. (The inflation is horizontal-only; a vertical
-  // margin is a known gap, slated for the EDT rework.)
-  const double safety_dist = 0.4;          // inflate obstacles to clear tight doorways
-  const double start_safety_dist = 0.0;    // reduced inflation within the start sphere
-  const double start_escape_radius = 0.5;  // [m] extent of the start sphere
-
+  // Margin to enforce here: the full collision margin in general, the reduced
+  // start margin within the escape sphere so a parked/lifting drone sitting within
+  // the margin of the mapped floor can still root the search without ever entering
+  // an obstacle. The sphere centre (start_pos_) is anchored in planPath /
+  // isPathValid.
   const double ex = pos->values[0] - start_pos_[0];
   const double ey = pos->values[1] - start_pos_[1];
   const double ez = pos->values[2] - start_pos_[2];
   const bool near_start =
-      ex * ex + ey * ey + ez * ez <= start_escape_radius * start_escape_radius;
-  const double margin = near_start ? start_safety_dist : safety_dist;
+      ex * ex + ey * ey + ez * ez <= kStartEscapeRadius * kStartEscapeRadius;
+  const double margin = near_start ? kStartMargin : kCollisionMargin;
 
-  // Reject if any obstacle lies within `margin` (horizontally) of the state.
-  // Unknown space (null node) is treated as free so the planner can route into
-  // not-yet-mapped regions. The motion checker samples finer (0.01 m) than the
-  // voxel size, so a segment cannot tunnel through an occupied voxel between
-  // samples even when margin is 0.
+  // Preferred path: a single O(1) clearance lookup when a clearance field is set
+  // (the live planner always sets one). The field is the 3D Euclidean distance to
+  // the nearest obstacle, so this enforces vertical clearance too — unlike the
+  // horizontal-only fallback below — and is far cheaper than the cell scan.
+  // Outside the field / unknown space reads as free (it returns the saturation
+  // distance), matching the treat-unknown-as-free policy.
+  if (clearance_fn_) {
+    return clearance_fn_(pos->values[0], pos->values[1], pos->values[2]) > margin;
+  }
+
+  // Fallback for standalone use (no clearance field, e.g. unit tests): scan the
+  // octree directly, inflating obstacles by `margin` in the horizontal plane.
+  // Unknown space (null node) is free. The motion checker samples finer (0.01 m)
+  // than the voxel size, so a segment cannot tunnel through an occupied voxel
+  // between samples even when margin is 0.
+  if (!octree_ptr_) return false;
   const double res = octree_ptr_->getResolution();
   for (double dx = -margin; dx <= margin; dx += res) {
     for (double dy = -margin; dy <= margin; dy += res) {
@@ -113,6 +116,24 @@ bool RrtStarPlanner::isStateValid(const ompl::base::State* state) {
     }
   }
   return true;
+}
+
+double RrtStarPlanner::minClearance(const std::vector<std::vector<double>>& path) const {
+  if (!clearance_fn_ || path.size() < 2) return std::numeric_limits<double>::infinity();
+  double mind = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    const auto& a = path[i];
+    const auto& b = path[i + 1];
+    const double seg = std::hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    const int steps = std::max(1, static_cast<int>(std::ceil(seg / 0.05)));
+    for (int s = 0; s <= steps; ++s) {
+      const double u = static_cast<double>(s) / steps;
+      mind = std::min(mind, clearance_fn_(a[0] + u * (b[0] - a[0]),
+                                          a[1] + u * (b[1] - a[1]),
+                                          a[2] + u * (b[2] - a[2])));
+    }
+  }
+  return mind;
 }
 
 bool RrtStarPlanner::isPathValid(const std::vector<std::vector<double>>& path) const {
@@ -182,6 +203,16 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
 
   const ompl::base::PlannerStatus solved = planner->ompl::base::Planner::solve(planning_time_);
   if (!solved) {
+    return false;
+  }
+
+  // OMPL reports both exact and approximate solutions as "solved". An approximate
+  // solution stops short of the goal (the tree never connected to it). Accept one
+  // only if its endpoint is within kGoalFlexibility of the goal; otherwise reject
+  // the plan — the caller then treats this as no path (infinite cost) rather than
+  // committing the vehicle to a route that ends partway. getSolutionDifference()
+  // is the distance from the returned path's end to the goal.
+  if (pdef->hasApproximateSolution() && pdef->getSolutionDifference() > kGoalFlexibility) {
     return false;
   }
 

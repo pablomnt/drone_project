@@ -53,12 +53,17 @@ inside the core.
 
 ### `planning/`
 
-- `RrtStarPlanner` — OMPL SE(3) RRT* over an octree (X/Y ±15 m, Z 0.3–2.5 m, 0.4 m obstacle
-  inflation, 3 s solve budget). Inside a small sphere around the start state (`start_escape_radius`,
-  0.5 m) a reduced inflation (`start_safety_dist`, default 0 m) applies instead of the full 0.4 m, so
-  a parked or just-lifting drone — whose footprint sits within the normal margin of the mapped floor —
-  can still root the search and take off. Obstacles themselves are never ignored: even at 0 m startup
-  margin the path may approach but never pass *through* an occupied voxel.
+- `RrtStarPlanner` — OMPL SE(3) RRT* over an octree (X/Y ±15 m, Z 0.3–2.5 m, 3 s solve budget).
+  Collision checking is **EDT-based**: a state is free when its clearance (3D Euclidean distance to
+  the nearest obstacle, from a `DynamicEDTOctomap` passed in as the clearance function) exceeds
+  `kCollisionMargin` (0.4 m) — one O(1) lookup that also enforces *vertical* clearance. (A
+  horizontal-only octree box scan remains as a fallback for standalone use when no field is set.)
+  Inside a sphere around the start (`kStartEscapeRadius`, 0.5 m) the required clearance drops to
+  `kStartMargin` (0 m) so a parked or just-lifting drone — sitting within the normal margin of the
+  mapped floor — can still root the search and take off, without ever passing *through* an obstacle.
+  RRT* approximate solutions that stop more than `kGoalFlexibility` (0.3 m) short of the goal are
+  rejected (treated as no path) rather than committed to. The same field also drives a clearance-aware
+  cost (`setClearance`). These tunables are `static constexpr` in the class.
 - `MinSnapTrajectory` / `MinSnapTimeOptimizer` — KKT minimum-snap solve plus an NLopt BOBYQA outer
   loop for per-segment time allocation ("mode A" of ETH Zurich's `mav_trajectory_generation`). The
   optimizer keeps the actual per-segment polynomial coefficients + segment times (rather than
@@ -215,11 +220,13 @@ colcon manages `CMAKE_PREFIX_PATH` per-package and can shadow the `-D` cache ove
 even though the core installed correctly. Exporting an absolute `CMAKE_PREFIX_PATH` (as above) is
 reliable because colcon *extends* that env var for every package.
 
-**After the restructure, wipe stale colcon dirs once.** The old `build/`, `install/`, `log/` were
-generated against the pre-restructure paths and colcon will refuse to reuse them ("source ... does
-not match the source ... used to generate cache"). They are not version-controlled:
-`rm -rf build install log` from the workspace root, then rebuild from step 1. Expect `px4_msgs`
-(a large generated package, ~4–5 min) to dominate a clean build.
+**Incremental colcon builds are the norm — don't wipe to rebuild.** Re-running `colcon build`
+rebuilds only what changed; a full wipe forces a ~4–5 min `px4_msgs` plus a long `okvis2` rebuild for
+nothing. The only situation that warrants a clean is the stale-cache error *"source ... does not match
+the source ... used to generate cache"*, which colcon throws when a package's path moves (it bit us
+once during the restructure when files moved under `src/ros2/`). Even then, remove just the offending
+package's `build/<pkg>` and `install/<pkg>` rather than the whole tree. Treat a full workspace wipe as
+a deliberate, rare action — never a routine build step.
 
 ## Test
 

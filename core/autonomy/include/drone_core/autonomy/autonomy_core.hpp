@@ -11,6 +11,11 @@
 #include "drone_core/planning/min_snap_trajectory.hpp"
 #include "drone_core/planning/rrt_star_planner.hpp"
 
+// Forward declaration (from dynamicEDT3D) so the cached distance field can be a
+// member without pulling that header into this ROS-free public interface.
+template <class TREE>
+class DynamicEDTOctomapBase;
+
 namespace drone_core::autonomy {
 
 // Top-level autonomy object. It owns the whole guidance-to-control pipeline and
@@ -105,6 +110,23 @@ private:
   void stagePending(const common::Trajectory& traj);
   void plannerLoop();
 
+  // Configure `planner` with the shared clearance-aware objective used by BOTH
+  // the monitor and improve passes (build the EDT over `map`, then setClearance
+  // with cfg_.clearance_weight / cfg_.clearance_threshold), so a forced replan
+  // and an improvement search minimise exactly the same cost. Returns false and
+  // leaves the planner length-optimal when the map has no obstacles (clearance
+  // is then uniform and the EDT meaningless).
+  bool applyClearanceObjective(planning::RrtStarPlanner& planner,
+                               const planning::MapHandle& map);
+
+  // Return the cached Euclidean distance field for `map`, rebuilding it only when
+  // the map has actually changed (octomap hands us a fresh tree per message). A
+  // static scene therefore reuses one EDT instead of rebuilding it every tick.
+  // Returns nullptr (and clears the cache) when the map is empty / has no
+  // obstacles. Called only from the planner worker thread.
+  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> clearanceField(
+      const planning::MapHandle& map);
+
   Config cfg_;
   std::function<double()> clock_;
 
@@ -130,9 +152,12 @@ private:
   std::thread worker_;
   std::atomic<bool> running_{false};
   std::vector<std::vector<double>> cached_path_;
-  double last_monitor_{-1.0e9};
-  double last_improve_{-1.0e9};
   double last_trajgen_{-1.0e9};
+
+  // Cached distance field and the map it was built from — the single obstacle
+  // model for both collision validity and the clearance cost. See clearanceField.
+  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> edt_;
+  planning::MapHandle edt_source_map_;
 };
 
 }  // namespace drone_core::autonomy

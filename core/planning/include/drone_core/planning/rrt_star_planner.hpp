@@ -56,6 +56,15 @@ public:
   // against the committed one for a hysteresis-gated replan decision.
   double pathCost(const std::vector<std::vector<double>>& path) const;
 
+  // Smallest clearance (distance to the nearest obstacle, metres) along the path,
+  // sampled finely. Requires a clearance field (see setClearance); returns
+  // +infinity when none is set or the path has fewer than two points. Purely a
+  // diagnostic — it is what the validity check flags if it drops below the margin.
+  double minClearance(const std::vector<std::vector<double>>& path) const;
+
+  // The hard clearance the validity check enforces away from the start [m].
+  double collisionMargin() const { return kCollisionMargin; }
+
 private:
   bool isStateValid(const ompl::base::State* state);
   ompl::base::OptimizationObjectivePtr makeObjective() const;
@@ -75,6 +84,21 @@ private:
   ClearanceFn clearance_fn_;            // null => optimise pure path length
   double clearance_weight_ = 0.0;       // obstacle-proximity penalty weight
   double clearance_threshold_ = 1.0;    // clearance saturation distance [m]
+
+  // Validity margins [m]. A state is free when its clearance exceeds the margin:
+  // kCollisionMargin in general, the reduced kStartMargin within kStartEscapeRadius
+  // of the start so a parked/lifting drone can root the search (see isStateValid).
+  static constexpr double kCollisionMargin = 0.4;
+  static constexpr double kStartMargin = 0.0;
+  static constexpr double kStartEscapeRadius = 0.5;
+
+  // goal_flexibility [m]: how far short of the goal an RRT* solution may stop and
+  // still be accepted. RRT* may return an approximate solution that does not reach
+  // the goal (e.g. the goal sits in tight clearance); accept it only within this
+  // tolerance, otherwise reject the plan rather than commit to a path that stops
+  // short. Raise it to tolerate harder-to-reach goals, lower it to insist on
+  // (near-)exact arrival.
+  static constexpr double kGoalFlexibility = 0.3;
 };
 
 }  // namespace drone_core::planning

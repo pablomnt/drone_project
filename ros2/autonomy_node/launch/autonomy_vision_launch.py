@@ -88,6 +88,9 @@ def generate_launch_description():
                 'ros2 launch rtabmap_launch rtabmap.launch.py '
                 'visual_odometry:=false '
                 'rtabmap_viz:=false '
+                # Quiet rtabmap's per-update INFO stats so the terminal can focus on
+                # planning logs; warnings/errors still print.
+                'log_level:=warn '
                 'rgb_topic:=/camera/camera/color/image_raw '
                 'depth_topic:=/camera/camera/aligned_depth_to_color/image_raw '
                 'camera_info_topic:=/camera/camera/color/camera_info '

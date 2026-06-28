@@ -126,16 +126,20 @@ camera/VIO/mapping stack + Foxglove + the `body→camera_link` static TF), `auto
 harness, or a test) drives. It is middleware-free and runs cadences on a background worker thread
 and the fast control thread:
 
-**Background worker (planning, geometry-first phase):**
-- **Monitor (~2 Hz, `rrt_monitor_period=0.5 s`):** re-checks the committed path against the latest
-  map via `RrtStarPlanner::isPathValid`. If clear, keeps it. If blocked (or no path yet), forces a
-  length-optimal replan and adopts unconditionally (safety). Also resets the improve clock so a
-  just-created path isn't immediately re-solved.
-- **Improve (~0.2 Hz, `rrt_improve_period=5 s`):** builds a `DynamicEDTOctomap` (maxdist =
-  `clearance_threshold`), runs a **clearance-aware** RRT* (`cost = ∫(1 + w·max(0,thresh−d)) ds`),
-  and adopts the candidate **only if** `cost ≤ replan_improve_ratio × committed_cost`. Skipped when
-  no obstacles are mapped. `simplifyMax` is disabled in clearance mode (it would shortcut back
-  toward obstacles).
+**Background worker (planning, geometry-first phase):** one loop ticking at the monitor cadence
+(`rrt_monitor_period`, ~2 Hz). Each tick builds **one** planner and does:
+- **Monitor (every tick):** re-checks the committed path via `RrtStarPlanner::isPathValid`. If a
+  point's clearance has dropped below the margin it's `path_invalid`.
+- **Improve (every Nth tick,** `N = round(rrt_improve_period / rrt_monitor_period)` ≈ 10): flagged
+  only with a committed path and obstacles mapped.
+- A **search runs iff** `path_invalid || improve_run`. If `path_invalid`, adopt the result
+  **unconditionally** (safety); else (improve, path valid) adopt **only if**
+  `cost ≤ replan_improve_ratio × committed_cost` (hysteresis, prevents chatter). One search ⇒ one
+  EDT use per tick. Both validity and cost use the **same cached `DynamicEDTOctomap`** (`maxdist =
+  clearance_threshold`), rebuilt only when the map object changes (see `clearanceField`), not per
+  tick. Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`; `simplifyMax` is disabled in clearance
+  mode (it would shortcut back toward obstacles). Each tick logs one line (phase, committed cost, min
+  clearance, blocked/why, outcome); OMPL's own console is set to `LOG_WARN` to keep the terminal clean.
 - **Trajectory generation (~1 Hz, `trajgen_period`):** re-anchors min-snap to current position.
   **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
   control stays on `kDirect` / POS_SP.
@@ -146,21 +150,23 @@ Module roles:
 - **`common`** — shared plain types (`State`, `Reference`, `Command`, `Trajectory`, `Goal`,
   `MapHandle`) and **`frames`**, which holds *all* ENU↔NED/FRD and OKVIS-yaw conversions (extracted
   from the old node so they are unit-testable). `logging.hpp` replaces ROS logging in the core.
-- **`planning`** — `RrtStarPlanner` (OMPL SE(3) RRT* over an octree, X/Y ±15 m, Z −1.5–2.5 m,
-  0.4 m inflation, **horizontal-only** — vertical margin is a known gap deferred to the EDT rework).
-  **Start-state escape sphere**: within `start_escape_radius` (0.5 m) of the start the planner
-  inflates by the reduced `start_safety_dist` (default 0 m) instead of the full 0.4 m, so a parked or
-  just-lifting drone — whose footprint sits inside the normal margin of the mapped floor — can still
-  root the tree. Obstacles are never skipped: even at 0 m startup margin the path may approach but not
-  enter an occupied voxel (the 0.01 m motion-check resolution is finer than the voxel size, so a
-  segment can't tunnel through). The sphere is anchored at the start in `planPath` and at the first
-  waypoint in `isPathValid`, so a path that begins on the floor doesn't fail the periodic re-check and
-  churn replans. Both constants are local in `isStateValid` (deliberately not ROS params).
-  Supports a **clearance-aware cost** via `setClearance(fn, weight, threshold)`
-  that adds an obstacle-proximity integral penalty; without it falls back to pure path length.
-  `isPathValid()` re-checks a committed path against the current map (same collision model as
-  planning). `pathCost()` scores an existing waypoint list under the current objective, used for
-  the hysteresis gate. `MinSnapTrajectory` / `MinSnapTimeOptimizer` (KKT min-snap + NLopt BOBYQA
+- **`planning`** — `RrtStarPlanner` (OMPL SE(3) RRT* over an octree, X/Y ±15 m, Z −1.5–2.5 m).
+  **Collision check is EDT-based**: a state is free when its clearance (3D Euclidean distance to the
+  nearest obstacle, via a `DynamicEDTOctomap` passed as the clearance fn) exceeds `kCollisionMargin`
+  (0.4 m) — one O(1) lookup, and because the distance is 3D it enforces **vertical** clearance too
+  (the old horizontal-only box is now only a fallback in `isStateValid` for standalone/test use with
+  no field set). **Start-state escape sphere**: within `kStartEscapeRadius` (0.5 m) of the start the
+  required clearance drops to `kStartMargin` (0 m) so a parked/just-lifting drone — sitting within the
+  normal margin of the mapped floor — can root the tree; obstacles are never skipped (clearance must
+  still exceed 0, i.e. not inside a voxel). Anchored at the start in `planPath`, at the first waypoint
+  in `isPathValid`. `kGoalFlexibility` (0.3 m): RRT* approximate solutions that stop farther than this
+  from the goal are **rejected** (`planPath` returns false → caller sees infinite cost) rather than
+  committing to a path that ends short. All four are `static constexpr` in the class (deliberately not
+  ROS params). The same field feeds the **clearance-aware cost** via `setClearance(fn, weight,
+  threshold)` (obstacle-proximity integral penalty up to `clearance_threshold`); `isPathValid()`
+  re-checks a committed path under the same model; `pathCost()` scores a waypoint list for the
+  hysteresis gate; `minClearance()` reports a path's tightest clearance (diagnostic / logging).
+  `MinSnapTrajectory` / `MinSnapTimeOptimizer` (KKT min-snap + NLopt BOBYQA
   time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a `Trajectory`
   of **per-segment polynomial coefficients + durations** (not sampled points) so the flatness mapper
   can differentiate it analytically.

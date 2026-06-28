@@ -1,10 +1,16 @@
 #include "drone_core/autonomy/autonomy_core.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <memory>
 
 #include <dynamicEDT3D/dynamicEDTOctomap.h>
+#include <ompl/util/Console.h>
 
+#include "drone_core/common/logging.hpp"
 #include "drone_core/control/flatness_mapper.hpp"
 
 namespace drone_core::autonomy {
@@ -46,6 +52,10 @@ AutonomyCore::AutonomyCore(const Config& config)
   tracker_.setHoverThrust(cfg_.hover_thrust);
   tracker_.enableFeedforward(cfg_.enable_feedforward);
   tracker_.setStaleTimeout(cfg_.stale_timeout);
+
+  // Quiet OMPL's own console (the per-solve "RRTstar: ..." INFO/DEBUG spam) so the
+  // terminal shows our planner summary; warnings and errors still come through.
+  ompl::msg::setLogLevel(ompl::msg::LOG_WARN);
 }
 
 AutonomyCore::~AutonomyCore() {
@@ -70,10 +80,9 @@ void AutonomyCore::setGoal(const common::Goal& goal) {
   std::lock_guard<std::mutex> lock(io_mutex_);
   goal_ = goal;
   has_goal_ = true;
-  // Force a fresh geometric plan toward the new goal on the next worker cycle.
+  // Force a fresh geometric plan toward the new goal on the next worker cycle:
+  // an empty committed path reads as invalid, so the loop replans immediately.
   cached_path_.clear();
-  last_monitor_ = -1.0e9;
-  last_improve_ = -1.0e9;
 }
 
 void AutonomyCore::setSetpoint(const Eigen::Vector3d& pos, double yaw) {
@@ -229,7 +238,44 @@ void AutonomyCore::stagePending(const common::Trajectory& traj) {
   has_pending_ = true;
 }
 
+std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
+    const planning::MapHandle& map) {
+  // No obstacles => clearance is uniform => no field needed (validity treats
+  // everything as free, cost reduces to length). Drop any stale cache.
+  if (!map || map->size() == 0) {
+    edt_.reset();
+    edt_source_map_.reset();
+    return nullptr;
+  }
+  // Rebuild only when the map object itself changed. This is what makes the EDT
+  // collision check cheaper than the per-state octree scan it replaces: a static
+  // scene reuses one field across many ticks instead of rebuilding it each time.
+  if (map != edt_source_map_) {
+    edt_ = buildEdt(map, cfg_.clearance_threshold);
+    edt_source_map_ = map;
+  }
+  return edt_;
+}
+
+bool AutonomyCore::applyClearanceObjective(planning::RrtStarPlanner& planner,
+                                           const planning::MapHandle& map) {
+  auto edt = clearanceField(map);
+  if (!edt) return false;
+  // One field, two consumers: the planner's collision check (clearance > margin)
+  // and its cost objective (proximity penalty up to clearance_threshold).
+  planner.setClearance(
+      [edt, maxd = cfg_.clearance_threshold](double x, double y, double z) {
+        const double d = edt->getDistance(octomap::point3d(
+            static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+        return d < 0.0 ? maxd : d;  // outside the EDT bbx => treat as free
+      },
+      cfg_.clearance_weight, cfg_.clearance_threshold);
+  return true;
+}
+
 void AutonomyCore::plannerLoop() {
+  std::uint64_t run = 0;  // planner ticks taken (advanced only while a goal and map exist)
+
   while (running_.load()) {
     const double t = now();
 
@@ -246,6 +292,7 @@ void AutonomyCore::plannerLoop() {
     }
 
     if (has_goal && map) {
+      ++run;
       const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
       const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
 
@@ -256,60 +303,83 @@ void AutonomyCore::plannerLoop() {
         last_geometric_path_ = p;
       };
 
-      // MONITOR (fast): hold the committed path while it stays collision-free; on
-      // a block (or with no path yet) force a length-optimal replan and adopt it
-      // unconditionally — safety outranks optimality.
-      if (cached_path_.empty() || t - last_monitor_ >= cfg_.rrt_monitor_period) {
-        last_monitor_ = t;
-        planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
-        if (cached_path_.empty() || !planner.isPathValid(cached_path_)) {
-          std::vector<std::vector<double>> path;
-          if (planner.planPath(start, goal_vec, path)) {
-            adopt(path);
-            // The path is freshly optimal for the current map; let it settle a
-            // full improve period before spending another solve trying to beat it.
-            last_improve_ = t;
+      // One planner per tick. Set the clearance field FIRST: it is now the single
+      // obstacle model for both the collision check (clearance > margin) and the
+      // cost, so the committed-path re-check below sees the same obstacles the
+      // search would. The field is cached (rebuilt only on a map change), so this
+      // is cheap on the common still-valid tick.
+      planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
+      applyClearanceObjective(planner, map);
+
+      const bool had_path = !cached_path_.empty();
+      const bool path_invalid = !had_path || !planner.isPathValid(cached_path_);
+
+      // IMPROVE every Nth tick, N = improve period / monitor period (≈10 with the
+      // defaults), so the RRT_MONITOR_PERIOD / RRT_IMPROVE_PERIOD params still set
+      // both cadences. Skipped with no committed path or no obstacles mapped
+      // (clearance is then uniform, so there is nothing to improve — a blocked path
+      // still replans below regardless).
+      const long n = std::lround(cfg_.rrt_improve_period /
+                                 std::max(cfg_.rrt_monitor_period, 1.0e-3));
+      const std::uint64_t improve_interval = static_cast<std::uint64_t>(std::max<long>(1, n));
+      const bool improve_run = (run % improve_interval == 0) && had_path && map->size() > 0;
+
+      // Diagnostics on the committed path (the field is already set).
+      const double committed_cost = planner.pathCost(cached_path_);
+      const double committed_clr = planner.minClearance(cached_path_);
+
+      if (path_invalid || improve_run) {
+        std::vector<std::vector<double>> candidate;
+        const bool solved = planner.planPath(start, goal_vec, candidate);
+
+        if (path_invalid) {
+          // Forced replan — adopt unconditionally (safety outranks optimality).
+          if (solved) {
+            adopt(candidate);
+            if (had_path)
+              DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed BLOCKED (clr="
+                             << committed_clr << "m < " << planner.collisionMargin()
+                             << "m) -> REPLAN cost=" << planner.pathCost(candidate) << " clr="
+                             << planner.minClearance(candidate) << "m");
+            else
+              DRONE_LOG_INFO("[plan] #" << run << " MONITOR no committed path -> PLAN cost="
+                             << planner.pathCost(candidate) << " clr="
+                             << planner.minClearance(candidate) << "m");
+          } else {
+            DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed "
+                           << (had_path ? "BLOCKED" : "absent")
+                           << " -> REPLAN FAILED (no path to goal), holding");
+          }
+        } else {
+          // Improve — switch only past the hysteresis margin. RRT* is randomised,
+          // so without the margin a near-identical re-solve would chatter.
+          const double threshold = cfg_.replan_improve_ratio * committed_cost;
+          if (solved && planner.pathCost(candidate) <= threshold) {
+            const double cand_cost = planner.pathCost(candidate);
+            adopt(candidate);
+            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << committed_cost
+                           << " -> ADOPT cost=" << cand_cost << " clr="
+                           << planner.minClearance(candidate) << "m");
+          } else {
+            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << committed_cost
+                           << " clr=" << committed_clr << "m candidate cost="
+                           << (solved ? planner.pathCost(candidate)
+                                      : std::numeric_limits<double>::infinity())
+                           << " -> keep (need <=" << threshold << ")");
           }
         }
+      } else {
+        // Monitor only: committed path still clear of obstacles.
+        DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed cost=" << committed_cost
+                       << " clr=" << committed_clr << "m -> OK");
       }
 
-      // IMPROVE (slow): search for a clearance-aware better path and switch only
-      // if it beats the committed one by the hysteresis margin. RRT* is
-      // randomised, so without the margin a near-identical re-solve would be
-      // adopted every cycle and the path would chatter. Skipped with no obstacles
-      // mapped: clearance is then uniform, so there is nothing to improve.
-      if (!cached_path_.empty() && map->size() > 0 &&
-          t - last_improve_ >= cfg_.rrt_improve_period) {
-        last_improve_ = t;
-        auto edt = buildEdt(map, cfg_.clearance_threshold);
-        planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
-        planner.setClearance(
-            [edt, maxd = cfg_.clearance_threshold](double x, double y, double z) {
-              const double d = edt->getDistance(octomap::point3d(
-                  static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
-              return d < 0.0 ? maxd : d;  // outside the EDT bbx => treat as free
-            },
-            cfg_.clearance_weight, cfg_.clearance_threshold);
-
-        std::vector<std::vector<double>> candidate;
-        if (planner.planPath(start, goal_vec, candidate)) {
-          const double committed_cost = planner.pathCost(cached_path_);
-          const double candidate_cost = planner.pathCost(candidate);
-          if (candidate_cost <= cfg_.replan_improve_ratio * committed_cost) adopt(candidate);
-        }
-      }
-
-      // Trajectory generation is the next pipeline stage; while it is disabled
-      // the worker is a pure geometric planner and control keeps following the
-      // direct setpoint (the tracker is never handed a trajectory).
-      if (!cfg_.plan_trajectory) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        continue;
-      }
-
-      // Local trajectory replan on the mid cadence, re-anchored to where the
-      // vehicle actually is now.
-      if (!cached_path_.empty() && t - last_trajgen_ >= cfg_.trajgen_period) {
+      // Trajectory generation is the next pipeline stage; while plan_trajectory is
+      // false the worker is a pure geometric planner and control keeps following
+      // the direct setpoint (the tracker is never handed a trajectory). When
+      // enabled it re-anchors min-snap to where the vehicle is now, on its cadence.
+      if (cfg_.plan_trajectory && !cached_path_.empty() &&
+          t - last_trajgen_ >= cfg_.trajgen_period) {
         std::vector<std::vector<double>> path = cached_path_;
         path.front() = {state.pos.x(), state.pos.y(), state.pos.z()};
         common::Trajectory traj;
@@ -320,7 +390,10 @@ void AutonomyCore::plannerLoop() {
       }
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // The loop ticks at the monitor cadence — every iteration is one monitor tick.
+    // Clamp to a small floor so a mis-set period cannot turn this into a busy loop.
+    std::this_thread::sleep_for(
+        std::chrono::duration<double>(std::max(cfg_.rrt_monitor_period, 0.01)));
   }
 }
 
