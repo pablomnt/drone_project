@@ -1,6 +1,9 @@
 #include "drone_core/autonomy/autonomy_core.hpp"
 
 #include <chrono>
+#include <memory>
+
+#include <dynamicEDT3D/dynamicEDTOctomap.h>
 
 #include "drone_core/control/flatness_mapper.hpp"
 
@@ -11,6 +14,27 @@ namespace {
 double steadyNowSeconds() {
   const auto t = std::chrono::steady_clock::now().time_since_epoch();
   return std::chrono::duration<double>(t).count();
+}
+
+// Build a Euclidean distance transform over the occupancy octree, capped at
+// maxdist (metres) so its cost is bounded by the obstacle envelope rather than
+// the whole volume. getDistance() then gives O(1) clearance lookups. Points
+// outside the map's bounding box read as "no obstacle within maxdist", matching
+// the planner's treat-unknown-as-free policy.
+std::shared_ptr<DynamicEDTOctomap> buildEdt(const std::shared_ptr<octomap::OcTree>& tree,
+                                            double maxdist) {
+  double xmin, ymin, zmin, xmax, ymax, zmax;
+  tree->getMetricMin(xmin, ymin, zmin);
+  tree->getMetricMax(xmax, ymax, zmax);
+  const octomap::point3d bbx_min(static_cast<float>(xmin), static_cast<float>(ymin),
+                                 static_cast<float>(zmin));
+  const octomap::point3d bbx_max(static_cast<float>(xmax), static_cast<float>(ymax),
+                                 static_cast<float>(zmax));
+  auto edt = std::make_shared<DynamicEDTOctomap>(static_cast<float>(maxdist), tree.get(),
+                                                 bbx_min, bbx_max,
+                                                 /*treatUnknownAsOccupied=*/false);
+  edt->update();
+  return edt;
 }
 
 }  // namespace
@@ -48,7 +72,8 @@ void AutonomyCore::setGoal(const common::Goal& goal) {
   has_goal_ = true;
   // Force a fresh geometric plan toward the new goal on the next worker cycle.
   cached_path_.clear();
-  last_rrt_ = -1.0e9;
+  last_monitor_ = -1.0e9;
+  last_improve_ = -1.0e9;
 }
 
 void AutonomyCore::setSetpoint(const Eigen::Vector3d& pos, double yaw) {
@@ -174,10 +199,15 @@ std::vector<std::vector<double>> AutonomyCore::sampledPlannedPath(double sample_
   return path;
 }
 
+std::vector<std::vector<double>> AutonomyCore::geometricPath() const {
+  std::lock_guard<std::mutex> lock(traj_mutex_);
+  return last_geometric_path_;
+}
+
 bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal& goal,
                                  const planning::MapHandle& map,
                                  std::vector<std::vector<double>>& path) {
-  planning::RrtStarPlanner planner(map);
+  planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
   const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
   const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
   return planner.planPath(start, goal_vec, path);
@@ -216,13 +246,65 @@ void AutonomyCore::plannerLoop() {
     }
 
     if (has_goal && map) {
-      // Geometric replan on the slow cadence (or whenever the path was invalidated).
-      if (cached_path_.empty() || t - last_rrt_ >= cfg_.rrt_period) {
-        std::vector<std::vector<double>> path;
-        if (runGlobalPlan(state, goal, map, path)) {
-          cached_path_ = path;
-          last_rrt_ = t;
+      const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
+      const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
+
+      // Commit a path: keep it on the worker and republish for visualisation.
+      auto adopt = [this](const std::vector<std::vector<double>>& p) {
+        cached_path_ = p;
+        std::lock_guard<std::mutex> lock(traj_mutex_);
+        last_geometric_path_ = p;
+      };
+
+      // MONITOR (fast): hold the committed path while it stays collision-free; on
+      // a block (or with no path yet) force a length-optimal replan and adopt it
+      // unconditionally — safety outranks optimality.
+      if (cached_path_.empty() || t - last_monitor_ >= cfg_.rrt_monitor_period) {
+        last_monitor_ = t;
+        planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
+        if (cached_path_.empty() || !planner.isPathValid(cached_path_)) {
+          std::vector<std::vector<double>> path;
+          if (planner.planPath(start, goal_vec, path)) {
+            adopt(path);
+            // The path is freshly optimal for the current map; let it settle a
+            // full improve period before spending another solve trying to beat it.
+            last_improve_ = t;
+          }
         }
+      }
+
+      // IMPROVE (slow): search for a clearance-aware better path and switch only
+      // if it beats the committed one by the hysteresis margin. RRT* is
+      // randomised, so without the margin a near-identical re-solve would be
+      // adopted every cycle and the path would chatter. Skipped with no obstacles
+      // mapped: clearance is then uniform, so there is nothing to improve.
+      if (!cached_path_.empty() && map->size() > 0 &&
+          t - last_improve_ >= cfg_.rrt_improve_period) {
+        last_improve_ = t;
+        auto edt = buildEdt(map, cfg_.clearance_threshold);
+        planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
+        planner.setClearance(
+            [edt, maxd = cfg_.clearance_threshold](double x, double y, double z) {
+              const double d = edt->getDistance(octomap::point3d(
+                  static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+              return d < 0.0 ? maxd : d;  // outside the EDT bbx => treat as free
+            },
+            cfg_.clearance_weight, cfg_.clearance_threshold);
+
+        std::vector<std::vector<double>> candidate;
+        if (planner.planPath(start, goal_vec, candidate)) {
+          const double committed_cost = planner.pathCost(cached_path_);
+          const double candidate_cost = planner.pathCost(candidate);
+          if (candidate_cost <= cfg_.replan_improve_ratio * committed_cost) adopt(candidate);
+        }
+      }
+
+      // Trajectory generation is the next pipeline stage; while it is disabled
+      // the worker is a pure geometric planner and control keeps following the
+      // direct setpoint (the tracker is never handed a trajectory).
+      if (!cfg_.plan_trajectory) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
       }
 
       // Local trajectory replan on the mid cadence, re-anchored to where the

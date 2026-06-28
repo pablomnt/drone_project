@@ -21,10 +21,12 @@
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
 
+#include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "sensor_msgs/msg/joy.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 #include "px4_msgs/msg/offboard_control_mode.hpp"
 #include "px4_msgs/msg/sensor_combined.hpp"
 #include "px4_msgs/msg/vehicle_attitude_setpoint.hpp"
@@ -86,9 +88,11 @@ public:
     pub_command_ = create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
     pub_debug_ = create_publisher<drone_interfaces::msg::ControllerDebug>("/debug/telemetry", 10);
     pub_path_ = create_publisher<nav_msgs::msg::Path>("/smooth_trajectory", 10);
+    pub_geom_path_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/geometric_path", 10);
+    pub_goal_marker_ = create_publisher<visualization_msgs::msg::Marker>("/planner/goal_marker", 10);
 
     control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this));
-    viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishPlannedPath, this));
+    viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this));
 
     RCLCPP_INFO(get_logger(), "Autonomy node started.");
   }
@@ -114,8 +118,18 @@ private:
 
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
     declare_parameter("STALE_TIMEOUT", 0.5);
-    declare_parameter("RRT_PERIOD", 5.0);
+    declare_parameter("RRT_MONITOR_PERIOD", 0.5);
+    declare_parameter("RRT_IMPROVE_PERIOD", 5.0);
+    declare_parameter("RRT_SOLVE_TIME", 5.0);
+    declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
+    declare_parameter("CLEARANCE_WEIGHT", 4.0);
+    declare_parameter("CLEARANCE_THRESHOLD", 1.0);
     declare_parameter("TRAJGEN_PERIOD", 1.0);
+    // Geometry-first bring-up: with this false the planner only runs RRT* and
+    // publishes the geometric path; it does not generate a trajectory or feed
+    // the controller, which keeps following POS_SP. Flip to true to enable the
+    // min-snap trajectory + tracking stage.
+    declare_parameter("PLAN_TRAJECTORY", false);
   }
 
   drone_core::autonomy::AutonomyCore::Config configFromParameters() {
@@ -139,8 +153,14 @@ private:
     cfg.hover_thrust = get_parameter("MPC_HOVER_THRUST").as_double();
     cfg.enable_feedforward = get_parameter("ENABLE_FEEDFORWARD").as_bool();
     cfg.stale_timeout = get_parameter("STALE_TIMEOUT").as_double();
-    cfg.rrt_period = get_parameter("RRT_PERIOD").as_double();
+    cfg.rrt_monitor_period = get_parameter("RRT_MONITOR_PERIOD").as_double();
+    cfg.rrt_improve_period = get_parameter("RRT_IMPROVE_PERIOD").as_double();
+    cfg.rrt_solve_time = get_parameter("RRT_SOLVE_TIME").as_double();
+    cfg.replan_improve_ratio = get_parameter("REPLAN_IMPROVE_RATIO").as_double();
+    cfg.clearance_weight = get_parameter("CLEARANCE_WEIGHT").as_double();
+    cfg.clearance_threshold = get_parameter("CLEARANCE_THRESHOLD").as_double();
     cfg.trajgen_period = get_parameter("TRAJGEN_PERIOD").as_double();
+    cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
     return cfg;
   }
 
@@ -229,6 +249,8 @@ private:
     drone_core::common::Goal goal;
     goal.pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
     core_->setGoal(goal);
+    goal_pos_ = goal.pos;
+    has_goal_ = true;
     RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f, %.2f)", goal.pos.x(), goal.pos.y(), goal.pos.z());
   }
 
@@ -345,6 +367,83 @@ private:
     pub_debug_->publish(d);
   }
 
+  void publishViz() {
+    publishGoalMarker();
+    publishGeometricPath();
+    publishPlannedPath();
+  }
+
+  // The active goal as a single sphere marker, so it renders as a point in RViz
+  // regardless of display type (unlike the raw /planner/goal PoseStamped, which
+  // RViz draws as an orientation arrow).
+  void publishGoalMarker() {
+    if (!has_goal_) return;
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = "map";
+    m.header.stamp = now();
+    m.ns = "goal";
+    m.id = 0;
+    m.type = visualization_msgs::msg::Marker::SPHERE;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.pose.position.x = goal_pos_.x();
+    m.pose.position.y = goal_pos_.y();
+    m.pose.position.z = goal_pos_.z();
+    m.pose.orientation.w = 1.0;
+    m.scale.x = m.scale.y = m.scale.z = 0.3;  // sphere diameter [m]
+    m.color.r = 1.0f; m.color.g = 0.1f; m.color.b = 0.1f; m.color.a = 1.0f;
+    pub_goal_marker_->publish(m);
+  }
+
+  // Raw RRT* waypoints (drone position -> goal) as an RViz MarkerArray: a line
+  // strip through the waypoints plus a sphere at each one. Independent of the
+  // min-snap trajectory, so it renders even when PLAN_TRAJECTORY is false.
+  void publishGeometricPath() {
+    const auto wps = core_->geometricPath();
+
+    visualization_msgs::msg::MarkerArray arr;
+
+    // Clear stale markers first so an empty/failed plan removes the old path.
+    visualization_msgs::msg::Marker clear;
+    clear.header.frame_id = "map";
+    clear.header.stamp = now();
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+
+    if (wps.size() >= 2) {
+      visualization_msgs::msg::Marker line;
+      line.header.frame_id = "map";
+      line.header.stamp = now();
+      line.ns = "geometric_path";
+      line.id = 0;
+      line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      line.action = visualization_msgs::msg::Marker::ADD;
+      line.pose.orientation.w = 1.0;
+      line.scale.x = 0.03;  // line width [m]
+      line.color.r = 0.1f; line.color.g = 1.0f; line.color.b = 0.2f; line.color.a = 1.0f;
+
+      visualization_msgs::msg::Marker nodes;
+      nodes.header = line.header;
+      nodes.ns = "geometric_path";
+      nodes.id = 1;
+      nodes.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+      nodes.action = visualization_msgs::msg::Marker::ADD;
+      nodes.pose.orientation.w = 1.0;
+      nodes.scale.x = nodes.scale.y = nodes.scale.z = 0.12;  // sphere diameter [m]
+      nodes.color.r = 0.2f; nodes.color.g = 0.4f; nodes.color.b = 1.0f; nodes.color.a = 1.0f;
+
+      for (const auto& w : wps) {
+        geometry_msgs::msg::Point p;
+        p.x = w[0]; p.y = w[1]; p.z = w[2];
+        line.points.push_back(p);
+        nodes.points.push_back(p);
+      }
+      arr.markers.push_back(line);
+      arr.markers.push_back(nodes);
+    }
+
+    pub_geom_path_->publish(arr);
+  }
+
   void publishPlannedPath() {
     const auto sampled = core_->sampledPlannedPath();
     if (sampled.empty()) return;
@@ -380,6 +479,8 @@ private:
   rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_command_;
   rclcpp::Publisher<drone_interfaces::msg::ControllerDebug>::SharedPtr pub_debug_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_geom_path_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_goal_marker_;
 
   rclcpp::TimerBase::SharedPtr control_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;
@@ -402,6 +503,9 @@ private:
   bool was_armed_{false};
   bool was_offboard_{false};
   bool controller_running_{false};
+
+  Eigen::Vector3d goal_pos_{Eigen::Vector3d::Zero()};
+  bool has_goal_{false};
 };
 
 int main(int argc, char** argv) {

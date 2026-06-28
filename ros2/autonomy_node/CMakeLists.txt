@@ -15,6 +15,7 @@ find_package(px4_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(octomap REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -38,6 +39,7 @@ ament_target_dependencies(autonomy_node
   geometry_msgs
   sensor_msgs
   nav_msgs
+  visualization_msgs
   octomap_msgs
   drone_interfaces)
 

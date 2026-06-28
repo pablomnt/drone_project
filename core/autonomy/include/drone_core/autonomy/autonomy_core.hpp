@@ -29,9 +29,19 @@ public:
     Eigen::Vector3d vel_d{0.2, 0.2, 0.2};
     double hover_thrust{0.35};
     bool enable_feedforward{false};
-    double stale_timeout{0.5};   // hover-hold fallback threshold [s]
-    double rrt_period{5.0};      // geometric replan period [s]
-    double trajgen_period{1.0};  // local trajectory replan period [s]
+    double stale_timeout{0.5};        // hover-hold fallback threshold [s]
+    double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
+    double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
+    double rrt_solve_time{3.0};       // RRT* optimisation budget per solve [s]
+    double replan_improve_ratio{0.85};  // adopt candidate iff cost <= ratio*committed
+    double clearance_weight{4.0};     // obstacle-proximity penalty weight
+    double clearance_threshold{1.0};  // clearance saturation distance / EDT maxdist [m]
+    double trajgen_period{1.0};       // local trajectory replan period [s]
+    // When false the worker stops after RRT*: it stores the geometric path for
+    // visualisation but never runs min-snap or hands a trajectory to the
+    // tracker, so control keeps following the direct setpoint. Used to bring the
+    // planner online geometry-first, decoupled from control.
+    bool plan_trajectory{true};
   };
 
   explicit AutonomyCore(const Config& config);
@@ -80,6 +90,11 @@ public:
   // Sampled copy of the most recently planned trajectory, for visualisation.
   std::vector<std::vector<double>> sampledPlannedPath(double sample_dt = 0.1) const;
 
+  // Raw waypoints of the most recent RRT* geometric plan (start..goal), for
+  // visualisation. Independent of trajectory generation, so it is populated even
+  // when plan_trajectory is false.
+  std::vector<std::vector<double>> geometricPath() const;
+
 private:
   double now() const { return clock_(); }
   bool runGlobalPlan(const common::State& state, const common::Goal& goal,
@@ -110,11 +125,13 @@ private:
   common::Trajectory pending_;
   bool has_pending_{false};
   common::Trajectory last_planned_;  // retained for visualisation
+  std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
 
   std::thread worker_;
   std::atomic<bool> running_{false};
   std::vector<std::vector<double>> cached_path_;
-  double last_rrt_{-1.0e9};
+  double last_monitor_{-1.0e9};
+  double last_improve_{-1.0e9};
   double last_trajgen_{-1.0e9};
 };
 

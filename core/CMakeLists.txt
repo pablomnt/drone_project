@@ -22,6 +22,14 @@ find_package(octomap REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NLOPT REQUIRED nlopt)
 
+# dynamicEDT3D ships with octomap (libdynamicedt3d-dev) but exports no CMake
+# config, so locate the library directly. Its headers live under the octomap
+# include prefix as <dynamicEDT3D/...>, already on OCTOMAP_INCLUDE_DIRS.
+find_library(DYNAMICEDT3D_LIBRARY NAMES dynamicedt3d)
+if(NOT DYNAMICEDT3D_LIBRARY)
+  message(FATAL_ERROR "dynamicEDT3D not found. Install libdynamicedt3d-dev.")
+endif()
+
 if(DRONE_CORE_BUILD_TESTS)
   enable_testing()
 endif()

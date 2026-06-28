@@ -25,6 +25,6 @@
    </node>
 
 
-   <node pkg="rviz2" exec="rviz2" name="rviz2" namespace="okvis" args="-d $(find-pkg-share okvis)/config/rviz2/rviz2_config.rviz" if="$(var rviz)"/>
+   <node pkg="rviz2" exec="rviz2" name="rviz2" namespace="okvis" args="-d /home/dron/.rviz2/planning_drone.rviz" if="$(var rviz)"/>
   
 </launch>

@@ -123,11 +123,22 @@ camera/VIO/mapping stack + Foxglove + the `body→camera_link` static TF), `auto
 ### The autonomy core (`core/`)
 
 `AutonomyCore` (`core/autonomy/`) is the orchestrator and the object a host (the ROS node, a sim
-harness, or a test) drives. It is middleware-free and runs **three internal cadences**:
+harness, or a test) drives. It is middleware-free and runs cadences on a background worker thread
+and the fast control thread:
 
-- **RRT\* geometric replanning (~0.2 Hz)** and **minimum-snap trajectory generation (~1 Hz)** on a
-  **background worker thread** (receding-horizon: trajgen re-anchors to the current state). The fast
-  control path never blocks on planning; finished trajectories are handed over by an **atomic swap**.
+**Background worker (planning, geometry-first phase):**
+- **Monitor (~2 Hz, `rrt_monitor_period=0.5 s`):** re-checks the committed path against the latest
+  map via `RrtStarPlanner::isPathValid`. If clear, keeps it. If blocked (or no path yet), forces a
+  length-optimal replan and adopts unconditionally (safety). Also resets the improve clock so a
+  just-created path isn't immediately re-solved.
+- **Improve (~0.2 Hz, `rrt_improve_period=5 s`):** builds a `DynamicEDTOctomap` (maxdist =
+  `clearance_threshold`), runs a **clearance-aware** RRT* (`cost = ∫(1 + w·max(0,thresh−d)) ds`),
+  and adopts the candidate **only if** `cost ≤ replan_improve_ratio × committed_cost`. Skipped when
+  no obstacles are mapped. `simplifyMax` is disabled in clearance mode (it would shortcut back
+  toward obstacles).
+- **Trajectory generation (~1 Hz, `trajgen_period`):** re-anchors min-snap to current position.
+  **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
+  control stays on `kDirect` / POS_SP.
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
 Module roles:
@@ -135,11 +146,24 @@ Module roles:
 - **`common`** — shared plain types (`State`, `Reference`, `Command`, `Trajectory`, `Goal`,
   `MapHandle`) and **`frames`**, which holds *all* ENU↔NED/FRD and OKVIS-yaw conversions (extracted
   from the old node so they are unit-testable). `logging.hpp` replaces ROS logging in the core.
-- **`planning`** — `RrtStarPlanner` (OMPL SE(3) RRT* over an octree, X/Y ±15 m, Z 0.3–2.5 m, 0.4 m
-  inflation, 3 s budget) and `MinSnapTrajectory` / `MinSnapTimeOptimizer` (KKT min-snap + NLopt
-  BOBYQA time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a
-  `Trajectory` of **per-segment polynomial coefficients + durations** (not sampled points) so the
-  flatness mapper can differentiate it analytically.
+- **`planning`** — `RrtStarPlanner` (OMPL SE(3) RRT* over an octree, X/Y ±15 m, Z −1.5–2.5 m,
+  0.4 m inflation, **horizontal-only** — vertical margin is a known gap deferred to the EDT rework).
+  **Start-state escape sphere**: within `start_escape_radius` (0.5 m) of the start the planner
+  inflates by the reduced `start_safety_dist` (default 0 m) instead of the full 0.4 m, so a parked or
+  just-lifting drone — whose footprint sits inside the normal margin of the mapped floor — can still
+  root the tree. Obstacles are never skipped: even at 0 m startup margin the path may approach but not
+  enter an occupied voxel (the 0.01 m motion-check resolution is finer than the voxel size, so a
+  segment can't tunnel through). The sphere is anchored at the start in `planPath` and at the first
+  waypoint in `isPathValid`, so a path that begins on the floor doesn't fail the periodic re-check and
+  churn replans. Both constants are local in `isStateValid` (deliberately not ROS params).
+  Supports a **clearance-aware cost** via `setClearance(fn, weight, threshold)`
+  that adds an obstacle-proximity integral penalty; without it falls back to pure path length.
+  `isPathValid()` re-checks a committed path against the current map (same collision model as
+  planning). `pathCost()` scores an existing waypoint list under the current objective, used for
+  the hysteresis gate. `MinSnapTrajectory` / `MinSnapTimeOptimizer` (KKT min-snap + NLopt BOBYQA
+  time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a `Trajectory`
+  of **per-segment polynomial coefficients + durations** (not sampled points) so the flatness mapper
+  can differentiate it analytically.
 - **`control`** — see the flight-critical note below.
 
 ### control (`core/control/`) — flight-critical, be careful
@@ -174,8 +198,31 @@ core on disarm or leaving offboard, re-priming takeoff), assembles an ENU `State
 estimator (VIO in normal mode; PX4 odom in `USE_SIM_MODE`), feeds the core, reads back the `Command`,
 applies the **yaw-drift correction** (toward PX4's yaw) and the ENU→NED/FRD conversion via
 `core/common/frames`, and publishes the attitude setpoint + `ControllerDebug` telemetry. Goals
-arrive on `/planner/goal`; a `POS_SP` parameter provides the default takeoff/hover setpoint. All
-PX4 message types and frame conversions are confined to this file.
+arrive on `/planner/goal` (geometry_msgs/PoseStamped, position only — yaw ignored); a `POS_SP`
+parameter provides the default takeoff/hover setpoint. All PX4 message types and frame conversions
+are confined to this file.
+
+**Visualization publishers (at 2 Hz via `viz_timer_`):**
+- `/planner/geometric_path` (`visualization_msgs/MarkerArray`) — raw RRT* waypoints as a green
+  LINE_STRIP + blue SPHERE_LIST, frame `map`. Populated even when `PLAN_TRAJECTORY=false`.
+- `/planner/goal_marker` (`visualization_msgs/Marker`) — red sphere at the active goal position.
+  Published every viz tick so late-joining RViz sessions see it immediately.
+- `/smooth_trajectory` (`nav_msgs/Path`) — sampled min-snap trajectory. Dormant while
+  `PLAN_TRAJECTORY=false`.
+
+**Planning-related node parameters** (all live-reconfigurable via `onParameterChange`):
+- `PLAN_TRAJECTORY` (bool, default `false`) — geometry-first phase gate; set `true` to enable
+  min-snap + trajectory tracking.
+- `RRT_MONITOR_PERIOD` (double, default `0.5` s) — path validity re-check cadence.
+- `RRT_IMPROVE_PERIOD` (double, default `5.0` s) — clearance-aware improvement search cadence.
+- `RRT_SOLVE_TIME` (double, default `5.0` s) — RRT* optimisation budget per solve.
+- `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
+- `CLEARANCE_WEIGHT` (double, default `4.0`) — obstacle-proximity penalty weight.
+- `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
+
+**Additional dependency**: `libdynamicedt3d-dev` (apt, version-matched to octomap 1.9.7). Used in
+`autonomy_core.cpp` only; linked into `drone_core_autonomy`. Headers at
+`<dynamicEDT3D/dynamicEDTOctomap.h>`. Re-install if rebuilding on a fresh machine.
 
 ### Frames & TF (OKVIS ↔ RTAB-Map) — why odom can look fine while the voxel map is wrong
 

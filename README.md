@@ -54,7 +54,11 @@ inside the core.
 ### `planning/`
 
 - `RrtStarPlanner` — OMPL SE(3) RRT* over an octree (X/Y ±15 m, Z 0.3–2.5 m, 0.4 m obstacle
-  inflation, 3 s solve budget).
+  inflation, 3 s solve budget). Inside a small sphere around the start state (`start_escape_radius`,
+  0.5 m) a reduced inflation (`start_safety_dist`, default 0 m) applies instead of the full 0.4 m, so
+  a parked or just-lifting drone — whose footprint sits within the normal margin of the mapped floor —
+  can still root the search and take off. Obstacles themselves are never ignored: even at 0 m startup
+  margin the path may approach but never pass *through* an occupied voxel.
 - `MinSnapTrajectory` / `MinSnapTimeOptimizer` — KKT minimum-snap solve plus an NLopt BOBYQA outer
   loop for per-segment time allocation ("mode A" of ETH Zurich's `mav_trajectory_generation`). The
   optimizer keeps the actual per-segment polynomial coefficients + segment times (rather than

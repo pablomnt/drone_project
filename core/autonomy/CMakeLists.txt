@@ -14,7 +14,8 @@ target_link_libraries(drone_core_autonomy PUBLIC
   drone_core_control
   drone_core_planning
   drone_core_common
-  Threads::Threads)
+  Threads::Threads
+  ${DYNAMICEDT3D_LIBRARY})
 
 set_target_properties(drone_core_autonomy PROPERTIES EXPORT_NAME autonomy)
 
