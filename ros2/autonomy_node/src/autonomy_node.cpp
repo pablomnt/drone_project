@@ -18,6 +18,7 @@
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 #include <octomap/octomap.h>
+#include <octomap/ColorOcTree.h>
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
 
@@ -43,6 +44,35 @@ using namespace std::chrono_literals;
 namespace {
 constexpr double kControlDt = 0.02;       // 50 Hz
 constexpr double kDefaultYaw = M_PI_2;    // ENU heading for direct/hover setpoints
+
+// RTAB-Map publishes its octomap as a ColorOcTree (it stores voxel colour for
+// visualisation), but the core's map model — and DynamicEDTOctomap — needs a
+// plain octomap::OcTree. Copy occupancy across, dropping colour. Coarse (pruned)
+// leaves are expanded to resolution-sized voxels so an occupied region stays
+// solid instead of collapsing to a single centre voxel (which would punch holes
+// in walls for the planner). Works for any OccupancyOcTreeBase node type.
+template <typename TreeT>
+std::shared_ptr<octomap::OcTree> toOcTree(const TreeT& in) {
+  const double res = in.getResolution();
+  auto out = std::make_shared<octomap::OcTree>(res);
+  for (auto it = in.begin_leafs(), end = in.end_leafs(); it != end; ++it) {
+    const float log_odds = it->getLogOdds();
+    const double size = it.getSize();
+    if (size <= res * 1.5) {
+      out->setNodeValue(it.getCoordinate(), log_odds, /*lazy_eval=*/true);
+    } else {
+      const double half = (size - res) / 2.0;
+      const octomap::point3d c = it.getCoordinate();
+      for (double dx = -half; dx <= half + 1e-6; dx += res)
+        for (double dy = -half; dy <= half + 1e-6; dy += res)
+          for (double dz = -half; dz <= half + 1e-6; dz += res)
+            out->setNodeValue(octomap::point3d(c.x() + dx, c.y() + dy, c.z() + dz),
+                              log_odds, /*lazy_eval=*/true);
+    }
+  }
+  out->updateInnerOccupancy();
+  return out;
+}
 }  // namespace
 
 class AutonomyNode : public rclcpp::Node {
@@ -77,8 +107,14 @@ public:
         "/fmu/out/vehicle_status_v1", qos, std::bind(&AutonomyNode::onStatus, this, std::placeholders::_1));
     sub_vio_ = create_subscription<nav_msgs::msg::Odometry>(
         "/okvis/okvis_odometry", 10, std::bind(&AutonomyNode::onVioOdom, this, std::placeholders::_1));
+    // RTAB-Map publishes the assembled octomap only on map-graph updates (motion-gated)
+    // but latches it TRANSIENT_LOCAL. A VOLATILE subscriber never receives that retained
+    // sample, so on a static scene map_ would stay null and the planner would starve.
+    // Match the publisher's durability so we pull the last map on connect plus any
+    // updates. (Also compatible with octomap_server's latched publisher.)
+    auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     sub_map_ = create_subscription<octomap_msgs::msg::Octomap>(
-        "/octomap_binary", 10, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1));
+        "/octomap_binary", map_qos, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1));
     sub_goal_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         "/planner/goal", 10, std::bind(&AutonomyNode::onGoal, this, std::placeholders::_1));
 
@@ -237,12 +273,31 @@ private:
 
   void onOctomap(const octomap_msgs::msg::Octomap::SharedPtr msg) {
     octomap::AbstractOcTree* tree = octomap_msgs::binaryMsgToMap(*msg);
-    if (!tree) return;
-    if (auto* octree = dynamic_cast<octomap::OcTree*>(tree)) {
-      core_->setMap(std::shared_ptr<octomap::OcTree>(octree));
-    } else {
-      delete tree;
+    if (!tree) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "octomap failed to deserialize (binaryMsgToMap returned null)");
+      return;
     }
+
+    std::shared_ptr<octomap::OcTree> map;
+    if (auto* octree = dynamic_cast<octomap::OcTree*>(tree)) {
+      // Already the type the core wants (e.g. octomap_server) — take ownership.
+      map = std::shared_ptr<octomap::OcTree>(octree);
+    } else if (auto* color = dynamic_cast<octomap::ColorOcTree*>(tree)) {
+      // RTAB-Map's case: convert colour tree to a plain OcTree, then free the original.
+      map = toOcTree(*color);
+      delete tree;
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "octomap is an unsupported tree type (id='%s'), ignoring",
+                           msg->id.c_str());
+      delete tree;
+      return;
+    }
+
+    // One-time confirmation the core is actually being fed a map (and how dense).
+    RCLCPP_INFO_ONCE(get_logger(), "First octomap received: %zu nodes", map->size());
+    core_->setMap(map);
   }
 
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {

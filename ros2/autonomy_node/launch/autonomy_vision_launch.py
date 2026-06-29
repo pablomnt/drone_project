@@ -11,11 +11,15 @@ def generate_launch_description():
 
     return launch.LaunchDescription([
 
-        # Start the autonomy node (wraps the drone_core stack)
+        # Start the autonomy node (wraps the drone_core stack).
+        # The map now comes from RTAB-Map's own ray-traced octomap (see the rtabmap
+        # block below) rather than a standalone octomap_server, so remap the node's
+        # /octomap_binary subscription onto /rtabmap/octomap_binary.
         launch.actions.ExecuteProcess(
             cmd=[
                 'bash', '-c',
-                'ros2 run autonomy_node autonomy_node'
+                'ros2 run autonomy_node autonomy_node '
+                '--ros-args -r /octomap_binary:=/rtabmap/octomap_binary'
             ],
             output='screen'
         ),
@@ -103,21 +107,40 @@ def generate_launch_description():
                 # available for all timestamps; waiting removes the startup race that otherwise
                 # placed the first clouds ~90 deg off (no map reset needed).
                 'wait_for_transform:=3.0 '
-                'args:=" -d --Vis/MinInliers 12 --Rtabmap/DetectionRate 1 --Rtabmap/ImagesBufferSize 10 --Rtabmap/TimeThr 0 --Rtabmap/MemoryThr 0"'
+                # RTAB-Map builds its own 3D occupancy octomap and publishes
+                # /rtabmap/octomap_binary (it links liboctomap). RayTracing is the key
+                # flip: each scan carves free space along the rays from the sensor
+                # origin, so voxels seen empty decay back to free instead of
+                # accumulating forever (the old octomap_server-on-cloud_map setup could
+                # never clear). The density knobs restore something close to that old
+                # dense map (rtabmap's grid is otherwise decimated + ground-segmented,
+                # so it looked sparse):
+                #   DepthDecimation 1          - full-res depth (default 4 was sparse)
+                #   NormalsSegmentation false  - keep ALL points as obstacles instead of
+                #       discarding "ground"; for a flying drone the floor IS an obstacle
+                # NoiseFiltering drops isolated speckle: a voxel needs >=5 neighbours
+                #   within 0.10 m to survive, so lone specks vanish but surfaces (many
+                #   neighbours) stay. The RADIUS is what keeps this gentle - an earlier
+                #   0.05 m radius with the same neighbour count was too strict in the
+                #   smaller sphere and stripped legitimate voxels, making the map sparse.
+                # RangeMax trades look-ahead vs. far D435i depth noise (8 m is well into
+                #   the noisy range; lower it toward ~3 m for less speckle at the source).
+                #   CellSize matches the old 0.05 m octomap_server resolution.
+                'args:=" -d --Vis/MinInliers 12 --Rtabmap/DetectionRate 1 --Rtabmap/ImagesBufferSize 10 --Rtabmap/TimeThr 0 --Rtabmap/MemoryThr 0 '
+                '--Grid/3D true --Grid/RayTracing true --Grid/CellSize 0.05 --Grid/RangeMax 8.0 '
+                '--Grid/DepthDecimation 1 --Grid/NormalsSegmentation false '
+                '--Grid/NoiseFilteringRadius 0.1 --Grid/NoiseFilteringMinNeighbors 5"'
             ],
             output='screen'
         ),
 
-        # Launch octomap server to generate multi resolution voxel markers for foxglove
-        launch.actions.ExecuteProcess(
-            cmd=[
-                'bash', '-c',
-                'ros2 run octomap_server octomap_server_node --ros-args -p resolution:=0.05 -p frame_id:=map -r cloud_in:=/rtabmap/cloud_map'
-            ],
-            output='screen'
-        ),
+        # (Removed) The standalone octomap_server that voxelized /rtabmap/cloud_map.
+        # RTAB-Map now publishes the occupancy octomap directly (Grid/* args above), so
+        # this process is redundant; it also could never clear stale voxels because an
+        # assembled cloud carries no sensor origin to ray-trace from. Point Foxglove at
+        # /rtabmap/octomap_binary for the voxel view.
 
-        
+
 
         # Start Foxglove WebSocket bridge for remote visualization
         launch.actions.ExecuteProcess(

@@ -82,13 +82,13 @@ private:
   mutable std::array<double, 3> start_pos_{};
 
   ClearanceFn clearance_fn_;            // null => optimise pure path length
-  double clearance_weight_ = 0.0;       // obstacle-proximity penalty weight
+  double clearance_weight_ = 1.0;       // obstacle-proximity penalty weight
   double clearance_threshold_ = 1.0;    // clearance saturation distance [m]
 
   // Validity margins [m]. A state is free when its clearance exceeds the margin:
   // kCollisionMargin in general, the reduced kStartMargin within kStartEscapeRadius
   // of the start so a parked/lifting drone can root the search (see isStateValid).
-  static constexpr double kCollisionMargin = 0.4;
+  static constexpr double kCollisionMargin = 0.5;
   static constexpr double kStartMargin = 0.0;
   static constexpr double kStartEscapeRadius = 0.5;
 

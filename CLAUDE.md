@@ -103,8 +103,8 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
 The pipeline is now fully connected: perception → mapping → **planning → control** → PX4.
 
 ```
-RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (/rtabmap/cloud_map)
-         → octomap_server (/octomap_binary)
+RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (ray-traced 3D
+         occupancy octomap: /rtabmap/octomap_binary)
                                    │
                       ┌────────────┴───────────── autonomy_node (thin ROS wrapper) ─────────────┐
                       │  subscribes: octomap, okvis odom, px4 odom, sensor_combined,            │
@@ -153,7 +153,7 @@ Module roles:
 - **`planning`** — `RrtStarPlanner` (OMPL SE(3) RRT* over an octree, X/Y ±15 m, Z −1.5–2.5 m).
   **Collision check is EDT-based**: a state is free when its clearance (3D Euclidean distance to the
   nearest obstacle, via a `DynamicEDTOctomap` passed as the clearance fn) exceeds `kCollisionMargin`
-  (0.4 m) — one O(1) lookup, and because the distance is 3D it enforces **vertical** clearance too
+  (0.5 m) — one O(1) lookup, and because the distance is 3D it enforces **vertical** clearance too
   (the old horizontal-only box is now only a fallback in `isStateValid` for standalone/test use with
   no field set). **Start-state escape sphere**: within `kStartEscapeRadius` (0.5 m) of the start the
   required clearance drops to `kStartMargin` (0 m) so a parked/just-lifting drone — sitting within the
@@ -236,8 +236,8 @@ A RealSense depth point reaches the world through
 `world ──(OKVIS VIO)──▶ body ──(static body→camera_link)──▶ camera_link ──(RealSense REP-103)──▶ *_optical_frame`.
 OKVIS estimates `world→body` (the trajectory); `body→camera_link` is the fixed camera mount, a
 **pure rotation with zero translation** (`pitch -1.5708, roll 1.5708`) published by the
-`static_transform_publisher` in `autonomy_vision_launch.py`; RTAB-Map (base `camera_link`) assembles
-`/rtabmap/cloud_map`, octomap_server voxelizes it.
+`static_transform_publisher` in `autonomy_vision_launch.py`; RTAB-Map (base `camera_link`) builds and
+publishes the occupancy octomap directly (`/rtabmap/octomap_binary`; see *Map source* below).
 
 Because that edge has **zero translation**, `body` and `camera_link` share an origin: the trajectory
 (a sequence of origins) is unaffected by a wrong rotation, but the voxels (depth projected along the
@@ -249,6 +249,35 @@ post-hoc map resets can't fix it). **The fix:** leave `T_BS` alone (it also defi
 body frame, so rotating it would rotate the controller's odometry) and instead drop OKVIS's broadcast
 (local patch in `Publisher.cpp::setBodyTransform`, RViz-mesh-only and unused). The launch now solely
 owns the edge; RTAB-Map's `wait_for_transform:=3.0` blocks for the latched TF before its first cloud.
+
+### Map source (RTAB-Map octomap) — why it's not octomap_server anymore
+
+The occupancy map fed to the planner is **RTAB-Map's own 3D octomap** (`/rtabmap/octomap_binary`),
+not a standalone `octomap_server`. The motivation was **clearing**: `octomap_server` was voxelizing
+the *assembled* `/rtabmap/cloud_map`, which carries no per-scan sensor origin, so it could only ever
+*add* occupied voxels — phantom obstacles never cleared even when you flew up to them. RTAB-Map builds
+its grid per-node with the real viewpoints, so `Grid/RayTracing true` carves free space along each ray
+and stale voxels decay back to free. The relevant `Grid/*` args (in `autonomy_vision_launch.py`):
+`Grid/3D true`, `Grid/RayTracing true`, `Grid/CellSize 0.05`, `Grid/RangeMax` (far-noise vs.
+look-ahead), `Grid/DepthDecimation 1` + `Grid/NormalsSegmentation false` (density — rtabmap otherwise
+decimates and drops "ground", which for a flying drone is a real obstacle), and a gentle
+`Grid/NoiseFiltering*` pair for isolated speckle. There is **no `map_always_update`** — RTAB-Map only
+republishes the assembled octomap on map-graph updates (motion-gated), which is fine because the node
+latches and the subscriber retains the last map (below).
+
+**Two non-obvious gotchas the switch exposed (both fixed in `autonomy_node.cpp`):**
+1. **`ColorOcTree`, not `OcTree`.** RTAB-Map publishes a `ColorOcTree` (it stores voxel colour);
+   `octomap_server` published a plain `OcTree`. The core/`DynamicEDTOctomap` needs an `OcTree`, so a
+   naive `dynamic_cast<OcTree*>` silently dropped *every* map and the planner sat idle ("New goal"
+   then nothing). `onOctomap` now converts via the `toOcTree()` helper (copies occupancy, drops
+   colour, **expands coarse/pruned leaves** to resolution voxels so walls don't get holes).
+2. **QoS durability.** RTAB-Map's octomap publisher is `RELIABLE` + `TRANSIENT_LOCAL` (latched) and
+   publishes sparsely (only on motion-gated updates). A `VOLATILE` subscriber never receives the
+   retained sample, so on a static scene `map_` stayed null. The octomap subscription is now
+   `TRANSIENT_LOCAL` so it pulls the last map on connect. (`octomap_server` masked this by
+   republishing continuously as clouds streamed in.) `onOctomap` also logs `First octomap received:
+   N nodes` once, and throttled warnings on deserialize/type failure — the fastest way to tell
+   whether the core is actually being fed a map.
 
 ### px4_msgs / okvis (`ros2/third_party/`)
 
@@ -262,8 +291,9 @@ broadcasts `body→camera_link` (see *Frames & TF* above). Re-apply it if you re
 Required at runtime, referenced by path/command in the launch files:
 
 - `MicroXRCEAgent` — ROS2 ⇄ PX4 uORB bridge, serial (`/dev/ttyUSB0`) or UDP (`8888`, SITL).
-- `realsense2_camera`, `rtabmap_launch`, `octomap_server`, `foxglove_bridge`, `joy`, `tf2_ros` —
-  external ROS2 packages launched from the autonomy_node launch files.
+- `realsense2_camera`, `rtabmap_launch`, `foxglove_bridge`, `joy`, `tf2_ros` —
+  external ROS2 packages launched from the autonomy_node launch files. (`octomap_server` is no
+  longer used — RTAB-Map publishes the octomap itself; see *Map source*.)
 - The OKVIS config (`ros2/third_party/okvis2/config/realsense_D435i.yaml`) and the cpu monitor are
   referenced by expanded `$HOME` paths in the launch files — update those paths if the workspace moves.
 - **Map-frame consistency (verify before flying planned trajectories)**: the octomap/RTAB-Map "map"
