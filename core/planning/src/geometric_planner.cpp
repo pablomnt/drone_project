@@ -31,7 +31,15 @@ public:
   ClearanceObjective(const ompl::base::SpaceInformationPtr& si,
                      GeometricPlanner::ClearanceFn clearance, double weight, double threshold)
       : ompl::base::StateCostIntegralObjective(si, /*enableMotionCostInterpolation=*/true),
-        clearance_(std::move(clearance)), weight_(weight), threshold_(threshold) {}
+        clearance_(std::move(clearance)), weight_(weight), threshold_(threshold) {
+    // Register a state->goal cost-to-go heuristic (distance to the goal region).
+    // This is what RRT*'s informed sampler and the BIT*-lineage goal heuristic
+    // query via hasCostToGoHeuristic()/costToGo(); without it OMPL warns that
+    // informed sampling "will have little to no effect". Admissible for the same
+    // reason as motionCostHeuristic below: our integrand is >= 1, so true cost is
+    // always >= geometric distance.
+    setCostToGoHeuristic(&ompl::base::goalRegionCostToGo);
+  }
 
   ompl::base::Cost stateCost(const ompl::base::State* state) const override {
     double penalty = 0.0;
