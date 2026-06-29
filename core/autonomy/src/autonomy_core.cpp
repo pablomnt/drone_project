@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <sstream>
+#include <string>
 
 #include <dynamicEDT3D/dynamicEDTOctomap.h>
 #include <ompl/util/Console.h>
@@ -213,10 +215,45 @@ std::vector<std::vector<double>> AutonomyCore::geometricPath() const {
   return last_geometric_path_;
 }
 
+planning::RrtStarPlanner::SearchTree AutonomyCore::searchTree() const {
+  std::lock_guard<std::mutex> lock(traj_mutex_);
+  return last_search_tree_;
+}
+
+std::vector<std::array<double, 4>> AutonomyCore::clearanceSamples() const {
+  std::lock_guard<std::mutex> lock(traj_mutex_);
+  return last_clearance_samples_;
+}
+
+std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
+  std::vector<std::array<double, 4>> out;
+  if (!edt_ || !edt_source_map_) return out;
+
+  double xmin, ymin, zmin, xmax, ymax, zmax;
+  edt_source_map_->getMetricMin(xmin, ymin, zmin);
+  edt_source_map_->getMetricMax(xmax, ymax, zmax);
+
+  constexpr double step = 0.15;  // grid spacing [m] — coarse, debug-only
+  const double maxd = cfg_.clearance_threshold;
+  for (double x = xmin; x <= xmax; x += step) {
+    for (double y = ymin; y <= ymax; y += step) {
+      for (double z = zmin; z <= zmax; z += step) {
+        double d = edt_->getDistance(octomap::point3d(
+            static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+        if (d < 0.0) continue;       // outside the EDT bounding box
+        if (d > maxd) d = maxd;      // clamp to the saturation threshold
+        out.push_back({x, y, z, d});
+      }
+    }
+  }
+  return out;
+}
+
 bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal& goal,
                                  const planning::MapHandle& map,
                                  std::vector<std::vector<double>>& path) {
   planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
+  planner.setRange(cfg_.rrt_range);
   const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
   const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
   return planner.planPath(start, goal_vec, path);
@@ -309,7 +346,22 @@ void AutonomyCore::plannerLoop() {
       // search would. The field is cached (rebuilt only on a map change), so this
       // is cheap on the common still-valid tick.
       planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
+      planner.setRange(cfg_.rrt_range);
+      planner.setRecordTree(cfg_.debug_planner_viz);
       applyClearanceObjective(planner, map);
+
+      // Debug-only: re-sample the clearance field when the map changes (the EDT
+      // is now current for this tick). Gated so a regular flight never walks the
+      // grid. Sampling only on map change keeps even a debug run cheap on a
+      // static scene.
+      if (cfg_.debug_planner_viz && map != viz_sampled_map_) {
+        auto samples = sampleClearanceField();
+        {
+          std::lock_guard<std::mutex> lock(traj_mutex_);
+          last_clearance_samples_ = std::move(samples);
+        }
+        viz_sampled_map_ = map;
+      }
 
       const bool had_path = !cached_path_.empty();
       const bool path_invalid = !had_path || !planner.isPathValid(cached_path_);
@@ -324,26 +376,45 @@ void AutonomyCore::plannerLoop() {
       const std::uint64_t improve_interval = static_cast<std::uint64_t>(std::max<long>(1, n));
       const bool improve_run = (run % improve_interval == 0) && had_path && map->size() > 0;
 
-      // Diagnostics on the committed path (the field is already set).
-      const double committed_cost = planner.pathCost(cached_path_);
+      // Diagnostics on the committed path (the field is already set). The cost is
+      // split into its length + clearance-penalty terms for the logs below;
+      // committed_clr is the tightest distance to a wall along the path.
+      const auto committed = planner.costBreakdown(cached_path_);
+      const double committed_cost = committed.total;
       const double committed_clr = planner.minClearance(cached_path_);
+
+      // Stream a cost as "total (len=L + clr_cost=C)" so each replan line shows
+      // whether the score is driven by path length or by obstacle proximity.
+      auto fmtCost = [](const planning::RrtStarPlanner::CostBreakdown& cb) {
+        std::ostringstream os;
+        os << cb.total << " (len=" << cb.length << " + clr_cost=" << cb.clearance << ")";
+        return os.str();
+      };
 
       if (path_invalid || improve_run) {
         std::vector<std::vector<double>> candidate;
         const bool solved = planner.planPath(start, goal_vec, candidate);
 
+        // Debug-only: capture the tree this solve built (even if it failed — that
+        // is exactly when seeing where it explored is most useful).
+        if (cfg_.debug_planner_viz) {
+          std::lock_guard<std::mutex> lock(traj_mutex_);
+          last_search_tree_ = planner.searchTree();
+        }
+
         if (path_invalid) {
           // Forced replan — adopt unconditionally (safety outranks optimality).
           if (solved) {
+            const auto cand = planner.costBreakdown(candidate);
             adopt(candidate);
             if (had_path)
               DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed BLOCKED (clr="
                              << committed_clr << "m < " << planner.collisionMargin()
-                             << "m) -> REPLAN cost=" << planner.pathCost(candidate) << " clr="
+                             << "m) -> REPLAN cost=" << fmtCost(cand) << " clr="
                              << planner.minClearance(candidate) << "m");
             else
               DRONE_LOG_INFO("[plan] #" << run << " MONITOR no committed path -> PLAN cost="
-                             << planner.pathCost(candidate) << " clr="
+                             << fmtCost(cand) << " clr="
                              << planner.minClearance(candidate) << "m");
           } else {
             DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed "
@@ -354,23 +425,22 @@ void AutonomyCore::plannerLoop() {
           // Improve — switch only past the hysteresis margin. RRT* is randomised,
           // so without the margin a near-identical re-solve would chatter.
           const double threshold = cfg_.replan_improve_ratio * committed_cost;
-          if (solved && planner.pathCost(candidate) <= threshold) {
-            const double cand_cost = planner.pathCost(candidate);
+          const auto cand = planner.costBreakdown(candidate);
+          if (solved && cand.total <= threshold) {
             adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << committed_cost
-                           << " -> ADOPT cost=" << cand_cost << " clr="
+            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << fmtCost(committed)
+                           << " -> ADOPT cost=" << fmtCost(cand) << " clr="
                            << planner.minClearance(candidate) << "m");
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << committed_cost
+            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << fmtCost(committed)
                            << " clr=" << committed_clr << "m candidate cost="
-                           << (solved ? planner.pathCost(candidate)
-                                      : std::numeric_limits<double>::infinity())
+                           << (solved ? fmtCost(cand) : std::string("inf"))
                            << " -> keep (need <=" << threshold << ")");
           }
         }
       } else {
         // Monitor only: committed path still clear of obstacles.
-        DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed cost=" << committed_cost
+        DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed cost=" << fmtCost(committed)
                        << " clr=" << committed_clr << "m -> OK");
       }
 

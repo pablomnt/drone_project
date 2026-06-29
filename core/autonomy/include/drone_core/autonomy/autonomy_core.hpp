@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -38,6 +39,7 @@ public:
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
     double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
     double rrt_solve_time{3.0};       // RRT* optimisation budget per solve [s]
+    double rrt_range{1.0};            // RRT* max tree-extension (step size) [m]; <=0 => OMPL auto
     double replan_improve_ratio{0.85};  // adopt candidate iff cost <= ratio*committed
     double clearance_weight{4.0};     // obstacle-proximity penalty weight
     double clearance_threshold{1.0};  // clearance saturation distance / EDT maxdist [m]
@@ -47,6 +49,11 @@ public:
     // tracker, so control keeps following the direct setpoint. Used to bring the
     // planner online geometry-first, decoupled from control.
     bool plan_trajectory{true};
+    // Single switch for the debug planner visualisation (search-tree capture +
+    // EDT clearance-field sampling). Off by default so a regular flight pays
+    // nothing: with it false the planner never extracts the OMPL tree and the
+    // field is never sampled. Safe to flip live for a debugging run.
+    bool debug_planner_viz{false};
   };
 
   explicit AutonomyCore(const Config& config);
@@ -100,6 +107,15 @@ public:
   // when plan_trajectory is false.
   std::vector<std::vector<double>> geometricPath() const;
 
+  // Snapshot of the most recent RRT* search tree (nodes + edges), for debug
+  // visualisation. Empty unless cfg.debug_planner_viz is set. Thread-safe copy.
+  planning::RrtStarPlanner::SearchTree searchTree() const;
+
+  // Coarse samples of the cached clearance (EDT) field as {x, y, z, distance}
+  // (distance clamped at clearance_threshold), for debug visualisation. Empty
+  // unless cfg.debug_planner_viz is set. Thread-safe copy.
+  std::vector<std::array<double, 4>> clearanceSamples() const;
+
 private:
   double now() const { return clock_(); }
   bool runGlobalPlan(const common::State& state, const common::Goal& goal,
@@ -127,6 +143,11 @@ private:
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> clearanceField(
       const planning::MapHandle& map);
 
+  // Sample the cached EDT on a coarse grid over the map's bounding box. Called
+  // only from the planner worker thread (it reads edt_ / edt_source_map_, which
+  // the worker owns), and only when debug_planner_viz is set.
+  std::vector<std::array<double, 4>> sampleClearanceField() const;
+
   Config cfg_;
   std::function<double()> clock_;
 
@@ -148,6 +169,8 @@ private:
   bool has_pending_{false};
   common::Trajectory last_planned_;  // retained for visualisation
   std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
+  planning::RrtStarPlanner::SearchTree last_search_tree_;  // debug viz; empty unless enabled
+  std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
 
   std::thread worker_;
   std::atomic<bool> running_{false};
@@ -158,6 +181,7 @@ private:
   // model for both collision validity and the clearance cost. See clearanceField.
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> edt_;
   planning::MapHandle edt_source_map_;
+  planning::MapHandle viz_sampled_map_;  // map the debug clearance samples were taken from
 };
 
 }  // namespace drone_core::autonomy

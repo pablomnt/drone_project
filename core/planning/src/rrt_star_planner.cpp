@@ -6,6 +6,7 @@
 #include <limits>
 #include <utility>
 
+#include <ompl/base/PlannerData.h>
 #include <ompl/base/objectives/StateCostIntegralObjective.h>
 #include <ompl/geometric/PathGeometric.h>
 
@@ -171,6 +172,8 @@ void RrtStarPlanner::setClearance(ClearanceFn clearance, double weight, double t
   clearance_threshold_ = threshold;
 }
 
+void RrtStarPlanner::setRange(double range) { range_ = range; }
+
 ompl::base::OptimizationObjectivePtr RrtStarPlanner::makeObjective() const {
   // With no clearance function the per-state cost is a constant 1, so this is
   // exactly a path-length objective; with one it adds the proximity penalty.
@@ -199,9 +202,38 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
 
   auto planner = std::make_shared<ompl::geometric::RRTstar>(si_);
   planner->setProblemDefinition(pdef);
+  // Set the step size before setup(): setup() only auto-sizes the range when it
+  // is still zero, so this overrides OMPL's extent-fraction default. <=0 keeps
+  // the auto behaviour.
+  if (range_ > 0.0) planner->setRange(range_);
   planner->setup();
 
   const ompl::base::PlannerStatus solved = planner->ompl::base::Planner::solve(planning_time_);
+
+  // Capture the tree for debug visualisation before the planner goes out of
+  // scope. Done regardless of success (the tree of a *failed* solve is just as
+  // useful to look at) but only when recording is on, so a flight build never
+  // pays for getPlannerData().
+  if (record_tree_) {
+    last_tree_ = SearchTree{};
+    ompl::base::PlannerData data(si_);
+    planner->getPlannerData(data);
+    const unsigned int n = data.numVertices();
+    last_tree_.nodes.reserve(n);
+    for (unsigned int i = 0; i < n; ++i) {
+      const auto* st =
+          data.getVertex(i).getState()->as<ompl::base::SE3StateSpace::StateType>();
+      const auto* pos = st->as<ompl::base::RealVectorStateSpace::StateType>(0);
+      last_tree_.nodes.push_back({pos->values[0], pos->values[1], pos->values[2]});
+    }
+    for (unsigned int i = 0; i < n; ++i) {
+      std::vector<unsigned int> out;
+      data.getEdges(i, out);
+      for (unsigned int j : out)
+        last_tree_.edges.emplace_back(static_cast<int>(i), static_cast<int>(j));
+    }
+  }
+
   if (!solved) {
     return false;
   }
@@ -220,9 +252,7 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
 
   // Straighten the jagged RRT* result. Deliberately skip B-spline smoothing so
   // the original waypoints survive for the minimum-snap optimiser downstream.
-  // Skip this entirely when clearance-aware: simplifyMax shortcuts purely to cut
-  // length and collision-checks only, so it would straighten the path back toward
-  // the obstacles the clearance objective deliberately routed around.
+  // With no clearance field, plain length-only simplifyMax is correct and cheap.
   if (!clearance_fn_) {
     ompl::geometric::PathSimplifier simplifier(si_);
     simplifier.simplifyMax(*path);
@@ -233,11 +263,69 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
     const auto* pos = state->as<ompl::base::RealVectorStateSpace::StateType>(0);
     result_path.push_back({pos->values[0], pos->values[1], pos->values[2]});
   }
+
+  // In clearance mode, use a cost-aware shortcut instead of simplifyMax: it cuts
+  // the RRT* zig-zag but, by gating on the clearance-aware cost, keeps the
+  // detours the objective actually wanted (see shortcutClearanceAware).
+  if (clearance_fn_) {
+    shortcutClearanceAware(result_path);
+  }
   return true;
 }
 
+void RrtStarPlanner::shortcutClearanceAware(
+    std::vector<std::vector<double>>& waypoints) const {
+  if (waypoints.size() < 3) return;
+
+  auto makeState = [this](const std::vector<double>& p) {
+    ompl::base::ScopedState<ompl::base::SE3StateSpace> s(space_);
+    s->setXYZ(p[0], p[1], p[2]);
+    s->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
+    return s;
+  };
+  auto motionValid = [&](const std::vector<double>& a, const std::vector<double>& b) {
+    const auto sa = makeState(a);
+    const auto sb = makeState(b);
+    return si_->checkMotion(sa.get(), sb.get());
+  };
+
+  // Anchor the start-state collision exemption at the first waypoint, mirroring
+  // isPathValid, so a bypass near the takeoff pose is judged with the same
+  // relaxed margin the search used (motionValid -> isStateValid reads start_pos_).
+  start_pos_ = {waypoints.front()[0], waypoints.front()[1], waypoints.front()[2]};
+
+  double current = costBreakdown(waypoints).total;
+  bool changed = true;
+  while (changed && waypoints.size() > 2) {
+    changed = false;
+    for (std::size_t i = 1; i + 1 < waypoints.size();) {
+      const double seg = std::hypot(waypoints[i + 1][0] - waypoints[i - 1][0],
+                                    waypoints[i + 1][1] - waypoints[i - 1][1],
+                                    waypoints[i + 1][2] - waypoints[i - 1][2]);
+      if (seg <= kMaxShortcutSegment && motionValid(waypoints[i - 1], waypoints[i + 1])) {
+        std::vector<std::vector<double>> candidate = waypoints;
+        candidate.erase(candidate.begin() + static_cast<std::ptrdiff_t>(i));
+        const double cost = costBreakdown(candidate).total;
+        if (cost <= current + 1e-9) {
+          waypoints.swap(candidate);
+          current = cost;
+          changed = true;
+          continue;  // re-examine index i (now the following vertex)
+        }
+      }
+      ++i;
+    }
+  }
+}
+
 double RrtStarPlanner::pathCost(const std::vector<std::vector<double>>& path) const {
-  if (path.size() < 2) return std::numeric_limits<double>::infinity();
+  return costBreakdown(path).total;
+}
+
+RrtStarPlanner::CostBreakdown
+RrtStarPlanner::costBreakdown(const std::vector<std::vector<double>>& path) const {
+  constexpr double inf = std::numeric_limits<double>::infinity();
+  if (path.size() < 2) return {inf, inf, inf};
 
   ompl::geometric::PathGeometric geo(si_);
   for (const auto& p : path) {
@@ -246,7 +334,11 @@ double RrtStarPlanner::pathCost(const std::vector<std::vector<double>>& path) co
     s->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
     geo.append(s.get());
   }
-  return geo.cost(makeObjective()).value();
+  // The objective's per-state cost is 1 + proximity penalty, so the total minus
+  // the geometric length isolates the penalty the clearance term contributed.
+  const double total = geo.cost(makeObjective()).value();
+  const double length = geo.length();
+  return {length, total - length, total};
 }
 
 }  // namespace drone_core::planning

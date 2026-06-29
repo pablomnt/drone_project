@@ -137,9 +137,13 @@ and the fast control thread:
   `cost ≤ replan_improve_ratio × committed_cost` (hysteresis, prevents chatter). One search ⇒ one
   EDT use per tick. Both validity and cost use the **same cached `DynamicEDTOctomap`** (`maxdist =
   clearance_threshold`), rebuilt only when the map object changes (see `clearanceField`), not per
-  tick. Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`; `simplifyMax` is disabled in clearance
-  mode (it would shortcut back toward obstacles). Each tick logs one line (phase, committed cost, min
-  clearance, blocked/why, outcome); OMPL's own console is set to `LOG_WARN` to keep the terminal clean.
+  tick. Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`. Path post-processing: with **no**
+  clearance field, plain length-only `simplifyMax`; in clearance mode, a **cost-aware shortcut**
+  (`shortcutClearanceAware`) drops an interior waypoint only when the straight bypass is
+  collision-free *and* doesn't raise the clearance-aware cost — so it removes the RRT* zig-zag
+  without the wall-hugging that pure `simplifyMax` would cause (a `kMaxShortcutSegment` cap keeps
+  waypoint density for min-snap). Each tick logs one line (phase, committed cost, min clearance,
+  blocked/why, outcome); OMPL's own console is set to `LOG_WARN` to keep the terminal clean.
 - **Trajectory generation (~1 Hz, `trajgen_period`):** re-anchors min-snap to current position.
   **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
   control stays on `kDirect` / POS_SP.
@@ -216,15 +220,37 @@ are confined to this file.
 - `/smooth_trajectory` (`nav_msgs/Path`) — sampled min-snap trajectory. Dormant while
   `PLAN_TRAJECTORY=false`.
 
+**Debug-only planner visualisation** (gated by `DEBUG_PLANNER_VIZ`, default off — see below). These
+publish nothing and cost nothing when the flag is off:
+- `/planner/search_tree` (`visualization_msgs/MarkerArray`) — the RRT* tree from the most recent
+  solve: faint grey `LINE_LIST` edges + orange `POINTS` nodes. Per-solve snapshot (persists between
+  searches). Lets you watch where the planner explored and tune `RRT_RANGE` / `RRT_SOLVE_TIME` by eye.
+- `/planner/clearance_field` (`sensor_msgs/PointCloud2`, `intensity` = clearance distance) — coarse
+  (0.15 m) samples of the cached EDT, colour near→far. Shows exactly what the clearance cost "sees",
+  for tuning `CLEARANCE_WEIGHT` / `CLEARANCE_THRESHOLD`. Sampled on the worker thread only when the
+  map changes.
+
 **Planning-related node parameters** (all live-reconfigurable via `onParameterChange`):
 - `PLAN_TRAJECTORY` (bool, default `false`) — geometry-first phase gate; set `true` to enable
   min-snap + trajectory tracking.
 - `RRT_MONITOR_PERIOD` (double, default `0.5` s) — path validity re-check cadence.
 - `RRT_IMPROVE_PERIOD` (double, default `5.0` s) — clearance-aware improvement search cadence.
 - `RRT_SOLVE_TIME` (double, default `5.0` s) — RRT* optimisation budget per solve.
+- `RRT_RANGE` (double, default `1.0` m) — RRT* max tree-extension ("step size"); smaller = finer
+  paths/denser waypoints but needs more solve time. `<=0` lets OMPL auto-size (≈ several m here).
 - `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
 - `CLEARANCE_WEIGHT` (double, default `4.0`) — obstacle-proximity penalty weight.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
+- `DEBUG_PLANNER_VIZ` (bool, default `false`) — **single switch** for the debug planner
+  visualisation (search tree + clearance field above). Off by default so a regular flight pays
+  nothing: with it false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is
+  never sampled, and the two publish methods early-return. Flip it true for a bench/tuning run; it is
+  live-reconfigurable, so no relaunch.
+
+> **Instrumentation principle (apply to any future debug/viz):** keep it behind a *single*,
+> *default-off* runtime parameter and make it *zero-cost when off* — no extraction, no allocation, no
+> publishing — so it never taxes a real flight on the NUC, and never touches the flight-critical
+> control path. `DEBUG_PLANNER_VIZ` is the reference example.
 
 **Additional dependency**: `libdynamicedt3d-dev` (apt, version-matched to octomap 1.9.7). Used in
 `autonomy_core.cpp` only; linked into `drone_core_autonomy`. Headers at

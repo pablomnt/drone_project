@@ -76,11 +76,17 @@ def generate_launch_description():
             ]
         ),
 
-        # Launch OKVIS node in subscriber mode
+        # Launch OKVIS node in subscriber mode.
+        # OKVIS logs through glog (the 'I0629 ...' lines: pose-init, RANSAC, large
+        # reprojection error), which floods the terminal. GLOG_minloglevel=1 drops
+        # its INFO chatter while keeping warnings/errors, so the planning logs stay
+        # readable. (rviz stays on — the okvis launch brings up its own rviz2 for
+        # the VIO mesh/trajectory view.)
         launch.actions.ExecuteProcess(
             cmd=[
                 'bash', '-c',
-                f"ros2 launch okvis okvis_node_subscriber.launch.xml config_filename:={config_file}"
+                f"GLOG_minloglevel=2 ros2 launch okvis okvis_node_subscriber.launch.xml "
+                f"config_filename:={config_file}"
             ],
             output='screen'
         ),
@@ -126,7 +132,7 @@ def generate_launch_description():
                 # RangeMax trades look-ahead vs. far D435i depth noise (8 m is well into
                 #   the noisy range; lower it toward ~3 m for less speckle at the source).
                 #   CellSize matches the old 0.05 m octomap_server resolution.
-                'args:=" -d --Vis/MinInliers 12 --Rtabmap/DetectionRate 1 --Rtabmap/ImagesBufferSize 10 --Rtabmap/TimeThr 0 --Rtabmap/MemoryThr 0 '
+                'args:=" -d --Vis/MinInliers 12 --Rtabmap/DetectionRate 1 --Rtabmap/ImagesBufferSize 10 --Rtabmap/TimeThr 0 --Rtabmap/MemoryThr 0 --RGBD/OptimizeMaxError 5.0 '
                 '--Grid/3D true --Grid/RayTracing true --Grid/CellSize 0.05 --Grid/RangeMax 8.0 '
                 '--Grid/DepthDecimation 1 --Grid/NormalsSegmentation false '
                 '--Grid/NoiseFilteringRadius 0.1 --Grid/NoiseFilteringMinNeighbors 5"'
@@ -142,11 +148,16 @@ def generate_launch_description():
 
 
 
-        # Start Foxglove WebSocket bridge for remote visualization
+        # Start Foxglove WebSocket bridge for remote visualization.
+        # foxglove_bridge logs an INFO 'Advertising new channel N for topic ...'
+        # for every topic (~140 of them), burying the planning logs at startup and
+        # on every new topic. --log-level WARN raises its threshold so only
+        # warnings/errors print; the bridge itself is unaffected.
         launch.actions.ExecuteProcess(
             cmd=[
                 'bash', '-c',
-                'ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765'
+                'ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765 '
+                '--log-level WARN'
             ],
             output='screen'
         ),

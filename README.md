@@ -63,7 +63,11 @@ inside the core.
   mapped floor — can still root the search and take off, without ever passing *through* an obstacle.
   RRT* approximate solutions that stop more than `kGoalFlexibility` (0.3 m) short of the goal are
   rejected (treated as no path) rather than committed to. The same field also drives a clearance-aware
-  cost (`setClearance`). These tunables are `static constexpr` in the class.
+  cost (`setClearance`). These tunables are `static constexpr` in the class. The raw RRT* path is
+  post-processed by a **cost-aware shortcut** in clearance mode (`shortcutClearanceAware`): it removes
+  zig-zag waypoints but only when the straight bypass stays collision-free *and* does not raise the
+  clearance-aware cost, so the result is straighter without hugging the obstacles the cost routed
+  around (plain length-only `simplifyMax` is used only when no clearance field is set).
 - `MinSnapTrajectory` / `MinSnapTimeOptimizer` — KKT minimum-snap solve plus an NLopt BOBYQA outer
   loop for per-segment time allocation ("mode A" of ETH Zurich's `mav_trajectory_generation`). The
   optimizer keeps the actual per-segment polynomial coefficients + segment times (rather than
@@ -105,7 +109,13 @@ from the active estimator (VIO in normal mode; PX4 odometry in `USE_SIM_MODE`), 
 back the `Command`, applies the yaw-drift correction toward PX4's yaw and the ENU→NED/FRD conversion
 via `core/common/frames`, and publishes the attitude setpoint plus `ControllerDebug` telemetry. Goals
 arrive on `/planner/goal`; a `POS_SP` parameter provides the default takeoff/hover setpoint. All PX4
-message types and frame conversions are confined to this file. Launch files live in `launch/`:
+message types and frame conversions are confined to this file. It also exposes an **opt-in planner
+debug visualisation** — `/planner/search_tree` (the RRT* tree as a MarkerArray) and
+`/planner/clearance_field` (the EDT as an intensity-coloured PointCloud2) — behind the single
+`DEBUG_PLANNER_VIZ` parameter (default off, zero-cost when off) for tuning planning by eye in
+Foxglove. Any future debug/instrumentation should follow that same rule: one default-off switch,
+nothing computed or published when it is off, and never in the flight-critical path. Launch files
+live in `launch/`:
 `autonomy_vision_launch.py` (real flight — full camera/VIO/mapping stack + Foxglove + the
 `body→camera_link` static TF), `autonomy_launch.py` (xterm-per-process variant) and
 `autonomy_sim_launch.py` (SITL: `USE_SIM_MODE:=true`, `MicroXRCEAgent udp4`).

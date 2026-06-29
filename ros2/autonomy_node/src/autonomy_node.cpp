@@ -27,6 +27,8 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "sensor_msgs/msg/joy.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 #include "px4_msgs/msg/offboard_control_mode.hpp"
 #include "px4_msgs/msg/sensor_combined.hpp"
@@ -126,6 +128,8 @@ public:
     pub_path_ = create_publisher<nav_msgs::msg::Path>("/smooth_trajectory", 10);
     pub_geom_path_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/geometric_path", 10);
     pub_goal_marker_ = create_publisher<visualization_msgs::msg::Marker>("/planner/goal_marker", 10);
+    pub_search_tree_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/search_tree", 10);
+    pub_clearance_field_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/clearance_field", 10);
 
     control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this));
     viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this));
@@ -154,9 +158,10 @@ private:
 
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
     declare_parameter("STALE_TIMEOUT", 0.5);
-    declare_parameter("RRT_MONITOR_PERIOD", 0.5);
-    declare_parameter("RRT_IMPROVE_PERIOD", 5.0);
+    declare_parameter("RRT_MONITOR_PERIOD", 1.0);
+    declare_parameter("RRT_IMPROVE_PERIOD", 10.0);
     declare_parameter("RRT_SOLVE_TIME", 5.0);
+    declare_parameter("RRT_RANGE", 1.0);
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
     declare_parameter("CLEARANCE_WEIGHT", 4.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
@@ -166,6 +171,11 @@ private:
     // the controller, which keeps following POS_SP. Flip to true to enable the
     // min-snap trajectory + tracking stage.
     declare_parameter("PLAN_TRAJECTORY", false);
+    // Single switch for the planner debug visualisation: publishes the RRT*
+    // search tree (/planner/search_tree) and the EDT clearance field
+    // (/planner/clearance_field). Off by default so regular flights pay nothing;
+    // flip true for a debugging/tuning run (live-reconfigurable).
+    declare_parameter("DEBUG_PLANNER_VIZ", false);
   }
 
   drone_core::autonomy::AutonomyCore::Config configFromParameters() {
@@ -192,11 +202,13 @@ private:
     cfg.rrt_monitor_period = get_parameter("RRT_MONITOR_PERIOD").as_double();
     cfg.rrt_improve_period = get_parameter("RRT_IMPROVE_PERIOD").as_double();
     cfg.rrt_solve_time = get_parameter("RRT_SOLVE_TIME").as_double();
+    cfg.rrt_range = get_parameter("RRT_RANGE").as_double();
     cfg.replan_improve_ratio = get_parameter("REPLAN_IMPROVE_RATIO").as_double();
     cfg.clearance_weight = get_parameter("CLEARANCE_WEIGHT").as_double();
     cfg.clearance_threshold = get_parameter("CLEARANCE_THRESHOLD").as_double();
     cfg.trajgen_period = get_parameter("TRAJGEN_PERIOD").as_double();
     cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
+    cfg.debug_planner_viz = get_parameter("DEBUG_PLANNER_VIZ").as_bool();
     return cfg;
   }
 
@@ -426,6 +438,8 @@ private:
     publishGoalMarker();
     publishGeometricPath();
     publishPlannedPath();
+    publishSearchTree();
+    publishClearanceField();
   }
 
   // The active goal as a single sphere marker, so it renders as a point in RViz
@@ -499,6 +513,102 @@ private:
     pub_geom_path_->publish(arr);
   }
 
+  // Debug-only (gated by DEBUG_PLANNER_VIZ): the RRT* search tree from the most
+  // recent solve as a MarkerArray — a faint LINE_LIST of edges plus small POINTS
+  // for the nodes. Lets you watch where the planner explored and tune RRT_RANGE /
+  // RRT_SOLVE_TIME by eye. When off this returns before building anything.
+  void publishSearchTree() {
+    if (!get_parameter("DEBUG_PLANNER_VIZ").as_bool()) return;
+    const auto tree = core_->searchTree();
+
+    visualization_msgs::msg::MarkerArray arr;
+    visualization_msgs::msg::Marker clear;
+    clear.header.frame_id = "map";
+    clear.header.stamp = now();
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+
+    if (!tree.nodes.empty()) {
+      visualization_msgs::msg::Marker edges;
+      edges.header.frame_id = "map";
+      edges.header.stamp = now();
+      edges.ns = "search_tree";
+      edges.id = 0;
+      edges.type = visualization_msgs::msg::Marker::LINE_LIST;
+      edges.action = visualization_msgs::msg::Marker::ADD;
+      edges.pose.orientation.w = 1.0;
+      edges.scale.x = 0.01;  // line width [m]
+      edges.color.r = 0.6f; edges.color.g = 0.6f; edges.color.b = 0.6f; edges.color.a = 0.5f;
+      for (const auto& e : tree.edges) {
+        if (e.first < 0 || e.second < 0) continue;
+        const auto& a = tree.nodes[static_cast<std::size_t>(e.first)];
+        const auto& b = tree.nodes[static_cast<std::size_t>(e.second)];
+        geometry_msgs::msg::Point pa, pb;
+        pa.x = a[0]; pa.y = a[1]; pa.z = a[2];
+        pb.x = b[0]; pb.y = b[1]; pb.z = b[2];
+        edges.points.push_back(pa);
+        edges.points.push_back(pb);
+      }
+
+      visualization_msgs::msg::Marker nodes;
+      nodes.header = edges.header;
+      nodes.ns = "search_tree";
+      nodes.id = 1;
+      nodes.type = visualization_msgs::msg::Marker::POINTS;
+      nodes.action = visualization_msgs::msg::Marker::ADD;
+      nodes.pose.orientation.w = 1.0;
+      nodes.scale.x = nodes.scale.y = 0.04;  // point size [m]
+      nodes.color.r = 1.0f; nodes.color.g = 0.7f; nodes.color.b = 0.1f; nodes.color.a = 0.9f;
+      for (const auto& n : tree.nodes) {
+        geometry_msgs::msg::Point p;
+        p.x = n[0]; p.y = n[1]; p.z = n[2];
+        nodes.points.push_back(p);
+      }
+      arr.markers.push_back(edges);
+      arr.markers.push_back(nodes);
+    }
+    pub_search_tree_->publish(arr);
+  }
+
+  // Debug-only (gated by DEBUG_PLANNER_VIZ): the EDT clearance field as a
+  // PointCloud2 with an `intensity` = distance-to-nearest-obstacle field, so
+  // RViz/Foxglove colour it near->far. Shows exactly what the clearance cost
+  // sees, for tuning CLEARANCE_WEIGHT / CLEARANCE_THRESHOLD. When off this
+  // returns before touching the core.
+  void publishClearanceField() {
+    if (!get_parameter("DEBUG_PLANNER_VIZ").as_bool()) return;
+    const auto samples = core_->clearanceSamples();
+    if (samples.empty()) return;
+
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.frame_id = "map";
+    cloud.header.stamp = now();
+    cloud.height = 1;
+    cloud.is_dense = true;
+    cloud.is_bigendian = false;
+
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2Fields(4,
+        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "intensity", 1, sensor_msgs::msg::PointField::FLOAT32);
+    mod.resize(samples.size());
+
+    sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iy(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iz(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<float> ii(cloud, "intensity");
+    for (const auto& s : samples) {
+      *ix = static_cast<float>(s[0]);
+      *iy = static_cast<float>(s[1]);
+      *iz = static_cast<float>(s[2]);
+      *ii = static_cast<float>(s[3]);
+      ++ix; ++iy; ++iz; ++ii;
+    }
+    pub_clearance_field_->publish(cloud);
+  }
+
   void publishPlannedPath() {
     const auto sampled = core_->sampledPlannedPath();
     if (sampled.empty()) return;
@@ -536,6 +646,8 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_geom_path_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_goal_marker_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_search_tree_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_clearance_field_;
 
   rclcpp::TimerBase::SharedPtr control_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;
