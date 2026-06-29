@@ -59,10 +59,11 @@ inside the core.
   instead of sampling the whole box, which plain RRT* does); a small `makePlanner()` factory builds
   and configures the chosen one. **Every per-planner tunable lives in `PlannerConfig` in
   `geometric_planner.hpp`** — the single place to tune them — and only the selection
-  (`PLANNER_TYPE`) is a ROS param. The clearance objective overrides `motionCostHeuristic` with the
-  Euclidean distance (admissible, since the integrand is ≥1) so the heuristic-driven planners search
-  toward the goal. Collision checking is **EDT-based**: a state is free when its clearance (3D
-  Euclidean distance to
+  (`PLANNER_TYPE`) is a ROS param. The clearance objective gives the informed/heuristic planners both
+  an edge heuristic (`motionCostHeuristic`) and a state→goal cost-to-go (`goalRegionCostToGo`) — both
+  the Euclidean distance, admissible since the integrand is ≥1; without the cost-to-go one OMPL warns
+  informed sampling has "little to no effect". Collision checking is **EDT-based**: a state is free
+  when its clearance (3D Euclidean distance to
   the nearest obstacle, from a `DynamicEDTOctomap` passed in as the clearance function) exceeds
   `kCollisionMargin` (0.4 m) — one O(1) lookup that also enforces *vertical* clearance. (A
   horizontal-only octree box scan remains as a fallback for standalone use when no field is set.)

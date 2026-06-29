@@ -159,9 +159,12 @@ Module roles:
   a small factory `makePlanner()`; the BIT* lineage is heuristic/informed and far better at focusing
   the search on the start→goal corridor than plain RRT*). **All per-planner tunables live in
   `PlannerConfig` in `geometric_planner.hpp`** (the single place to tune them — edit + rebuild the
-  core); only `PLANNER_TYPE` is a ROS param. The clearance objective overrides `motionCostHeuristic`
-  to return Euclidean distance (an admissible lower bound, since the integrand is ≥1) so the
-  heuristic-driven planners actually search toward the goal.
+  core); only `PLANNER_TYPE` is a ROS param. For the informed/heuristic planners to work the clearance
+  objective must supply **both** an edge heuristic (`motionCostHeuristic` → Euclidean distance between
+  states) **and** a state→goal cost-to-go heuristic (`setCostToGoHeuristic(goalRegionCostToGo)`); both
+  are admissible lower bounds because the integrand is ≥1. Without the cost-to-go one OMPL warns that
+  informed sampling "will have little to no effect" and RRT*'s ellipse / the BIT* goal heuristic stay
+  blind.
   **Collision check is EDT-based**: a state is free when its clearance (3D Euclidean distance to the
   nearest obstacle, via a `DynamicEDTOctomap` passed as the clearance fn) exceeds `kCollisionMargin`
   (0.5 m) — one O(1) lookup, and because the distance is 3D it enforces **vertical** clearance too
