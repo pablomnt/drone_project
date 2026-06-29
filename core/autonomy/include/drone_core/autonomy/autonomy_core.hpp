@@ -10,7 +10,7 @@
 #include "drone_core/common/types.hpp"
 #include "drone_core/control/trajectory_tracker.hpp"
 #include "drone_core/planning/min_snap_trajectory.hpp"
-#include "drone_core/planning/rrt_star_planner.hpp"
+#include "drone_core/planning/geometric_planner.hpp"
 
 // Forward declaration (from dynamicEDT3D) so the cached distance field can be a
 // member without pulling that header into this ROS-free public interface.
@@ -38,8 +38,11 @@ public:
     double stale_timeout{0.5};        // hover-hold fallback threshold [s]
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
     double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
-    double rrt_solve_time{3.0};       // RRT* optimisation budget per solve [s]
-    double rrt_range{1.0};            // RRT* max tree-extension (step size) [m]; <=0 => OMPL auto
+    double rrt_solve_time{3.0};       // planner optimisation budget per solve [s]
+    // Which OMPL planner the worker builds. Per-planner tunables (RRT* range/goal
+    // bias, BIT*/AIT*/EIT* batch sizes, etc.) live in PlannerConfig in
+    // geometric_planner.hpp, the single place to tune them.
+    planning::PlannerType planner_type{planning::PlannerType::RRTstar};
     double replan_improve_ratio{0.85};  // adopt candidate iff cost <= ratio*committed
     double clearance_weight{4.0};     // obstacle-proximity penalty weight
     double clearance_threshold{1.0};  // clearance saturation distance / EDT maxdist [m]
@@ -109,7 +112,7 @@ public:
 
   // Snapshot of the most recent RRT* search tree (nodes + edges), for debug
   // visualisation. Empty unless cfg.debug_planner_viz is set. Thread-safe copy.
-  planning::RrtStarPlanner::SearchTree searchTree() const;
+  planning::GeometricPlanner::SearchTree searchTree() const;
 
   // Coarse samples of the cached clearance (EDT) field as {x, y, z, distance}
   // (distance clamped at clearance_threshold), for debug visualisation. Empty
@@ -132,7 +135,7 @@ private:
   // and an improvement search minimise exactly the same cost. Returns false and
   // leaves the planner length-optimal when the map has no obstacles (clearance
   // is then uniform and the EDT meaningless).
-  bool applyClearanceObjective(planning::RrtStarPlanner& planner,
+  bool applyClearanceObjective(planning::GeometricPlanner& planner,
                                const planning::MapHandle& map);
 
   // Return the cached Euclidean distance field for `map`, rebuilding it only when
@@ -169,7 +172,7 @@ private:
   bool has_pending_{false};
   common::Trajectory last_planned_;  // retained for visualisation
   std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
-  planning::RrtStarPlanner::SearchTree last_search_tree_;  // debug viz; empty unless enabled
+  planning::GeometricPlanner::SearchTree last_search_tree_;  // debug viz; empty unless enabled
   std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
 
   std::thread worker_;

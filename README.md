@@ -25,7 +25,7 @@ src/
 ├── core/                       # ROS-FREE autonomy core (plain CMake, COLCON_IGNORE)
 │   ├── common/                 # types.hpp, frames.{hpp,cpp}, logging.hpp
 │   ├── control/                # position_control, flatness_mapper, trajectory_tracker
-│   ├── planning/               # rrt_star_planner, min_snap_trajectory
+│   ├── planning/               # geometric_planner, min_snap_trajectory
 │   └── autonomy/               # autonomy_core (the orchestrator)
 └── ros2/                       # everything colcon/ament
     ├── autonomy_node/          # the one first-party ROS node + launch files
@@ -53,17 +53,25 @@ inside the core.
 
 ### `planning/`
 
-- `RrtStarPlanner` — OMPL SE(3) RRT* over an octree (X/Y ±15 m, Z 0.3–2.5 m, 3 s solve budget).
-  Collision checking is **EDT-based**: a state is free when its clearance (3D Euclidean distance to
+- `GeometricPlanner` — a **runtime-selectable** OMPL planner over an SE(3) octree (X/Y ±15 m,
+  Z 0.3–2.5 m). `PlannerType` picks among `RRTstar`, `BITstar`, `ABITstar`, `AITstar`, `EITstar`
+  (the BIT* lineage is heuristic/informed and concentrates the search on the start→goal corridor
+  instead of sampling the whole box, which plain RRT* does); a small `makePlanner()` factory builds
+  and configures the chosen one. **Every per-planner tunable lives in `PlannerConfig` in
+  `geometric_planner.hpp`** — the single place to tune them — and only the selection
+  (`PLANNER_TYPE`) is a ROS param. The clearance objective overrides `motionCostHeuristic` with the
+  Euclidean distance (admissible, since the integrand is ≥1) so the heuristic-driven planners search
+  toward the goal. Collision checking is **EDT-based**: a state is free when its clearance (3D
+  Euclidean distance to
   the nearest obstacle, from a `DynamicEDTOctomap` passed in as the clearance function) exceeds
   `kCollisionMargin` (0.4 m) — one O(1) lookup that also enforces *vertical* clearance. (A
   horizontal-only octree box scan remains as a fallback for standalone use when no field is set.)
   Inside a sphere around the start (`kStartEscapeRadius`, 0.5 m) the required clearance drops to
   `kStartMargin` (0 m) so a parked or just-lifting drone — sitting within the normal margin of the
   mapped floor — can still root the search and take off, without ever passing *through* an obstacle.
-  RRT* approximate solutions that stop more than `kGoalFlexibility` (0.3 m) short of the goal are
+  Approximate solutions that stop more than `kGoalFlexibility` (0.3 m) short of the goal are
   rejected (treated as no path) rather than committed to. The same field also drives a clearance-aware
-  cost (`setClearance`). These tunables are `static constexpr` in the class. The raw RRT* path is
+  cost (`setClearance`). These margins are `static constexpr` in the class. The raw planner path is
   post-processed by a **cost-aware shortcut** in clearance mode (`shortcutClearanceAware`): it removes
   zig-zag waypoints but only when the straight bypass stays collision-free *and* does not raise the
   clearance-aware cost, so the result is straighter without hugging the obstacles the cost routed

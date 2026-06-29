@@ -215,7 +215,7 @@ std::vector<std::vector<double>> AutonomyCore::geometricPath() const {
   return last_geometric_path_;
 }
 
-planning::RrtStarPlanner::SearchTree AutonomyCore::searchTree() const {
+planning::GeometricPlanner::SearchTree AutonomyCore::searchTree() const {
   std::lock_guard<std::mutex> lock(traj_mutex_);
   return last_search_tree_;
 }
@@ -252,8 +252,8 @@ std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
 bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal& goal,
                                  const planning::MapHandle& map,
                                  std::vector<std::vector<double>>& path) {
-  planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
-  planner.setRange(cfg_.rrt_range);
+  planning::GeometricPlanner planner(map, cfg_.rrt_solve_time);
+  planner.setPlannerType(cfg_.planner_type);
   const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
   const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
   return planner.planPath(start, goal_vec, path);
@@ -294,7 +294,7 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
   return edt_;
 }
 
-bool AutonomyCore::applyClearanceObjective(planning::RrtStarPlanner& planner,
+bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
                                            const planning::MapHandle& map) {
   auto edt = clearanceField(map);
   if (!edt) return false;
@@ -345,8 +345,8 @@ void AutonomyCore::plannerLoop() {
       // cost, so the committed-path re-check below sees the same obstacles the
       // search would. The field is cached (rebuilt only on a map change), so this
       // is cheap on the common still-valid tick.
-      planning::RrtStarPlanner planner(map, cfg_.rrt_solve_time);
-      planner.setRange(cfg_.rrt_range);
+      planning::GeometricPlanner planner(map, cfg_.rrt_solve_time);
+      planner.setPlannerType(cfg_.planner_type);
       planner.setRecordTree(cfg_.debug_planner_viz);
       applyClearanceObjective(planner, map);
 
@@ -385,7 +385,7 @@ void AutonomyCore::plannerLoop() {
 
       // Stream a cost as "total (len=L + clr_cost=C)" so each replan line shows
       // whether the score is driven by path length or by obstacle proximity.
-      auto fmtCost = [](const planning::RrtStarPlanner::CostBreakdown& cb) {
+      auto fmtCost = [](const planning::GeometricPlanner::CostBreakdown& cb) {
         std::ostringstream os;
         os << cb.total << " (len=" << cb.length << " + clr_cost=" << cb.clearance << ")";
         return os.str();
@@ -408,16 +408,16 @@ void AutonomyCore::plannerLoop() {
             const auto cand = planner.costBreakdown(candidate);
             adopt(candidate);
             if (had_path)
-              DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed BLOCKED (clr="
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed BLOCKED (clr="
                              << committed_clr << "m < " << planner.collisionMargin()
                              << "m) -> REPLAN cost=" << fmtCost(cand) << " clr="
                              << planner.minClearance(candidate) << "m");
             else
-              DRONE_LOG_INFO("[plan] #" << run << " MONITOR no committed path -> PLAN cost="
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR no committed path -> PLAN cost="
                              << fmtCost(cand) << " clr="
                              << planner.minClearance(candidate) << "m");
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed "
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed "
                            << (had_path ? "BLOCKED" : "absent")
                            << " -> REPLAN FAILED (no path to goal), holding");
           }
@@ -428,11 +428,11 @@ void AutonomyCore::plannerLoop() {
           const auto cand = planner.costBreakdown(candidate);
           if (solved && cand.total <= threshold) {
             adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << fmtCost(committed)
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE committed cost=" << fmtCost(committed)
                            << " -> ADOPT cost=" << fmtCost(cand) << " clr="
                            << planner.minClearance(candidate) << "m");
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " IMPROVE committed cost=" << fmtCost(committed)
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE committed cost=" << fmtCost(committed)
                            << " clr=" << committed_clr << "m candidate cost="
                            << (solved ? fmtCost(cand) : std::string("inf"))
                            << " -> keep (need <=" << threshold << ")");
@@ -440,7 +440,7 @@ void AutonomyCore::plannerLoop() {
         }
       } else {
         // Monitor only: committed path still clear of obstacles.
-        DRONE_LOG_INFO("[plan] #" << run << " MONITOR committed cost=" << fmtCost(committed)
+        DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed cost=" << fmtCost(committed)
                        << " clr=" << committed_clr << "m -> OK");
       }
 

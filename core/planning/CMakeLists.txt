@@ -1,8 +1,9 @@
-# Global geometric planning (RRT*) and minimum-snap trajectory generation.
-# Third-party deps (OMPL, octomap, NLopt) are all ROS-free.
+# Global geometric planning (selectable OMPL planner: RRT* / BIT* / ABIT* / AIT* /
+# EIT*) and minimum-snap trajectory generation. Third-party deps (OMPL, octomap,
+# NLopt) are all ROS-free.
 
 add_library(drone_core_planning
-  src/rrt_star_planner.cpp
+  src/geometric_planner.cpp
   src/min_snap_trajectory.cpp)
 add_library(drone_core::planning ALIAS drone_core_planning)
 

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -161,7 +162,10 @@ private:
     declare_parameter("RRT_MONITOR_PERIOD", 1.0);
     declare_parameter("RRT_IMPROVE_PERIOD", 10.0);
     declare_parameter("RRT_SOLVE_TIME", 5.0);
-    declare_parameter("RRT_RANGE", 1.0);
+    // Which OMPL planner to run: RRTstar | BITstar | ABITstar | AITstar | EITstar.
+    // Live-reconfigurable so you can A/B them on the bench. Per-planner internal
+    // tunables live in geometric_planner.hpp (PlannerConfig).
+    declare_parameter<std::string>("PLANNER_TYPE", "RRTstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
     declare_parameter("CLEARANCE_WEIGHT", 4.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
@@ -175,7 +179,7 @@ private:
     // search tree (/planner/search_tree) and the EDT clearance field
     // (/planner/clearance_field). Off by default so regular flights pay nothing;
     // flip true for a debugging/tuning run (live-reconfigurable).
-    declare_parameter("DEBUG_PLANNER_VIZ", false);
+    declare_parameter("DEBUG_PLANNER_VIZ", true);
   }
 
   drone_core::autonomy::AutonomyCore::Config configFromParameters() {
@@ -202,7 +206,11 @@ private:
     cfg.rrt_monitor_period = get_parameter("RRT_MONITOR_PERIOD").as_double();
     cfg.rrt_improve_period = get_parameter("RRT_IMPROVE_PERIOD").as_double();
     cfg.rrt_solve_time = get_parameter("RRT_SOLVE_TIME").as_double();
-    cfg.rrt_range = get_parameter("RRT_RANGE").as_double();
+    const std::string planner = get_parameter("PLANNER_TYPE").as_string();
+    if (!drone_core::planning::fromString(planner, cfg.planner_type)) {
+      RCLCPP_WARN(get_logger(), "Unknown PLANNER_TYPE '%s', using RRTstar.", planner.c_str());
+      cfg.planner_type = drone_core::planning::PlannerType::RRTstar;
+    }
     cfg.replan_improve_ratio = get_parameter("REPLAN_IMPROVE_RATIO").as_double();
     cfg.clearance_weight = get_parameter("CLEARANCE_WEIGHT").as_double();
     cfg.clearance_threshold = get_parameter("CLEARANCE_THRESHOLD").as_double();
@@ -513,9 +521,9 @@ private:
     pub_geom_path_->publish(arr);
   }
 
-  // Debug-only (gated by DEBUG_PLANNER_VIZ): the RRT* search tree from the most
-  // recent solve as a MarkerArray — a faint LINE_LIST of edges plus small POINTS
-  // for the nodes. Lets you watch where the planner explored and tune RRT_RANGE /
+  // Debug-only (gated by DEBUG_PLANNER_VIZ): the search tree from the most recent
+  // solve as a MarkerArray — a faint LINE_LIST of edges plus small POINTS for the
+  // nodes. Lets you watch where the planner explored and A/B PLANNER_TYPE /
   // RRT_SOLVE_TIME by eye. When off this returns before building anything.
   void publishSearchTree() {
     if (!get_parameter("DEBUG_PLANNER_VIZ").as_bool()) return;

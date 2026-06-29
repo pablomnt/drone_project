@@ -38,7 +38,7 @@ src/
 ├── core/                       # ROS-FREE autonomy core (plain CMake, COLCON_IGNORE)
 │   ├── common/                 # types.hpp, frames.{hpp,cpp}, logging.hpp
 │   ├── control/                # position_control, flatness_mapper, trajectory_tracker
-│   ├── planning/               # rrt_star_planner, min_snap_trajectory
+│   ├── planning/               # geometric_planner, min_snap_trajectory
 │   └── autonomy/               # autonomy_core (the orchestrator)
 └── ros2/                       # everything colcon/ament
     ├── autonomy_node/          # the one first-party ROS node + launch files
@@ -128,7 +128,7 @@ and the fast control thread:
 
 **Background worker (planning, geometry-first phase):** one loop ticking at the monitor cadence
 (`rrt_monitor_period`, ~2 Hz). Each tick builds **one** planner and does:
-- **Monitor (every tick):** re-checks the committed path via `RrtStarPlanner::isPathValid`. If a
+- **Monitor (every tick):** re-checks the committed path via `GeometricPlanner::isPathValid`. If a
   point's clearance has dropped below the margin it's `path_invalid`.
 - **Improve (every Nth tick,** `N = round(rrt_improve_period / rrt_monitor_period)` ≈ 10): flagged
   only with a committed path and obstacles mapped.
@@ -154,7 +154,14 @@ Module roles:
 - **`common`** — shared plain types (`State`, `Reference`, `Command`, `Trajectory`, `Goal`,
   `MapHandle`) and **`frames`**, which holds *all* ENU↔NED/FRD and OKVIS-yaw conversions (extracted
   from the old node so they are unit-testable). `logging.hpp` replaces ROS logging in the core.
-- **`planning`** — `RrtStarPlanner` (OMPL SE(3) RRT* over an octree, X/Y ±15 m, Z −1.5–2.5 m).
+- **`planning`** — `GeometricPlanner` (a **runtime-selectable** OMPL planner over an SE(3) octree,
+  X/Y ±15 m, Z −1.5–2.5 m — `PlannerType` ∈ {RRTstar, BITstar, ABITstar, AITstar, EITstar}, built by
+  a small factory `makePlanner()`; the BIT* lineage is heuristic/informed and far better at focusing
+  the search on the start→goal corridor than plain RRT*). **All per-planner tunables live in
+  `PlannerConfig` in `geometric_planner.hpp`** (the single place to tune them — edit + rebuild the
+  core); only `PLANNER_TYPE` is a ROS param. The clearance objective overrides `motionCostHeuristic`
+  to return Euclidean distance (an admissible lower bound, since the integrand is ≥1) so the
+  heuristic-driven planners actually search toward the goal.
   **Collision check is EDT-based**: a state is free when its clearance (3D Euclidean distance to the
   nearest obstacle, via a `DynamicEDTOctomap` passed as the clearance fn) exceeds `kCollisionMargin`
   (0.5 m) — one O(1) lookup, and because the distance is 3D it enforces **vertical** clearance too
@@ -222,9 +229,10 @@ are confined to this file.
 
 **Debug-only planner visualisation** (gated by `DEBUG_PLANNER_VIZ`, default off — see below). These
 publish nothing and cost nothing when the flag is off:
-- `/planner/search_tree` (`visualization_msgs/MarkerArray`) — the RRT* tree from the most recent
+- `/planner/search_tree` (`visualization_msgs/MarkerArray`) — the search tree from the most recent
   solve: faint grey `LINE_LIST` edges + orange `POINTS` nodes. Per-solve snapshot (persists between
-  searches). Lets you watch where the planner explored and tune `RRT_RANGE` / `RRT_SOLVE_TIME` by eye.
+  searches). Lets you watch where the planner explored — A/B `PLANNER_TYPE` and tune `RRT_SOLVE_TIME`
+  (and per-planner knobs in `geometric_planner.hpp`) by eye.
 - `/planner/clearance_field` (`sensor_msgs/PointCloud2`, `intensity` = clearance distance) — coarse
   (0.15 m) samples of the cached EDT, colour near→far. Shows exactly what the clearance cost "sees",
   for tuning `CLEARANCE_WEIGHT` / `CLEARANCE_THRESHOLD`. Sampled on the worker thread only when the
@@ -235,9 +243,14 @@ publish nothing and cost nothing when the flag is off:
   min-snap + trajectory tracking.
 - `RRT_MONITOR_PERIOD` (double, default `0.5` s) — path validity re-check cadence.
 - `RRT_IMPROVE_PERIOD` (double, default `5.0` s) — clearance-aware improvement search cadence.
-- `RRT_SOLVE_TIME` (double, default `5.0` s) — RRT* optimisation budget per solve.
-- `RRT_RANGE` (double, default `1.0` m) — RRT* max tree-extension ("step size"); smaller = finer
-  paths/denser waypoints but needs more solve time. `<=0` lets OMPL auto-size (≈ several m here).
+- `RRT_SOLVE_TIME` (double, default `5.0` s) — planner optimisation budget per solve (all planners
+  are anytime). Drop it to ~1–3 s while tuning so each solve refreshes the tree viz quickly.
+- `PLANNER_TYPE` (string, default `"RRTstar"`) — which OMPL planner the worker builds:
+  `RRTstar | BITstar | ABITstar | AITstar | EITstar`. Live-reconfigurable, so you can A/B them on the
+  bench against the tree viz. **Per-planner internals (RRT* range/goal-bias, BIT*/AIT*/EIT* batch
+  sizes, rewire factors, …) are NOT ROS params — they live in `PlannerConfig` in
+  `geometric_planner.hpp`**; edit there and rebuild the core to tune a specific planner. (RRT*'s old
+  `RRT_RANGE` param is gone — it's now `PlannerConfig::rrtstar.range`.)
 - `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
 - `CLEARANCE_WEIGHT` (double, default `4.0`) — obstacle-proximity penalty weight.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.

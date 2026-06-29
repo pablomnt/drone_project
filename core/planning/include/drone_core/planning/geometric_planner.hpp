@@ -3,13 +3,14 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <ompl/base/OptimizationObjective.h>
+#include <ompl/base/Planner.h>
 #include <ompl/base/SpaceInformation.h>
 #include <ompl/base/spaces/SE3StateSpace.h>
-#include <ompl/geometric/PathSimplifier.h>
-#include <ompl/geometric/planners/rrt/RRTstar.h>
 #include <octomap/octomap.h>
 
 namespace drone_core::planning {
@@ -19,18 +20,94 @@ namespace drone_core::planning {
 // planner carries no middleware dependency.
 using MapHandle = std::shared_ptr<octomap::OcTree>;
 
-// Geometric global planner: searches an SE(3) state space with RRT* against an
-// occupancy octree and returns a collision-free, simplified waypoint list.
-class RrtStarPlanner {
+// Which OMPL optimal planner to run. RRT* is the original asymptotically optimal
+// RRT; the rest are the BIT* lineage (heuristic/informed graph search), which
+// concentrate the search in the start->goal corridor instead of sampling the
+// whole workspace uniformly. All share the same state space, validity checker
+// and clearance objective; only construction/parameters differ (see makePlanner).
+enum class PlannerType { RRTstar, BITstar, ABITstar, AITstar, EITstar };
+
+// PlannerType <-> string, for ROS params and logging. The names match the enum.
+inline const char* toString(PlannerType t) {
+  switch (t) {
+    case PlannerType::BITstar: return "BITstar";
+    case PlannerType::ABITstar: return "ABITstar";
+    case PlannerType::AITstar: return "AITstar";
+    case PlannerType::EITstar: return "EITstar";
+    case PlannerType::RRTstar: break;
+  }
+  return "RRTstar";
+}
+
+// Parse a PlannerType name; returns false (and leaves `out` untouched) if the
+// string is not a known planner, so the caller can warn and keep its default.
+inline bool fromString(const std::string& s, PlannerType& out) {
+  if (s == "RRTstar") { out = PlannerType::RRTstar; return true; }
+  if (s == "BITstar") { out = PlannerType::BITstar; return true; }
+  if (s == "ABITstar") { out = PlannerType::ABITstar; return true; }
+  if (s == "AITstar") { out = PlannerType::AITstar; return true; }
+  if (s == "EITstar") { out = PlannerType::EITstar; return true; }
+  return false;
+}
+
+// All per-planner tunables, with their defaults inline here so this header is the
+// single place to tune any planner — edit a field and rebuild the core. Defaults
+// mirror OMPL's own, except RRT*'s goal_bias (raised from 0.05). Each field names
+// the OMPL setter it drives in makePlanner(). Knobs OMPL exposes but we leave at
+// their library default are intentionally omitted.
+struct PlannerConfig {
+  struct RrtStar {
+    double range = 1.0;          // setRange [m]; <=0 => OMPL auto-size
+    double goal_bias = 0.15;     // setGoalBias (OMPL default 0.05, raised)
+    double rewire_factor = 1.1;  // setRewireFactor
+    bool informed = true;        // setInformedSampling (ellipse after 1st soln)
+    bool k_nearest = true;       // setKNearest
+  } rrtstar;
+
+  struct BitStar {
+    unsigned samples_per_batch = 100;  // setSamplesPerBatch
+    double rewire_factor = 1.1;        // setRewireFactor
+    bool use_k_nearest = true;         // setUseKNearest
+    bool pruning = true;               // setPruning
+    bool jit_sampling = false;         // setJustInTimeSampling
+  } bitstar;
+
+  // ABIT* IS-A BIT*, so it also takes the BitStar fields above; these are the
+  // extra inflation/truncation knobs it adds. Defaults are OMPL's.
+  struct AbitStar {
+    double initial_inflation = 1.0e6;  // setInitialInflationFactor
+    double inflation_scaling = 10.0;   // setInflationScalingParameter
+    double truncation_scaling = 5.0;   // setTruncationScalingParameter
+  } abitstar;
+
+  struct AitStar {
+    unsigned batch_size = 100;   // setBatchSize
+    double rewire_factor = 1.1;  // setRewireFactor
+    bool use_k_nearest = true;   // setUseKNearest
+  } aitstar;
+
+  struct EitStar {
+    unsigned batch_size = 100;     // setBatchSize
+    bool use_k_nearest = true;     // setUseKNearest
+    double suboptimality = 5.0;    // setSuboptimalityFactor
+    double radius_factor = 1.001;  // setRadiusFactor
+  } eitstar;
+};
+
+// Geometric global planner: searches an SE(3) state space with a selectable OMPL
+// optimal planner (see PlannerType) against an occupancy octree and returns a
+// collision-free, clearance-aware waypoint list.
+class GeometricPlanner {
 public:
   // Returns the clearance (metres to the nearest obstacle) at a world point.
   using ClearanceFn = std::function<double(double x, double y, double z)>;
 
-  // planning_time is the RRT* optimisation budget per solve [s]. RRT* keeps
-  // improving the solution until the budget expires, so a larger value returns a
-  // more optimal path at the cost of a longer solve.
-  explicit RrtStarPlanner(const MapHandle& octree, double planning_time = 3.0);
-  ~RrtStarPlanner() = default;
+  // planning_time is the optimisation budget per solve [s]. Every supported
+  // planner is anytime — it keeps improving the solution until the budget
+  // expires — so a larger value returns a more optimal path at the cost of a
+  // longer solve.
+  explicit GeometricPlanner(const MapHandle& octree, double planning_time = 3.0);
+  ~GeometricPlanner() = default;
 
   // Enable clearance-aware optimisation. The path cost becomes
   //   integral over the path of ( 1 + weight * max(0, threshold - clearance) ),
@@ -40,12 +117,9 @@ public:
   // (the default) the planner optimises pure path length.
   void setClearance(ClearanceFn clearance, double weight, double threshold);
 
-  // Maximum length of a single RRT* tree extension [m] — the planner's "step
-  // size". Smaller gives finer paths and denser waypoints (better in tight
-  // spaces) at the cost of needing more samples/time to reach the goal. When
-  // <= 0 (the default) OMPL auto-sizes it as a fraction of the state-space
-  // extent, which for a large workspace is several metres.
-  void setRange(double range);
+  // Select which OMPL planner planPath builds. The per-planner parameters come
+  // from the PlannerConfig defaults in this header. Default is RRT*.
+  void setPlannerType(PlannerType type) { planner_type_ = type; }
 
   // Plan from start to goal (each [x, y, z]); fills result_path with waypoints.
   // Returns false if no solution is found within the planner time budget.
@@ -85,7 +159,7 @@ public:
   // The hard clearance the validity check enforces away from the start [m].
   double collisionMargin() const { return kCollisionMargin; }
 
-  // Snapshot of the RRT* tree from the most recent planPath, for debug
+  // Snapshot of the search tree from the most recent planPath, for debug
   // visualisation. `nodes` are the tree vertices in world XYZ; `edges` index
   // into `nodes`. Populated only while tree recording is enabled (see
   // setRecordTree) — otherwise left empty so a flight build never builds it.
@@ -108,12 +182,16 @@ private:
   bool isStateValid(const ompl::base::State* state);
   ompl::base::OptimizationObjectivePtr makeObjective() const;
 
+  // Construct and configure the OMPL planner selected by planner_type_, applying
+  // the matching PlannerConfig sub-struct. Called once per planPath.
+  ompl::base::PlannerPtr makePlanner() const;
+
   // Clearance-preserving shortcut pass for the clearance-aware case. Removes
   // interior waypoints whose detour is not "paying for itself": a vertex is
   // dropped only when the straight bypass is collision-free AND doing so does
   // not raise the clearance-aware path cost (so a corner-cut that creeps toward
   // a wall, raising the proximity penalty more than it saves in length, is
-  // rejected). This straightens the jagged RRT* result without the wall-hugging
+  // rejected). This straightens the jagged planner result without the wall-hugging
   // that plain length-only simplifyMax would cause.
   void shortcutClearanceAware(std::vector<std::vector<double>>& waypoints) const;
 
@@ -121,8 +199,9 @@ private:
   ompl::base::StateSpacePtr space_;
   ompl::base::SpaceInformationPtr si_;
 
-  double planning_time_;  // RRT* optimisation budget per solve [s]
-  double range_ = 0.0;    // max tree-extension length [m]; <=0 => OMPL auto-size
+  double planning_time_;  // optimisation budget per solve [s]
+  PlannerType planner_type_ = PlannerType::RRTstar;  // which OMPL planner to build
+  PlannerConfig params_{};                           // per-planner tunables (header defaults)
 
   // Centre of the start-state collision exemption (see isStateValid): the start
   // passed to planPath, or the first waypoint in isPathValid. Set transiently
@@ -149,9 +228,9 @@ private:
   bool record_tree_ = false;  // capture the OMPL tree each solve (debug viz only)
   SearchTree last_tree_;      // tree from the most recent planPath
 
-  // goal_flexibility [m]: how far short of the goal an RRT* solution may stop and
-  // still be accepted. RRT* may return an approximate solution that does not reach
-  // the goal (e.g. the goal sits in tight clearance); accept it only within this
+  // goal_flexibility [m]: how far short of the goal a solution may stop and
+  // still be accepted. A planner may return an approximate solution that does not
+  // reach the goal (e.g. the goal sits in tight clearance); accept it only within this
   // tolerance, otherwise reject the plan rather than commit to a path that stops
   // short. Raise it to tolerate harder-to-reach goals, lower it to insist on
   // (near-)exact arrival.

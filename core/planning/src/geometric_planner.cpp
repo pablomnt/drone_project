@@ -1,4 +1,4 @@
-#include "drone_core/planning/rrt_star_planner.hpp"
+#include "drone_core/planning/geometric_planner.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +9,12 @@
 #include <ompl/base/PlannerData.h>
 #include <ompl/base/objectives/StateCostIntegralObjective.h>
 #include <ompl/geometric/PathGeometric.h>
+#include <ompl/geometric/PathSimplifier.h>
+#include <ompl/geometric/planners/rrt/RRTstar.h>
+#include <ompl/geometric/planners/informedtrees/ABITstar.h>
+#include <ompl/geometric/planners/informedtrees/AITstar.h>
+#include <ompl/geometric/planners/informedtrees/BITstar.h>
+#include <ompl/geometric/planners/informedtrees/EITstar.h>
 
 namespace drone_core::planning {
 
@@ -23,7 +29,7 @@ namespace {
 class ClearanceObjective : public ompl::base::StateCostIntegralObjective {
 public:
   ClearanceObjective(const ompl::base::SpaceInformationPtr& si,
-                     RrtStarPlanner::ClearanceFn clearance, double weight, double threshold)
+                     GeometricPlanner::ClearanceFn clearance, double weight, double threshold)
       : ompl::base::StateCostIntegralObjective(si, /*enableMotionCostInterpolation=*/true),
         clearance_(std::move(clearance)), weight_(weight), threshold_(threshold) {}
 
@@ -38,15 +44,26 @@ public:
     return ompl::base::Cost(1.0 + penalty);
   }
 
+  // Admissible cost-to-go lower bound for an edge: the straight-line distance
+  // between the two states. The per-state integrand is 1 + penalty >= 1, so the
+  // true motion cost is always >= geometric length >= this distance — never an
+  // overestimate. The base StateCostIntegralObjective returns ~0 here, which
+  // would leave the heuristic-driven planners (BIT*/ABIT*) essentially blind; a
+  // real heuristic is what makes them search toward the goal.
+  ompl::base::Cost motionCostHeuristic(const ompl::base::State* s1,
+                                       const ompl::base::State* s2) const override {
+    return ompl::base::Cost(si_->distance(s1, s2));
+  }
+
 private:
-  RrtStarPlanner::ClearanceFn clearance_;
+  GeometricPlanner::ClearanceFn clearance_;
   double weight_;
   double threshold_;
 };
 
 }  // namespace
 
-RrtStarPlanner::RrtStarPlanner(const MapHandle& octree, double planning_time)
+GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time)
     : octree_ptr_(octree), planning_time_(planning_time) {
   // SE(3) state space leaves room for orientation should the vehicle footprint
   // ever become asymmetric, even though the current collision check is radial.
@@ -73,7 +90,7 @@ RrtStarPlanner::RrtStarPlanner(const MapHandle& octree, double planning_time)
   si_->setup();
 }
 
-bool RrtStarPlanner::isStateValid(const ompl::base::State* state) {
+bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
   const auto* se3state = state->as<ompl::base::SE3StateSpace::StateType>();
   const auto* pos = se3state->as<ompl::base::RealVectorStateSpace::StateType>(0);
 
@@ -119,7 +136,7 @@ bool RrtStarPlanner::isStateValid(const ompl::base::State* state) {
   return true;
 }
 
-double RrtStarPlanner::minClearance(const std::vector<std::vector<double>>& path) const {
+double GeometricPlanner::minClearance(const std::vector<std::vector<double>>& path) const {
   if (!clearance_fn_ || path.size() < 2) return std::numeric_limits<double>::infinity();
   double mind = std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i + 1 < path.size(); ++i) {
@@ -137,7 +154,7 @@ double RrtStarPlanner::minClearance(const std::vector<std::vector<double>>& path
   return mind;
 }
 
-bool RrtStarPlanner::isPathValid(const std::vector<std::vector<double>>& path) const {
+bool GeometricPlanner::isPathValid(const std::vector<std::vector<double>>& path) const {
   if (path.size() < 2) return false;
 
   // Anchor the start-state exemption at the path's first waypoint so a committed
@@ -166,22 +183,86 @@ bool RrtStarPlanner::isPathValid(const std::vector<std::vector<double>>& path) c
   return true;
 }
 
-void RrtStarPlanner::setClearance(ClearanceFn clearance, double weight, double threshold) {
+void GeometricPlanner::setClearance(ClearanceFn clearance, double weight, double threshold) {
   clearance_fn_ = std::move(clearance);
   clearance_weight_ = weight;
   clearance_threshold_ = threshold;
 }
 
-void RrtStarPlanner::setRange(double range) { range_ = range; }
+ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
+  // Build the selected OMPL planner and apply its PlannerConfig sub-struct. Only
+  // the construction/parameters differ between planners; the SpaceInformation,
+  // validity checker and objective are shared. setup() is left to planPath (it
+  // runs after setProblemDefinition).
+  switch (planner_type_) {
+    case PlannerType::BITstar: {
+      auto p = std::make_shared<ompl::geometric::BITstar>(si_);
+      const auto& c = params_.bitstar;
+      p->setSamplesPerBatch(c.samples_per_batch);
+      p->setRewireFactor(c.rewire_factor);
+      p->setUseKNearest(c.use_k_nearest);
+      p->setPruning(c.pruning);
+      p->setJustInTimeSampling(c.jit_sampling);
+      return p;
+    }
+    case PlannerType::ABITstar: {
+      // ABIT* IS-A BIT*, so it takes the BitStar fields plus its own inflation /
+      // truncation knobs.
+      auto p = std::make_shared<ompl::geometric::ABITstar>(si_);
+      const auto& c = params_.bitstar;
+      p->setSamplesPerBatch(c.samples_per_batch);
+      p->setRewireFactor(c.rewire_factor);
+      p->setUseKNearest(c.use_k_nearest);
+      p->setPruning(c.pruning);
+      p->setJustInTimeSampling(c.jit_sampling);
+      const auto& a = params_.abitstar;
+      p->setInitialInflationFactor(a.initial_inflation);
+      p->setInflationScalingParameter(a.inflation_scaling);
+      p->setTruncationScalingParameter(a.truncation_scaling);
+      return p;
+    }
+    case PlannerType::AITstar: {
+      auto p = std::make_shared<ompl::geometric::AITstar>(si_);
+      const auto& c = params_.aitstar;
+      p->setBatchSize(c.batch_size);
+      p->setRewireFactor(c.rewire_factor);
+      p->setUseKNearest(c.use_k_nearest);
+      return p;
+    }
+    case PlannerType::EITstar: {
+      auto p = std::make_shared<ompl::geometric::EITstar>(si_);
+      const auto& c = params_.eitstar;
+      p->setBatchSize(c.batch_size);
+      p->setUseKNearest(c.use_k_nearest);
+      p->setSuboptimalityFactor(c.suboptimality);
+      p->setRadiusFactor(c.radius_factor);
+      return p;
+    }
+    case PlannerType::RRTstar:
+    default: {
+      auto p = std::make_shared<ompl::geometric::RRTstar>(si_);
+      const auto& c = params_.rrtstar;
+      // Set the step size before setup(): setup() only auto-sizes the range when
+      // it is still zero, so this overrides OMPL's extent-fraction default. <=0
+      // keeps the auto behaviour.
+      if (c.range > 0.0) p->setRange(c.range);
+      p->setGoalBias(c.goal_bias);
+      p->setRewireFactor(c.rewire_factor);
+      p->setInformedSampling(c.informed);
+      p->setKNearest(c.k_nearest);
+      return p;
+    }
+  }
+}
 
-ompl::base::OptimizationObjectivePtr RrtStarPlanner::makeObjective() const {
+ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective() const {
   // With no clearance function the per-state cost is a constant 1, so this is
   // exactly a path-length objective; with one it adds the proximity penalty.
   return std::make_shared<ClearanceObjective>(si_, clearance_fn_, clearance_weight_,
                                               clearance_threshold_);
 }
 
-bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
+bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
                               const std::vector<double>& goal_vec,
                               std::vector<std::vector<double>>& result_path) {
   ompl::base::ScopedState<ompl::base::SE3StateSpace> start(space_);
@@ -200,15 +281,11 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
   pdef->setStartAndGoalStates(start, goal);
   pdef->setOptimizationObjective(makeObjective());
 
-  auto planner = std::make_shared<ompl::geometric::RRTstar>(si_);
+  auto planner = makePlanner();
   planner->setProblemDefinition(pdef);
-  // Set the step size before setup(): setup() only auto-sizes the range when it
-  // is still zero, so this overrides OMPL's extent-fraction default. <=0 keeps
-  // the auto behaviour.
-  if (range_ > 0.0) planner->setRange(range_);
   planner->setup();
 
-  const ompl::base::PlannerStatus solved = planner->ompl::base::Planner::solve(planning_time_);
+  const ompl::base::PlannerStatus solved = planner->solve(planning_time_);
 
   // Capture the tree for debug visualisation before the planner goes out of
   // scope. Done regardless of success (the tree of a *failed* solve is just as
@@ -250,7 +327,7 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
 
   auto path = std::static_pointer_cast<ompl::geometric::PathGeometric>(pdef->getSolutionPath());
 
-  // Straighten the jagged RRT* result. Deliberately skip B-spline smoothing so
+  // Straighten the jagged planner result. Deliberately skip B-spline smoothing so
   // the original waypoints survive for the minimum-snap optimiser downstream.
   // With no clearance field, plain length-only simplifyMax is correct and cheap.
   if (!clearance_fn_) {
@@ -265,7 +342,7 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
   }
 
   // In clearance mode, use a cost-aware shortcut instead of simplifyMax: it cuts
-  // the RRT* zig-zag but, by gating on the clearance-aware cost, keeps the
+  // the planner's zig-zag but, by gating on the clearance-aware cost, keeps the
   // detours the objective actually wanted (see shortcutClearanceAware).
   if (clearance_fn_) {
     shortcutClearanceAware(result_path);
@@ -273,7 +350,7 @@ bool RrtStarPlanner::planPath(const std::vector<double>& start_vec,
   return true;
 }
 
-void RrtStarPlanner::shortcutClearanceAware(
+void GeometricPlanner::shortcutClearanceAware(
     std::vector<std::vector<double>>& waypoints) const {
   if (waypoints.size() < 3) return;
 
@@ -318,12 +395,12 @@ void RrtStarPlanner::shortcutClearanceAware(
   }
 }
 
-double RrtStarPlanner::pathCost(const std::vector<std::vector<double>>& path) const {
+double GeometricPlanner::pathCost(const std::vector<std::vector<double>>& path) const {
   return costBreakdown(path).total;
 }
 
-RrtStarPlanner::CostBreakdown
-RrtStarPlanner::costBreakdown(const std::vector<std::vector<double>>& path) const {
+GeometricPlanner::CostBreakdown
+GeometricPlanner::costBreakdown(const std::vector<std::vector<double>>& path) const {
   constexpr double inf = std::numeric_limits<double>::infinity();
   if (path.size() < 2) return {inf, inf, inf};
 
