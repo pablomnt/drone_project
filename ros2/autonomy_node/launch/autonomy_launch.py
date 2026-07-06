@@ -52,13 +52,12 @@ def generate_launch_description():
         ),
 
         # Start the Foxglove WebSocket bridge for remote visualization.
-        # --log-level WARN suppresses its per-topic 'Advertising new channel'
-        # INFO spam so the other terminals stay readable.
+        # NOTE: `ros2 launch` (Humble) has no --log-level option — passing it makes
+        # ros2 exit with "unrecognized arguments" and the bridge never starts.
         launch.actions.ExecuteProcess(
             cmd=[
                 'xterm', '-hold', '-e', 'bash', '-lc',
-                'ros2 launch foxglove_bridge foxglove_bridge_launch.xml '
-                'port:=8765 --log-level WARN'
+                'ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765'
             ],
             output='screen'
         )

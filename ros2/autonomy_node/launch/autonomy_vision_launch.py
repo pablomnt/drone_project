@@ -149,15 +149,15 @@ def generate_launch_description():
 
 
         # Start Foxglove WebSocket bridge for remote visualization.
-        # foxglove_bridge logs an INFO 'Advertising new channel N for topic ...'
-        # for every topic (~140 of them), burying the planning logs at startup and
-        # on every new topic. --log-level WARN raises its threshold so only
-        # warnings/errors print; the bridge itself is unaffected.
+        # NOTE: do NOT append `--log-level WARN` here — `ros2 launch` (Humble) has
+        # no such option, so it exits with "unrecognized arguments" and the bridge
+        # never comes up. --log-level is a node arg (--ros-args --log-level), which
+        # this launch XML does not forward, so the bridge's per-topic 'Advertising
+        # new channel' INFO chatter is accepted as the cost of using the launch file.
         launch.actions.ExecuteProcess(
             cmd=[
                 'bash', '-c',
-                'ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765 '
-                '--log-level WARN'
+                'ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765'
             ],
             output='screen'
         ),
