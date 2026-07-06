@@ -49,6 +49,18 @@ def generate_launch_description():
                 f'{cpu_script_path}'
             ],
             output='screen'
+        ),
+
+        # Start the Foxglove WebSocket bridge for remote visualization.
+        # --log-level WARN suppresses its per-topic 'Advertising new channel'
+        # INFO spam so the other terminals stay readable.
+        launch.actions.ExecuteProcess(
+            cmd=[
+                'xterm', '-hold', '-e', 'bash', '-lc',
+                'ros2 launch foxglove_bridge foxglove_bridge_launch.xml '
+                'port:=8765 --log-level WARN'
+            ],
+            output='screen'
         )
-        
+
     ])
