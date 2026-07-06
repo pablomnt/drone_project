@@ -82,9 +82,16 @@ void AutonomyCore::setGoal(const common::Goal& goal) {
   std::lock_guard<std::mutex> lock(io_mutex_);
   goal_ = goal;
   has_goal_ = true;
-  // Force a fresh geometric plan toward the new goal on the next worker cycle:
-  // an empty committed path reads as invalid, so the loop replans immediately.
-  cached_path_.clear();
+  // Force a fresh geometric plan toward the new goal from the drone's current
+  // position. Only raise a flag here (under io_mutex_) rather than touching
+  // cached_path_ directly: that path is owned by the worker thread. Clearing it
+  // here races with the worker's adopt() and can be overwritten by an in-flight
+  // solve for the previous goal, leaving a stale, still-collision-valid path
+  // rooted at the position where the old goal was issued (the monitor keeps it
+  // because it only checks for collisions, not the target). The worker consumes
+  // the flag and clears the path on its own thread, so a goal that lands
+  // mid-tick is honored on the next cycle instead of being lost.
+  new_goal_ = true;
 }
 
 void AutonomyCore::setSetpoint(const Eigen::Vector3d& pos, double yaw) {
@@ -320,13 +327,23 @@ void AutonomyCore::plannerLoop() {
     planning::MapHandle map;
     common::Goal goal;
     bool has_goal = false;
+    bool new_goal = false;
     {
       std::lock_guard<std::mutex> lock(io_mutex_);
       state = state_;
       map = map_;
       goal = goal_;
       has_goal = has_goal_;
+      new_goal = new_goal_;
+      new_goal_ = false;
     }
+
+    // A new goal invalidates the committed path regardless of its collision
+    // validity (the monitor check below only tests for collisions, not whether
+    // the path still targets the current goal). Drop it here on the worker
+    // thread so the tick below replans from the drone's current position toward
+    // the new goal.
+    if (new_goal) cached_path_.clear();
 
     if (has_goal && map) {
       ++run;

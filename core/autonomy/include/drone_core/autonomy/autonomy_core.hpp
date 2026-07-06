@@ -161,6 +161,7 @@ private:
   planning::MapHandle map_;
   common::Goal goal_;
   bool has_goal_{false};
+  bool new_goal_{false};  // raised by setGoal, consumed by the worker to force a replan
   Eigen::Vector3d direct_pos_{Eigen::Vector3d::Zero()};
   double direct_yaw_{0.0};
   bool has_direct_setpoint_{false};
