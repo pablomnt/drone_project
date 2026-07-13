@@ -222,6 +222,38 @@ arrive on `/planner/goal` (geometry_msgs/PoseStamped, position only — yaw igno
 parameter provides the default takeoff/hover setpoint. All PX4 message types and frame conversions
 are confined to this file.
 
+**Sensor-health watchdog (node-level, distinct from the core's `kHoverHold` / `STALE_TIMEOUT`
+planner-stale→hover path).** The node stamps a per-stream last-receive time (`t_px4_odom_ /
+t_sensor_ / t_vio_odom_`) in each estimator callback; `streamHealthy()` deems a stream healthy when
+its last sample is within `SENSOR_TIMEOUT` (default 0.5 s) and `streamsFresh()` ANDs the required set
+(all three normally, PX4 odom only in sim). There are **no** `has_*` "ever received" flags — freshness
+subsumes them. Two guards use this:
+- **Pre-takeoff gate** (replaces the old `dependenciesReady()`): the controller will not *engage*
+  until every required stream is healthy **and** has been continuously healthy for `SENSOR_WARMUP`
+  (default 5 s), tracked via `all_healthy_since_` (any staleness resets the streak; any interruption —
+  disarm or leaving offboard — resets it too, so each takeoff re-proves 5 s of health). Gated on
+  `!controller_running_` so it only blocks the engage transition; it must never early-return while
+  flying (that would silently disengage instead of landing). A throttled log names which streams are
+  stale and the warmup progress.
+- **In-flight watchdog**: every tick while flying (`controller_running_`), if `streamsFresh()` is
+  false it commands `land()` (`VEHICLE_CMD_NAV_LAND` → PX4 AUTO.LAND) and **latches**
+  (`failsafe_landing_`), re-commanding LAND each tick until `vehicle_status_.nav_state` reads
+  `NAVIGATION_STATE_AUTO_LAND` (a single VehicleCommand can be dropped, and NAV_LAND itself drops us
+  out of offboard — hence the latch block sits *above* the armed/offboard gate). The latch clears only
+  on the **disarm edge** (touchdown), never on leaving offboard, so it cannot un-latch mid-descent.
+
+`SENSOR_TIMEOUT` and `SENSOR_WARMUP` are live-reconfigurable node params.
+
+**Known issue (deferred fix): plans root at the map origin on the bench.** `setState()` is called only
+inside `controlLoop()` *below* the `armed && offboard` early-return, so while the vehicle is disarmed
+(the battery-off planning bench) the core's `state_` never updates from its default-constructed zero,
+and every plan starts from `(0,0,0)` instead of the drone's actual position. The planner line itself
+(`start = {state.pos.x(), ...}`) is correct — the state is simply never fed pre-arm. Fix (not yet
+done): feed the assembled `State` to the core independent of the arm/offboard gate — move the state
+assembly + `setState()` above that gate (still behind the health/warmup gate) so the core has a live
+position whether or not the vehicle is armed. Tackle alongside the sensor-health watchdog already in
+place.
+
 **Visualization publishers (at 2 Hz via `viz_timer_`):**
 - `/planner/geometric_path` (`visualization_msgs/MarkerArray`) — raw RRT* waypoints as a green
   LINE_STRIP + blue SPHERE_LIST, frame `map`. Populated even when `PLAN_TRAJECTORY=false`.

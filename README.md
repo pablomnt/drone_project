@@ -129,6 +129,18 @@ live in `launch/`:
 `body→camera_link` static TF), `autonomy_launch.py` (xterm-per-process variant) and
 `autonomy_sim_launch.py` (SITL: `USE_SIM_MODE:=true`, `MicroXRCEAgent udp4`).
 
+**Sensor-health watchdog.** The node guards the three estimator streams it depends on — PX4 odometry,
+IMU (`sensor_combined`) and VIO — by timestamp, deeming each *healthy* only while its last sample is
+within `SENSOR_TIMEOUT` (0.5 s). Two gates use this. **Before takeoff** the controller refuses to
+*engage* until every required stream has been continuously healthy for `SENSOR_WARMUP` (5 s), so it
+never takes off on a stream that arrived once and then died (the old check only asked whether a stream
+had *ever* been received). **In flight**, if any required stream goes stale it commands `NAV_LAND`
+(PX4 AUTO.LAND) and latches — re-commanding every tick until PX4 confirms the mode, since a single
+`VehicleCommand` can be dropped — and re-arms only after touchdown/disarm. That is a real landing,
+distinct from the core's `kHoverHold` (which only hovers): `NAV_LAND` is a mode switch that works from
+offboard, whereas the *core's* offboard-attitude stream has no land primitive. Both `SENSOR_TIMEOUT`
+and `SENSOR_WARMUP` are live-reconfigurable params.
+
 ### `drone_interfaces/`
 
 Custom message definitions (`ControllerDebug.msg`). Message generation has to stay ROS-side.

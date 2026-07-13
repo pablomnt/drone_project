@@ -159,13 +159,15 @@ private:
 
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
     declare_parameter("STALE_TIMEOUT", 0.5);
+    declare_parameter("SENSOR_TIMEOUT", 0.5);
+    declare_parameter("SENSOR_WARMUP", 5.0);
     declare_parameter("RRT_MONITOR_PERIOD", 1.0);
     declare_parameter("RRT_IMPROVE_PERIOD", 10.0);
-    declare_parameter("RRT_SOLVE_TIME", 5.0);
+    declare_parameter("RRT_SOLVE_TIME", 1.0);
     // Which OMPL planner to run: RRTstar | BITstar | ABITstar | AITstar | EITstar.
     // Live-reconfigurable so you can A/B them on the bench. Per-planner internal
     // tunables live in geometric_planner.hpp (PlannerConfig).
-    declare_parameter<std::string>("PLANNER_TYPE", "RRTstar");
+    declare_parameter<std::string>("PLANNER_TYPE", "EITstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
     declare_parameter("CLEARANCE_WEIGHT", 4.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
@@ -271,7 +273,7 @@ private:
     px4_pos_enu_ = drone_core::frames::pxNedToEnu(pos_ned);
     px4_vel_enu_ = drone_core::frames::pxNedToEnu(vel_ned);
     yaw_px4_enu_ = drone_core::frames::pxAttitudeToEnuYaw(q);
-    has_px4_odom_ = true;
+    t_px4_odom_ = get_clock()->now().seconds();
   }
 
   void onVioOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -281,14 +283,14 @@ private:
     const Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
     vio_vel_enu_ = drone_core::frames::bodyVelToWorld(q, vel_body);
     yaw_vio_enu_ = drone_core::frames::okvisAttitudeToEnuYaw(q);
-    has_vio_odom_ = true;
+    t_vio_odom_ = get_clock()->now().seconds();
   }
 
   void onSensorCombined(const px4_msgs::msg::SensorCombined::SharedPtr msg) {
     Eigen::Vector3d acc_ned(msg->accelerometer_m_s2[0], msg->accelerometer_m_s2[1], msg->accelerometer_m_s2[2]);
     acc_enu_ = drone_core::frames::pxNedToEnu(acc_ned);
     acc_enu_.z() -= 9.81;  // remove gravity to recover dynamic acceleration
-    has_sensor_ = true;
+    t_sensor_ = get_clock()->now().seconds();
   }
 
   void onOctomap(const octomap_msgs::msg::Octomap::SharedPtr msg) {
@@ -331,9 +333,20 @@ private:
 
   // --- Control loop --------------------------------------------------------
 
-  bool dependenciesReady() const {
-    if (use_sim_mode_) return has_px4_odom_;
-    return has_px4_odom_ && has_sensor_ && has_vio_odom_;
+  // A single stream is healthy when it has produced a sample within `timeout`
+  // seconds (t < 0 => never received => unhealthy).
+  static bool streamHealthy(double t, double now, double timeout) {
+    return t > 0.0 && (now - t) <= timeout;
+  }
+
+  // True iff every required estimator stream is healthy: all three in normal mode,
+  // PX4 odom only in sim. This is the current-health notion behind both the
+  // pre-takeoff warmup gate and the in-flight liveness watchdog.
+  bool streamsFresh(double now, double timeout) const {
+    if (use_sim_mode_) return streamHealthy(t_px4_odom_, now, timeout);
+    return streamHealthy(t_px4_odom_, now, timeout) &&
+           streamHealthy(t_sensor_, now, timeout) &&
+           streamHealthy(t_vio_odom_, now, timeout);
   }
 
   void controlLoop() {
@@ -344,8 +357,34 @@ private:
     hb.attitude = true;
     pub_offboard_->publish(hb);
 
-    if (!dependenciesReady()) {
-      controller_running_ = false;
+    const double now_s = get_clock()->now().seconds();
+    const double sensor_timeout = get_parameter("SENSOR_TIMEOUT").as_double();
+    const double sensor_warmup = get_parameter("SENSOR_WARMUP").as_double();
+
+    // Per-stream health = a sample within SENSOR_TIMEOUT. Track how long ALL
+    // required streams have been continuously healthy; a fresh sample restarts the
+    // streak, any staleness clears it.
+    const bool streams_healthy = streamsFresh(now_s, sensor_timeout);
+    if (!streams_healthy) {
+      all_healthy_since_ = -1.0;
+    } else if (all_healthy_since_ < 0.0) {
+      all_healthy_since_ = now_s;
+    }
+    const bool warmed_up =
+        streams_healthy && (now_s - all_healthy_since_) >= sensor_warmup;
+
+    // Pre-takeoff gate: refuse to engage until every required stream is healthy AND
+    // has been healthy continuously for SENSOR_WARMUP. This blocks ONLY the engage
+    // transition -- once flying (controller_running_) staleness is owned by the
+    // in-flight watchdog below (which lands), so we must not early-return here while
+    // running or a stale stream would silently disengage instead of landing.
+    if (!controller_running_ && !warmed_up) {
+      const double warm = all_healthy_since_ < 0.0 ? 0.0 : (now_s - all_healthy_since_);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Pre-takeoff hold: estimator streams px4=%d sensor=%d vio=%d, healthy %.1f/%.1fs",
+                           streamHealthy(t_px4_odom_, now_s, sensor_timeout),
+                           streamHealthy(t_sensor_, now_s, sensor_timeout),
+                           streamHealthy(t_vio_odom_, now_s, sensor_timeout), warm, sensor_warmup);
       return;
     }
 
@@ -353,16 +392,48 @@ private:
     const bool offboard = vehicle_status_.nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD;
 
     // Reset on disarm or leaving offboard so takeoff re-primes on the next arm.
+    // Also restart the health warmup so any re-engage must re-prove SENSOR_WARMUP
+    // seconds of healthy streams before taking off again.
     if ((was_armed_ && !armed) || (was_offboard_ && !offboard)) {
       RCLCPP_INFO(get_logger(), "Interruption (disarmed or left offboard). Resetting controller.");
       core_->reset();
-      has_px4_odom_ = has_sensor_ = has_vio_odom_ = false;
+      all_healthy_since_ = -1.0;
     }
+    // Re-arm the sensor-liveness watchdog only once the vehicle has disarmed
+    // (i.e. landed). Deliberately gated on the disarm edge, NOT the leaving-
+    // offboard edge: the failsafe's own NAV_LAND flips offboard->false, so
+    // clearing on that edge would un-latch mid-descent.
+    if (was_armed_ && !armed) failsafe_landing_ = false;
     was_armed_ = armed;
     was_offboard_ = offboard;
 
+    // Latched auto-land: re-command LAND every tick until PX4 confirms it is in
+    // AUTO.LAND (a single VehicleCommand can be dropped, and NAV_LAND itself drops
+    // us out of offboard). Placed ABOVE the armed/offboard gate so retries persist
+    // through that transition; stops only once nav_state actually reads AUTO_LAND.
+    // The latch is cleared on the disarm edge above (touchdown).
+    if (failsafe_landing_) {
+      if (vehicle_status_.nav_state != px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_AUTO_LAND) {
+        land();
+      }
+      return;
+    }
+
     if (!armed || !offboard) {
       controller_running_ = false;
+      return;
+    }
+
+    // In-flight sensor-liveness watchdog: if any required estimator stream has
+    // gone silent longer than SENSOR_TIMEOUT while we are actively controlling,
+    // command an auto-land and latch it. Gated on controller_running_ (set just
+    // below) so the engage transition itself never trips it.
+    if (controller_running_ && !streams_healthy) {
+      RCLCPP_ERROR(get_logger(),
+                   "SENSOR TIMEOUT (> %.2fs): estimator stream stale in flight -> commanding LAND",
+                   sensor_timeout);
+      land();
+      failsafe_landing_ = true;
       return;
     }
 
@@ -672,12 +743,21 @@ private:
   double yaw_px4_enu_{0.0};
   double yaw_vio_enu_{0.0};
 
-  bool has_px4_odom_{false};
-  bool has_sensor_{false};
-  bool has_vio_odom_{false};
   bool was_armed_{false};
   bool was_offboard_{false};
   bool controller_running_{false};
+
+  // Last-receive wall-clock times [s] per estimator stream, for the in-flight
+  // sensor-liveness watchdog (see controlLoop). Negative == never received.
+  double t_px4_odom_{-1.0};
+  double t_sensor_{-1.0};
+  double t_vio_odom_{-1.0};
+  // Latched once the watchdog commands an auto-land; cleared on the disarm edge.
+  bool failsafe_landing_{false};
+  // Wall-clock time [s] at which all required streams became continuously healthy
+  // (fresh within SENSOR_TIMEOUT). Negative == not currently all-healthy. Drives
+  // the pre-takeoff warmup gate; reset on any interruption.
+  double all_healthy_since_{-1.0};
 
   Eigen::Vector3d goal_pos_{Eigen::Vector3d::Zero()};
   bool has_goal_{false};
