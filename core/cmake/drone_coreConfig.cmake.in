@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# These provide imported targets that appear in the core's public link
+# interface (Eigen3::Eigen, ompl::ompl, octomap), so a consumer must be able to
+# resolve them. NLopt is absorbed as a concrete library path and needs none.
+find_dependency(Eigen3)
+find_dependency(ompl)
+find_dependency(octomap)
+
+include("${CMAKE_CURRENT_LIST_DIR}/drone_coreTargets.cmake")
