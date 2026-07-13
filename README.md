@@ -42,7 +42,11 @@ harness, or a test) drives. It is middleware-free and runs three internal cadenc
 replanning (~0.2 Hz) and minimum-snap trajectory generation (~1 Hz) on a background worker thread
 (receding-horizon — trajgen re-anchors to the current state), and trajectory tracking + flatness
 mapping at 50 Hz on whatever thread calls `stepControl()`. The fast control path never blocks on
-planning; finished trajectories are handed over by an atomic swap.
+planning; finished trajectories are handed over by an atomic swap. A blocked committed path replans
+unconditionally; an *improve* replan is adopted only past a hysteresis margin, and it's scored against
+the committed path's **remaining** cost from the drone's current position (not its full original
+cost), so the drone doesn't abandon its route for a fresh one just because it has moved closer to the
+goal.
 
 ### `common/`
 
@@ -116,7 +120,10 @@ The single thin wrapper. Per 50 Hz tick it publishes the offboard heartbeat, che
 (resetting the core on disarm or on leaving offboard, re-priming takeoff), assembles an ENU `State`
 from the active estimator (VIO in normal mode; PX4 odometry in `USE_SIM_MODE`), feeds the core, reads
 back the `Command`, applies the yaw-drift correction toward PX4's yaw and the ENU→NED/FRD conversion
-via `core/common/frames`, and publishes the attitude setpoint plus `ControllerDebug` telemetry. Goals
+via `core/common/frames`, and publishes the attitude setpoint plus `ControllerDebug` telemetry. The
+state is fed to the core **whenever the position source is fresh, independent of arm/offboard**, so the
+planner roots at the drone's live position even on the disarmed bench (control output stays gated on
+arm+offboard). Goals
 arrive on `/planner/goal`; a `POS_SP` parameter provides the default takeoff/hover setpoint. All PX4
 message types and frame conversions are confined to this file. It also exposes an **opt-in planner
 debug visualisation** — `/planner/search_tree` (the RRT* tree as a MarkerArray) and

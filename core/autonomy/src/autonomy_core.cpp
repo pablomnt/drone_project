@@ -45,6 +45,44 @@ std::shared_ptr<DynamicEDTOctomap> buildEdt(const std::shared_ptr<octomap::OcTre
   return edt;
 }
 
+// Remaining committed path from the drone's current position. Splits the committed
+// polyline at the drone by exact projection onto each segment (closed-form point-to-
+// segment, clamped to the segment), then returns [drone_pos, wp[i+1], ..., goal]
+// where segment i is the nearest one — i.e. the drone's actual position followed by
+// every waypoint still ahead of it. Lets an improve candidate (also rooted at the
+// drone) be scored against what remains of the committed path from here, not its
+// full original cost. With 4-5 sparse waypoints the projection point lands mid-
+// segment, so nearest-vertex would misjudge progress; hence the segment projection.
+std::vector<std::vector<double>> remainingCommittedSuffix(
+    const std::vector<std::vector<double>>& path,
+    const std::vector<double>& start) {
+  if (path.size() < 2) return path;
+  const double px = start[0], py = start[1], pz = start[2];
+  double best_d2 = std::numeric_limits<double>::infinity();
+  std::size_t best_seg = 0;
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    const double ax = path[i][0], ay = path[i][1], az = path[i][2];
+    const double abx = path[i + 1][0] - ax, aby = path[i + 1][1] - ay, abz = path[i + 1][2] - az;
+    const double denom = abx * abx + aby * aby + abz * abz;
+    double t = denom > 0.0 ? ((px - ax) * abx + (py - ay) * aby + (pz - az) * abz) / denom : 0.0;
+    t = std::clamp(t, 0.0, 1.0);
+    const double qx = ax + t * abx, qy = ay + t * aby, qz = az + t * abz;
+    const double dx = px - qx, dy = py - qy, dz = pz - qz;
+    const double d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < best_d2) {
+      best_d2 = d2;
+      best_seg = i;
+    }
+  }
+  // Waypoints up to and including best_seg are behind the drone; root the remainder
+  // at the drone's actual position.
+  std::vector<std::vector<double>> suffix;
+  suffix.reserve(path.size() - best_seg);
+  suffix.push_back(start);
+  for (std::size_t j = best_seg + 1; j < path.size(); ++j) suffix.push_back(path[j]);
+  return suffix;
+}
+
 }  // namespace
 
 AutonomyCore::AutonomyCore(const Config& config)
@@ -397,7 +435,6 @@ void AutonomyCore::plannerLoop() {
       // split into its length + clearance-penalty terms for the logs below;
       // committed_clr is the tightest distance to a wall along the path.
       const auto committed = planner.costBreakdown(cached_path_);
-      const double committed_cost = committed.total;
       const double committed_clr = planner.minClearance(cached_path_);
 
       // Stream a cost as "total (len=L + clr_cost=C)" so each replan line shows
@@ -441,15 +478,24 @@ void AutonomyCore::plannerLoop() {
         } else {
           // Improve — switch only past the hysteresis margin. RRT* is randomised,
           // so without the margin a near-identical re-solve would chatter.
-          const double threshold = cfg_.replan_improve_ratio * committed_cost;
+          //
+          // Score the candidate against the committed path's *remaining* cost from
+          // the drone's current position, not its full original cost. Both candidate
+          // and remaining are rooted at the drone (`start`), so the margin is a fair
+          // like-for-like test; billing the full committed cost would let a candidate
+          // win automatically as the drone nears the goal (its root creeps closer
+          // while the committed cost still charges the already-traversed prefix).
+          const auto remaining = remainingCommittedSuffix(cached_path_, start);
+          const double remaining_cost = planner.pathCost(remaining);
+          const double threshold = cfg_.replan_improve_ratio * remaining_cost;
           const auto cand = planner.costBreakdown(candidate);
           if (solved && cand.total <= threshold) {
             adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE committed cost=" << fmtCost(committed)
-                           << " -> ADOPT cost=" << fmtCost(cand) << " clr="
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
+                           << " (committed=" << fmtCost(committed) << ") -> ADOPT cost=" << fmtCost(cand) << " clr="
                            << planner.minClearance(candidate) << "m");
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE committed cost=" << fmtCost(committed)
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
                            << " clr=" << committed_clr << "m candidate cost="
                            << (solved ? fmtCost(cand) : std::string("inf"))
                            << " -> keep (need <=" << threshold << ")");

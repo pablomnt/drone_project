@@ -134,7 +134,13 @@ and the fast control thread:
   only with a committed path and obstacles mapped.
 - A **search runs iff** `path_invalid || improve_run`. If `path_invalid`, adopt the result
   **unconditionally** (safety); else (improve, path valid) adopt **only if**
-  `cost ≤ replan_improve_ratio × committed_cost` (hysteresis, prevents chatter). One search ⇒ one
+  `candidate_cost ≤ replan_improve_ratio × remaining_committed_cost` (hysteresis, prevents chatter).
+  The baseline is the committed path's **remaining** cost from the drone's *current* position — not
+  its full original cost — computed by `remainingCommittedSuffix()` (exact point-to-segment projection
+  of the drone onto the committed polyline, then `pathCost([drone_pos, wp_ahead…, goal]`)). Both sides
+  are thus rooted at the drone, so a candidate can't win merely because the drone has advanced toward
+  the goal (which would shrink a drone-rooted candidate while the full committed cost still billed the
+  already-traversed prefix). One search ⇒ one
   EDT use per tick. Both validity and cost use the **same cached `DynamicEDTOctomap`** (`maxdist =
   clearance_threshold`), rebuilt only when the map object changes (see `clearanceField`), not per
   tick. Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`. Path post-processing: with **no**
@@ -244,15 +250,16 @@ subsumes them. Two guards use this:
 
 `SENSOR_TIMEOUT` and `SENSOR_WARMUP` are live-reconfigurable node params.
 
-**Known issue (deferred fix): plans root at the map origin on the bench.** `setState()` is called only
-inside `controlLoop()` *below* the `armed && offboard` early-return, so while the vehicle is disarmed
-(the battery-off planning bench) the core's `state_` never updates from its default-constructed zero,
-and every plan starts from `(0,0,0)` instead of the drone's actual position. The planner line itself
-(`start = {state.pos.x(), ...}`) is correct — the state is simply never fed pre-arm. Fix (not yet
-done): feed the assembled `State` to the core independent of the arm/offboard gate — move the state
-assembly + `setState()` above that gate (still behind the health/warmup gate) so the core has a live
-position whether or not the vehicle is armed. Tackle alongside the sensor-health watchdog already in
-place.
+**State feed is independent of arm/offboard** (fixes an earlier bug where plans rooted at the map
+origin on the disarmed bench). The ENU `State` assembly + `core_->setState()` sit **above** the
+`armed && offboard` gate, so the core — and thus the planner worker, which reads `state_` for its
+`start` — always has the drone's live position, armed or not. The feed is gated on the **position
+source** being fresh (`streamHealthy(t_vio_odom_)` in normal mode, `t_px4_odom_` in sim) rather than
+on the full `streams_healthy` set: on the battery-off bench the flight controller may be unpowered, so
+PX4 odom + `sensor_combined` never arrive, but VIO alone is all the planner's start needs. Control
+(`stepControl` + attitude publish) stays **below** the arm/offboard gate, so output is still only
+produced when armed+offboard; every tick reaching it is a healthy tick (the watchdog lands otherwise),
+so the state it reads is always populated.
 
 **Visualization publishers (at 2 Hz via `viz_timer_`):**
 - `/planner/geometric_path` (`visualization_msgs/MarkerArray`) — raw RRT* waypoints as a green

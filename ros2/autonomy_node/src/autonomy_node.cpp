@@ -373,6 +373,35 @@ private:
     const bool warmed_up =
         streams_healthy && (now_s - all_healthy_since_) >= sensor_warmup;
 
+    // Feed the current state estimate to the core whenever the POSITION source is
+    // fresh (VIO in normal mode, PX4 odom in sim), independent of arm/offboard and
+    // of the other streams. This is what lets the planner root at the drone's real
+    // position on the battery-off bench, where the flight controller may be unpowered
+    // so PX4 odom + sensor_combined never arrive and the full streams_healthy set is
+    // unsatisfiable. The planner only needs position; the stricter all-streams warmup
+    // gate below still governs takeoff, and control (which also needs PX4 yaw + IMU
+    // accel) only ever runs armed+offboard, by which point streams_healthy holds.
+    const bool position_fresh = use_sim_mode_
+        ? streamHealthy(t_px4_odom_, now_s, sensor_timeout)
+        : streamHealthy(t_vio_odom_, now_s, sensor_timeout);
+    drone_core::common::State state;
+    double yaw_used = 0.0;
+    if (position_fresh) {
+      if (use_sim_mode_) {
+        state.pos = px4_pos_enu_;
+        state.vel = px4_vel_enu_;
+        state.yaw = yaw_px4_enu_;
+      } else {
+        state.pos = vio_pos_enu_;
+        state.vel = vio_vel_enu_;
+        state.yaw = yaw_vio_enu_;
+      }
+      state.acc = acc_enu_;
+      state.stamp = now_s;
+      yaw_used = state.yaw;
+      core_->setState(state);
+    }
+
     // Pre-takeoff gate: refuse to engage until every required stream is healthy AND
     // has been healthy continuously for SENSOR_WARMUP. This blocks ONLY the engage
     // transition -- once flying (controller_running_) staleness is owned by the
@@ -442,22 +471,6 @@ private:
       core_->reset();
       controller_running_ = true;
     }
-
-    // Assemble the ENU state estimate from the active estimator.
-    drone_core::common::State state;
-    if (use_sim_mode_) {
-      state.pos = px4_pos_enu_;
-      state.vel = px4_vel_enu_;
-      state.yaw = yaw_px4_enu_;
-    } else {
-      state.pos = vio_pos_enu_;
-      state.vel = vio_vel_enu_;
-      state.yaw = yaw_vio_enu_;
-    }
-    state.acc = acc_enu_;
-    state.stamp = get_clock()->now().seconds();
-    const double yaw_used = state.yaw;
-    core_->setState(state);
 
     // Default direct setpoint for takeoff / manual hover. A planner goal, once
     // set, supersedes this inside the tracker.
