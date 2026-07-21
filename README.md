@@ -13,7 +13,7 @@ rewriting any guidance or control code.
 
 - **`core/` — the ROS-free autonomy core (`drone_core`).** Pure C++17, plain CMake, builds and
   unit-tests with zero ROS installed. Depends only on ROS-free libraries: Eigen, octomap (the
-  library, not `octomap_msgs`), OMPL, NLopt and OSQP. All guidance and control logic lives here. It
+  library, not `octomap_msgs`), OMPL, NLopt, OSQP and DecompUtil. All guidance and control logic lives here. It
   carries a `COLCON_IGNORE` so colcon never tries to build it.
 - **`ros2/` — thin ROS wrappers + vendored third-party packages.** The colcon/ament side. The one
   first-party node (`autonomy_node`) does only message↔core-type translation, frame conversions and
@@ -95,20 +95,31 @@ inside the core.
   where unknown space reads as occupied. `truncatePath` walks the planned path against that
   conservative field and cuts it where clearance would fall below `FRONTIER_MARGIN`, yielding a
   committed prefix that never reaches into unexplored space and whose endpoint ratchets forward as
-  the map grows (the required clearance ramps up with distance from the start, which serves the same
-  purpose as the planner's start-escape sphere without its dead band). `buildCorridor` then resamples
-  that prefix and grows one maximal free axis-aligned box per segment, adjacent boxes overlapping by
-  construction. `CorridorTrajectoryOptimizer` solves the trajectory as a **QP** (OSQP): degree-7
+  the map grows. The required clearance ramps from zero at the drone up to the full margin over
+  `ESCAPE_RAMP_DIST`, which serves the same purpose as the planner's start-escape sphere without its
+  dead band; the ramp *length* is decoupled from the margin, because ramping over the margin itself
+  makes the requirement climb at 1 m/m and, on a thinly mapped scene, the rising requirement meets
+  the shrinking clearance within centimetres. `buildCorridor` then resamples
+  that prefix and grows one maximal free **convex polyhedron** per segment using DecompUtil's
+  ellipsoid inflation (Liu et al., RA-L 2017 — the safe-flight-corridor decomposition FASTER uses):
+  an ellipsoid spanning the segment inflates and cuts a half-space at each obstacle that binds, so
+  the region follows the path. Axis-aligned boxes were tried first and fail structurally — a box
+  seeded on a diagonal segment's bounding box is mostly volume the path never visits, so it is
+  rejected by geometry the drone would never approach. Faces are then pulled in by the margin plus
+  the voxel half-diagonal (obstacle points are voxel *centres*), and each region is checked for a
+  non-empty overlap with its neighbour, since C0 continuity pins the junction into that intersection. `CorridorTrajectoryOptimizer` solves the trajectory as a **QP** (OSQP): degree-7
   segments in the monomial basis, reusing the same snap cost matrix, with C⁰–C⁴ continuity and
   rest-to-rest ends as equalities, and the **Bézier** control points of position confined to the
-  boxes and of velocity/acceleration/jerk bounded per axis by `VMAX`/`AMAX`/`JMAX` as inequalities.
+  regions and of velocity/acceleration/jerk bounded per axis by `VMAX`/`AMAX`/`JMAX` as
+  inequalities. A polyhedron face mixes x, y and z, so unlike an axis-aligned box it cannot be split
+  into three per-axis problems — the QP is solved once over all three axes jointly.
   Because a Bézier curve lies inside the convex hull of its control points, bounding those points
   bounds the whole curve — the guarantee holds everywhere, not just at sampled instants. Interior
   waypoints are deliberately *not* pinned, so the trajectory is free to cut corners anywhere inside
   its corridor. An outer BOBYQA loop searches the segment times, scoring an infeasible QP as a large
   penalty so it is pushed back toward feasibility. Everything is written against a **clearance
   oracle** (`CorridorClearanceFn`, the same shape as the planner's `ClearanceFn`) rather than against
-  octomap directly, so box growth and truncation are unit-tested with analytic fields. Any stage
+  octomap directly, so region growth and truncation are unit-tested with analytic data. Any stage
   failing falls back to plain min-snap on the truncated prefix, logging which stage failed and why.
 
 ### `control/` — flight-critical, handle with care
@@ -154,7 +165,7 @@ debug visualisation** — `/planner/search_tree` (the RRT* tree as a MarkerArray
 `/planner/clearance_field` (the EDT as an intensity-coloured PointCloud2) — behind the single
 `DEBUG_PLANNER_VIZ` parameter (default off, zero-cost when off) for tuning planning by eye in
 Foxglove. The same switch exposes `/planner/corridor`, which draws the corridor pipeline's
-intermediate products — the free boxes as semi-transparent cubes, the truncated committed prefix as a
+intermediate products — the free polyhedra as translucent face outlines, the truncated committed prefix as a
 white line, and an orange sphere at the truncation endpoint, the intermediate goal in known-safe
 space. Where that white line stops short of the green geometric path is exactly where truncation
 refused to commit into the unknown. Any future debug/instrumentation should follow the same rule: one
@@ -282,8 +293,11 @@ only a build-time one via `CMAKE_PREFIX_PATH`. `-DUSE_NN=OFF` is required (okvis
 which needs LibTorch); `-DCMAKE_BUILD_TYPE=Release` is strongly wanted (VIO+SLAM are too slow on the
 NUC un-optimized).
 
-Besides the usual apt packages the core needs `libdynamicedt3d-dev` (version-matched to octomap) and
-**OSQP** (a system CMake install providing `libosqpstatic.a`, double precision). OSQP is found by
+Besides the usual apt packages the core needs `libdynamicedt3d-dev` (version-matched to octomap),
+**OSQP** (a system CMake install providing `libosqpstatic.a`, double precision) and **DecompUtil**
+(header-only, from https://github.com/sikang/DecompUtil; configure it with
+`-DCMAKE_POLICY_VERSION_MINIMUM=3.5` on CMake >= 4, and keep its source outside `src/` since it ships
+a `package.xml` colcon would pick up). OSQP is found by
 concrete library path rather than `find_package`, and linked PRIVATE into `drone_core_planning` with
 its C API confined to one `.cpp`, so it never enters the core's public export and consumers need no
 `find_dependency` for it.
@@ -313,8 +327,12 @@ ctest --test-dir build/core --output-on-failure
 ```
 
 Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
-OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (truncation, box growth and the corridor QP
-against analytic clearance fields — fast, no map), `autonomy_core` (plan→track→watchdog).
+OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (truncation, polyhedral corridor generation
+and the corridor QP, against analytic clearance fields and synthetic obstacle clouds — fast, no map),
+`autonomy_core` (plan→track→watchdog).
+
+**Keep any test run under 30 s** (`ctest --timeout 30 -R <name>`) and never run the full suite —
+`planner` drives real OMPL solves and has been seen spinning for minutes.
 
 ## Deployment notes
 

@@ -35,6 +35,12 @@ endif()
 # records an absolute path instead of the osqp::osqpstatic imported target,
 # and consumers need no find_dependency(osqp). Only the C API is used, in
 # planning/src, so no OSQP type reaches a public header.
+# DecompUtil (convex safe-flight-corridor decomposition). Header-only, so there
+# is nothing to link: only the include path is consumed, PRIVATE, in
+# planning/src. No imported target reaches the drone_core export, so consumers
+# need no find_dependency for it.
+find_package(decomp_util REQUIRED)
+
 find_library(OSQP_LIBRARY NAMES osqpstatic osqp)
 find_path(OSQP_INCLUDE_DIR NAMES osqp.h PATH_SUFFIXES osqp)
 if(NOT OSQP_LIBRARY OR NOT OSQP_INCLUDE_DIR)

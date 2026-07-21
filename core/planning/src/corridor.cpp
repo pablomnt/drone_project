@@ -2,50 +2,75 @@
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
 
+// DecompUtil (header-only) stays confined to this translation unit: the public
+// header trades in plain Eigen half-space data only.
+#include <decomp_util/ellipsoid_decomp.h>
+
 namespace drone_core::planning {
 
-namespace {
+std::vector<std::vector<Eigen::Vector3d>> regionFaceLoops(const ConvexRegion& region) {
+  std::vector<std::vector<Eigen::Vector3d>> loops;
+  const int k = static_cast<int>(region.A.rows());
+  if (k < 4) return loops;  // fewer than 4 half-spaces cannot bound a volume
+  constexpr double kEps = 1e-6;
 
-// Sample coordinates along one axis of an axis-aligned region [lo_i, hi_i].
-// A positive extent is split into the fewest `step`-sized intervals that cover
-// it (ceil), giving n+1 evenly spaced samples that always include both faces.
-// A zero (or degenerate) extent collapses to a single sample at the coordinate
-// so a thin slab or a degenerate axis-aligned segment never divides by zero.
-std::vector<double> axisSamples(double lo_i, double hi_i, double step) {
-  const double extent = hi_i - lo_i;
-  if (extent <= 0.0) return {lo_i};  // zero-thickness axis => one sample (faces coincide)
-
-  const int n = std::max(1, static_cast<int>(std::ceil(extent / step)));
-  std::vector<double> s(n + 1);
-  for (int j = 0; j <= n; ++j) s[j] = lo_i + (extent * j) / n;  // both faces included
-  return s;
-}
-
-// FREE TEST: an axis-aligned region [rlo, rhi] is free iff every grid sample
-// (spacing `step`, both faces included on each axis) has clearance >= margin.
-// This is the sole safety oracle: growBox only commits a slab that passes here,
-// so the whole grown box is guaranteed >= margin by construction.
-bool regionFree(const CorridorClearanceFn& clearance, const Eigen::Vector3d& rlo,
-                const Eigen::Vector3d& rhi, double step, double margin) {
-  const std::vector<double> xs = axisSamples(rlo.x(), rhi.x(), step);
-  const std::vector<double> ys = axisSamples(rlo.y(), rhi.y(), step);
-  const std::vector<double> zs = axisSamples(rlo.z(), rhi.z(), step);
-
-  for (double x : xs) {
-    for (double y : ys) {
-      for (double z : zs) {
-        if (clearance(x, y, z) < margin) return false;
+  // Candidate vertices: every triple of faces meeting at a point that satisfies
+  // all the remaining half-spaces.
+  std::vector<Eigen::Vector3d> verts;
+  for (int i = 0; i < k; ++i) {
+    for (int j = i + 1; j < k; ++j) {
+      for (int l = j + 1; l < k; ++l) {
+        Eigen::Matrix3d M;
+        M.row(0) = region.A.row(i);
+        M.row(1) = region.A.row(j);
+        M.row(2) = region.A.row(l);
+        const double det = M.determinant();
+        if (std::abs(det) < 1e-9) continue;  // parallel / coincident faces
+        const Eigen::Vector3d v =
+            M.inverse() * Eigen::Vector3d(region.b(i), region.b(j), region.b(l));
+        if (((region.A * v - region.b).array() > kEps).any()) continue;  // outside
+        bool dup = false;
+        for (const auto& u : verts) {
+          if ((u - v).norm() < 1e-6) { dup = true; break; }
+        }
+        if (!dup) verts.push_back(v);
       }
     }
   }
-  return true;
-}
+  if (verts.size() < 4) return loops;
 
-}  // namespace
+  // Per face, the vertices lying on it, sorted by angle about the face centroid
+  // in the face plane so the ring traces the outline rather than zig-zagging.
+  for (int f = 0; f < k; ++f) {
+    const Eigen::Vector3d n = region.A.row(f).transpose();
+    std::vector<Eigen::Vector3d> on_face;
+    for (const auto& v : verts) {
+      if (std::abs(n.dot(v) - region.b(f)) < 1e-5) on_face.push_back(v);
+    }
+    if (on_face.size() < 3) continue;
+
+    Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+    for (const auto& v : on_face) centroid += v;
+    centroid /= static_cast<double>(on_face.size());
+
+    // Any unit vector in the face plane serves as the angle origin.
+    Eigen::Vector3d u = n.unitOrthogonal();
+    const Eigen::Vector3d w = n.cross(u).normalized();
+    std::sort(on_face.begin(), on_face.end(),
+              [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b) {
+                const Eigen::Vector3d da = a - centroid, db = b - centroid;
+                return std::atan2(da.dot(w), da.dot(u)) < std::atan2(db.dot(w), db.dot(u));
+              });
+    loops.push_back(std::move(on_face));
+  }
+  return loops;
+}
 
 std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& path,
                                           double max_segment_len) {
@@ -89,25 +114,29 @@ std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& pa
 
 std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservative_clearance,
                                           const std::vector<Eigen::Vector3d>& path,
-                                          double margin, double sample_step) {
+                                          double margin, double escape_ramp,
+                                          double sample_step) {
   if (path.size() < 2) return path;
   const Eigen::Vector3d& start = path.front();
 
   // A sampled point is safe when its conservative clearance covers the required
-  // margin, which RAMPS with distance from the start: required = min(margin,
-  // |q - start|). This serves the same purpose as the planner's start-escape
-  // sphere (a drone parked near the mapped floor, or inside the frontier
-  // keep-out, must be able to root a path) but without the sphere's cliff — a
-  // hard sphere leaves a dead band just outside it where the full margin
-  // applies at once, cutting even a path that heads directly away from the
-  // hazard. The ramp instead demands exactly the clearance the vehicle can
-  // have gained by moving that far from where it already, physically, is: a
-  // climb-out from a low hover survives (clearance grows with distance), while
-  // a crawl alongside the hazard is cut. Clearance must additionally be
-  // strictly positive everywhere (never inside an occupied/unknown voxel).
+  // margin, which RAMPS LINEARLY from 0 at the drone to the full margin at
+  // `escape_ramp` metres out. This serves the same purpose as the planner's
+  // start-escape sphere (a drone parked near the mapped floor, or in a small
+  // pocket of known-free space, must be able to root a path) but without the
+  // sphere's cliff — a hard sphere leaves a dead band just outside it where the
+  // full margin applies at once, cutting even a path heading directly away from
+  // the hazard. Ramping over a distance INDEPENDENT of the margin is what keeps
+  // it usable: ramping over `margin` metres instead makes the requirement rise
+  // at 1 m/m, which on a thinly-mapped scene meets the shrinking clearance
+  // within centimetres and truncates the path to nothing. Clearance must
+  // additionally be strictly positive everywhere (never inside an
+  // occupied/unknown voxel), so leniency near the start never means blindness.
   const auto safe = [&](const Eigen::Vector3d& q) {
     const double d = conservative_clearance(q.x(), q.y(), q.z());
-    return d > 0.0 && d >= std::min(margin, (q - start).norm());
+    if (d <= 0.0) return false;
+    if (escape_ramp <= 0.0) return d >= margin;  // ramp disabled
+    return d >= margin * std::min(1.0, (q - start).norm() / escape_ramp);
   };
 
   std::vector<Eigen::Vector3d> out;
@@ -133,106 +162,167 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
   return out;  // whole path safe
 }
 
-bool growBox(const CorridorClearanceFn& clearance, const Eigen::Vector3d& a,
-             const Eigen::Vector3d& b, const CorridorParams& p, Box& box_out) {
-  // Seed at the tight AABB of the two endpoints. For an axis-aligned segment this
-  // is a thin slab (or zero-thickness on some axes); the free test handles that.
-  Eigen::Vector3d lo = a.cwiseMin(b);
-  Eigen::Vector3d hi = a.cwiseMax(b);
-
-  // If the segment's own AABB already clips an obstacle we cannot seed a free box.
-  if (!regionFree(clearance, lo, hi, p.step, p.margin)) return false;
-
-  // Six faces, each pushed outward in `step` increments while the newly swept
-  // slab stays free and its accumulated growth stays within the cap. Testing
-  // only the thin new slab each step keeps this O(box surface), not O(volume).
-  // Order: -x, +x, -y, +y, -z, +z.
-  bool open[6] = {true, true, true, true, true, true};
-  double growth[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  const double eps = 1e-9;  // absorb step accumulation so the last valid step isn't lost
-
-  bool any_open = true;
-  while (any_open) {
-    any_open = false;
-    for (int f = 0; f < 6; ++f) {
-      if (!open[f]) continue;
-
-      // Cap reached: this face can grow no further.
-      if (growth[f] + p.step > p.max_box_growth + eps) {
-        open[f] = false;
-        continue;
-      }
-
-      // Candidate slab = the thin region newly swept by pushing face f out by step,
-      // spanning the box's current cross-section on the other two axes.
-      Eigen::Vector3d slo = lo;
-      Eigen::Vector3d shi = hi;
-      switch (f) {
-        case 0: slo.x() = lo.x() - p.step; shi.x() = lo.x(); break;  // -x
-        case 1: slo.x() = hi.x();          shi.x() = hi.x() + p.step; break;  // +x
-        case 2: slo.y() = lo.y() - p.step; shi.y() = lo.y(); break;  // -y
-        case 3: slo.y() = hi.y();          shi.y() = hi.y() + p.step; break;  // +y
-        case 4: slo.z() = lo.z() - p.step; shi.z() = lo.z(); break;  // -z
-        case 5: slo.z() = hi.z();          shi.z() = hi.z() + p.step; break;  // +z
-      }
-
-      if (regionFree(clearance, slo, shi, p.step, p.margin)) {
-        // Commit: move the face out and record its growth.
-        switch (f) {
-          case 0: lo.x() -= p.step; break;
-          case 1: hi.x() += p.step; break;
-          case 2: lo.y() -= p.step; break;
-          case 3: hi.y() += p.step; break;
-          case 4: lo.z() -= p.step; break;
-          case 5: hi.z() += p.step; break;
-        }
-        growth[f] += p.step;
-        any_open = true;  // this face may still have room; keep the outer loop alive
-      } else {
-        open[f] = false;  // slab blocked => this face is final
-      }
-    }
-  }
-
-  // Growth is outward only, so [lo, hi] still contains a and b by construction.
-  box_out.lo = lo;
-  box_out.hi = hi;
-  return true;
+double corridorObstacleWindowPad(const CorridorParams& p) {
+  // Mirror the bbox sizing in buildCorridor: the widest a region can reach is
+  // the lateral window, which is at least the longest segment, plus the shrink.
+  const double pull_in = p.margin + p.voxel_half_diagonal;
+  return std::max(p.local_bbox.maxCoeff(), p.max_segment_len) + pull_in;
 }
 
-bool buildCorridor(const CorridorClearanceFn& clearance,
+bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    const std::vector<Eigen::Vector3d>& path,
                    const CorridorParams& p,
                    std::vector<Eigen::Vector3d>& resampled_out,
-                   std::vector<Box>& boxes_out) {
+                   std::vector<ConvexRegion>& regions_out,
+                   std::string* reason,
+                   CorridorAttempt* attempt) {
+  // The primary outputs are always cleared on failure so a rejected corridor
+  // can never be flown; `attempt` deliberately survives so the host can draw
+  // what was rejected.
+  const auto fail = [&](const std::string& why) {
+    if (reason) *reason = why;
+    resampled_out.clear();
+    regions_out.clear();
+    return false;
+  };
   resampled_out.clear();
-  boxes_out.clear();
-  if (path.size() < 2) return false;
+  regions_out.clear();
+  if (reason) reason->clear();
+  if (attempt) *attempt = CorridorAttempt{};
+  if (path.size() < 2) return fail("path has fewer than 2 waypoints");
 
   resampled_out = resamplePath(path, p.max_segment_len);
-  if (resampled_out.size() < 2) {
-    resampled_out.clear();
-    return false;
-  }
+  if (resampled_out.size() < 2) return fail("resampling produced fewer than 2 waypoints");
 
-  boxes_out.reserve(resampled_out.size() - 1);
+  // DecompUtil's ellipsoid decomposition: per segment, inflate an ellipsoid
+  // spanning it and cut a half-space at each obstacle point in the order they
+  // bind, within a window aligned to the segment (local_bbox: x along the
+  // path, y/z lateral). Vec3f is double despite the name. NOTE: the
+  // (origin, dim) constructor + global bbox path is deliberately avoided — its
+  // add_global_bbox has an upstream bug (the -Y plane is placed at +Y's
+  // coordinate), and the caller's obstacle window plus local_bbox already
+  // bound the regions.
+  vec_Vec3f obs;
+  obs.reserve(obstacles.size());
+  for (const auto& o : obstacles) obs.emplace_back(o.x(), o.y(), o.z());
+  vec_Vec3f dpath;
+  dpath.reserve(resampled_out.size());
+  for (const auto& w : resampled_out) dpath.emplace_back(w.x(), w.y(), w.z());
+
+  // Size the growth window from the geometry rather than a fixed number. Two
+  // requirements. (1) It must scale with the segments: a window narrower than
+  // the segment is long would clip regions purely because the path is long,
+  // which is the bounding-box failure this rewrite exists to remove. (2) The
+  // shrink below pulls EVERY face in, including these artificial window planes,
+  // so the window must be pull_in larger than the volume we actually want to
+  // keep — otherwise the margin silently eats the usable region from the
+  // outside. Lateral gets the full segment length, along-track half of it
+  // (which also guarantees consecutive regions overlap generously, since each
+  // reaches past its endpoints into its neighbour). p.local_bbox acts as a
+  // floor, so a caller can ask for a wider window but never a self-defeating
+  // one.
+  const double pull_in = p.margin + p.voxel_half_diagonal;
+  double seg_max = 0.0;
   for (size_t i = 0; i + 1 < resampled_out.size(); ++i) {
-    Box box;
-    if (!growBox(clearance, resampled_out[i], resampled_out[i + 1], p, box)) {
-      // One un-growable segment aborts the whole corridor; the caller falls back
-      // to plain min-snap, so leave nothing half-built.
-      resampled_out.clear();
-      boxes_out.clear();
-      return false;
-    }
-    // Each box contains both its endpoints, so it shares the junction waypoint
-    // with its neighbour; growing outward from a seed spanning that shared point
-    // makes consecutive boxes overlap with positive volume there. No extra
-    // overlap-forcing code is needed -- adjacency falls out of the construction.
-    boxes_out.push_back(box);
+    seg_max = std::max(seg_max, (resampled_out[i + 1] - resampled_out[i]).norm());
+  }
+  const Eigen::Vector3d want(std::max(p.local_bbox.x(), 0.5 * seg_max),
+                             std::max(p.local_bbox.y(), seg_max),
+                             std::max(p.local_bbox.z(), seg_max));
+  const Eigen::Vector3d bbox = want.array() + pull_in;
+  if (attempt) attempt->resampled = resampled_out;
+
+  EllipsoidDecomp3D decomp;
+  decomp.set_obs(obs);
+  decomp.set_local_bbox(Vec3f(bbox.x(), bbox.y(), bbox.z()));
+  decomp.dilate(dpath);
+
+  // Each polyhedron -> plain A/b rows, oriented "inside satisfies A p <= b"
+  // using the segment midpoint (which the decomposition guarantees is inside
+  // the unshrunk region). Then pull every face in by margin + the voxel half
+  // diagonal: DecompUtil's faces touch the obstacle *points*, which are voxel
+  // centres, so the extra pull-in makes the margin hold against the voxel's
+  // worst-case corner, not just its centre. Faces are unit-normal on
+  // DecompUtil's side already, but normalise defensively so b stays metric.
+  const auto polys = decomp.get_polyhedrons();
+  if (polys.size() != resampled_out.size() - 1) {
+    return fail("decomposition returned the wrong number of regions");
   }
 
-  return true;  // boxes_out.size() == resampled_out.size() - 1
+  regions_out.reserve(polys.size());
+  for (size_t s = 0; s < polys.size(); ++s) {
+    const Eigen::Vector3d mid = 0.5 * (resampled_out[s] + resampled_out[s + 1]);
+    LinearConstraint3D lc(Vec3f(mid.x(), mid.y(), mid.z()), polys[s].hyperplanes());
+
+    std::vector<Eigen::Vector3d> normals;
+    std::vector<double> offsets;  // unshrunk; the pull-in is applied below
+    normals.reserve(lc.A().rows());
+    for (int r = 0; r < lc.A().rows(); ++r) {
+      const Eigen::Vector3d n = lc.A().row(r).transpose();
+      const double norm = n.norm();
+      if (norm < 1e-9) continue;  // degenerate face; drop rather than divide
+      normals.push_back(n / norm);
+      offsets.push_back(lc.b()(r) / norm);
+    }
+    const int rows = static_cast<int>(normals.size());
+    ConvexRegion region;
+    region.A.resize(rows, 3);
+    region.b.resize(rows);
+    for (int r = 0; r < rows; ++r) {
+      region.A.row(r) = normals[r];
+      region.b(r) = offsets[r] - pull_in;
+    }
+    if (attempt) {
+      ConvexRegion raw;
+      raw.A = region.A;  // same normals, unshrunk offsets
+      raw.b.resize(rows);
+      for (int r = 0; r < rows; ++r) raw.b(r) = offsets[r];
+      attempt->raw.push_back(std::move(raw));
+      attempt->shrunk.push_back(region);
+    }
+    regions_out.push_back(std::move(region));
+  }
+
+  // Validate what the shrink may have destroyed, checking exactly what the QP
+  // pins — no more. The start and goal positions are equality-constrained, so
+  // they must lie in the first/last region. Interior junction positions are
+  // NOT pinned to the waypoints (the trajectory is free within the corridor),
+  // so requiring waypoints inside the shrunk regions would reintroduce the
+  // "path barely clears, corridor fails" mode this rewrite removes; what C0
+  // continuity actually needs is a non-empty INTERSECTION of each consecutive
+  // pair. Exact emptiness needs an LP; instead sample candidate points along
+  // the mid[s] -> junction -> mid[s+1] polyline and accept the first inside
+  // both regions. Approximate in the safe direction: it can fail a corridor
+  // whose overlap is real but sliver-thin (min-snap fallback, correct-ish),
+  // and never passes an empty one.
+  if (!regions_out.front().contains(resampled_out.front())) {
+    return fail("margin shrink pushed the first region past the start position");
+  }
+  if (!regions_out.back().contains(resampled_out.back())) {
+    return fail("margin shrink pushed the last region past the goal position");
+  }
+  for (size_t s = 0; s + 1 < regions_out.size(); ++s) {
+    const Eigen::Vector3d mid_a = 0.5 * (resampled_out[s] + resampled_out[s + 1]);
+    const Eigen::Vector3d mid_b = 0.5 * (resampled_out[s + 1] + resampled_out[s + 2]);
+    const Eigen::Vector3d& wp = resampled_out[s + 1];
+    bool overlap = false;
+    constexpr int kProbes = 11;  // wp first, then walk outward along both half-polylines
+    for (int k = 0; k < kProbes && !overlap; ++k) {
+      const double t = static_cast<double>(k) / (kProbes - 1);
+      overlap = regions_out[s].contains(wp + t * (mid_a - wp)) &&
+                regions_out[s + 1].contains(wp + t * (mid_a - wp));
+      if (!overlap)
+        overlap = regions_out[s].contains(wp + t * (mid_b - wp)) &&
+                  regions_out[s + 1].contains(wp + t * (mid_b - wp));
+    }
+    if (!overlap) {
+      std::ostringstream os;
+      os << "regions " << s << " and " << s + 1 << " stopped overlapping after the margin shrink";
+      return fail(os.str());
+    }
+  }
+
+  return true;  // regions_out.size() == resampled_out.size() - 1
 }
 
 }  // namespace drone_core::planning

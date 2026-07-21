@@ -194,7 +194,7 @@ private:
     declare_parameter("MPC_HOVER_THRUST", 0.35);
 
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
-    declare_parameter("STALE_TIMEOUT", 0.5);
+    declare_parameter("STALE_TIMEOUT", 2.0);
     declare_parameter("SENSOR_TIMEOUT", 0.5);
     declare_parameter("SENSOR_WARMUP", 5.0);
     declare_parameter("RRT_MONITOR_PERIOD", 1.0);
@@ -258,10 +258,25 @@ private:
     // corridor to be constructible in tight indoor space. Safety is not lost by
     // lowering it — the trajectory is still provably confined to the boxes, so
     // it keeps exactly this clearance from anything mapped or unknown.
-    declare_parameter("CORRIDOR_MARGIN", 0.5);
+    declare_parameter("CORRIDOR_MARGIN", 0.4);
+    // Distance over which truncation's required clearance ramps from 0 at the
+    // drone up to the full FRONTIER_MARGIN [m]. Deliberately independent of the
+    // margin: ramping over the margin itself makes the requirement climb at
+    // 1 m/m, so on a thinly-mapped scene it meets the shrinking clearance within
+    // centimetres and the committed path collapses to nothing. Longer commits
+    // further before demanding full clearance; <= 0 disables the ramp.
+    declare_parameter("ESCAPE_RAMP_DIST", 1.0);
     // Corridor resample cap: one free box is grown per path piece of at most
     // this length [m].
     declare_parameter("MAX_SEGMENT_LEN", 2.0);
+    // MINIMUM usable half-extents of the corridor region-growth window, in the
+    // SEGMENT-ALIGNED frame (0 = slack along the segment, 1/2 = lateral) — not
+    // world axes. All zeros (the default) means "derive it": the window scales
+    // with the longest segment and the margin shrink is added on top, so the
+    // window planes never eat into the volume the trajectory can use. Raise a
+    // component to let regions grow wider than the segments themselves, at the
+    // cost of more obstacle points per decomposition.
+    declare_parameter<std::vector<double>>("CORRIDOR_BBOX", {0.0, 0.0, 0.0});
   }
 
   drone_core::autonomy::AutonomyCore::Config configFromParameters() {
@@ -306,7 +321,15 @@ private:
     cfg.jmax = get_parameter("JMAX").as_double();
     cfg.frontier_margin = get_parameter("FRONTIER_MARGIN").as_double();
     cfg.corridor_margin = get_parameter("CORRIDOR_MARGIN").as_double();
+    cfg.escape_ramp_dist = get_parameter("ESCAPE_RAMP_DIST").as_double();
     cfg.max_segment_len = get_parameter("MAX_SEGMENT_LEN").as_double();
+    const auto bbox = get_parameter("CORRIDOR_BBOX").as_double_array();
+    if (bbox.size() == 3) {
+      cfg.corridor_bbox = Eigen::Vector3d(bbox[0], bbox[1], bbox[2]);
+    } else {
+      RCLCPP_WARN(get_logger(), "CORRIDOR_BBOX needs 3 elements, got %zu; keeping default.",
+                  bbox.size());
+    }
     return cfg;
   }
 
@@ -772,26 +795,47 @@ private:
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
 
-    int id = 0;
-    for (const auto& b : snap.boxes) {
-      visualization_msgs::msg::Marker cube;
-      cube.header.frame_id = "map";
-      cube.header.stamp = now();
-      cube.ns = "boxes";
-      cube.id = id++;
-      cube.type = visualization_msgs::msg::Marker::CUBE;
-      cube.action = visualization_msgs::msg::Marker::ADD;
-      cube.pose.position.x = 0.5 * (b.lo.x() + b.hi.x());
-      cube.pose.position.y = 0.5 * (b.lo.y() + b.hi.y());
-      cube.pose.position.z = 0.5 * (b.lo.z() + b.hi.z());
-      cube.pose.orientation.w = 1.0;
-      // A zero-extent axis (a box grown around an axis-aligned segment can be
-      // flat) would make RViz drop the marker; give it a visible sliver.
-      cube.scale.x = std::max(b.hi.x() - b.lo.x(), 0.02);
-      cube.scale.y = std::max(b.hi.y() - b.lo.y(), 0.02);
-      cube.scale.z = std::max(b.hi.z() - b.lo.z(), 0.02);
-      cube.color.r = 0.2f; cube.color.g = 0.8f; cube.color.b = 1.0f; cube.color.a = 0.2f;
-      arr.markers.push_back(cube);
+    // Two overlays so a failed tick explains itself. RAW (grey) is what the
+    // decomposition produced before the margin; SHRUNK is the same regions
+    // after CORRIDOR_MARGIN was pulled off every face — cyan when the corridor
+    // was accepted, red when it was rejected. The usual failure is then
+    // obvious on sight: grey outlines present, coloured ones missing, means
+    // the margin collapsed the regions to nothing. Face outlines rather than
+    // filled hulls because regions overlap by construction and stacked
+    // translucent solids turn to mush.
+    const auto drawRegions = [&](const std::vector<drone_core::planning::ConvexRegion>& regions,
+                                 const char* ns, float r, float g, float b, float a,
+                                 double width, int& id) {
+      for (const auto& region : regions) {
+        for (const auto& loop : drone_core::planning::regionFaceLoops(region)) {
+          if (loop.size() < 3) continue;
+          visualization_msgs::msg::Marker face;
+          face.header.frame_id = "map";
+          face.header.stamp = now();
+          face.ns = ns;
+          face.id = id++;
+          face.type = visualization_msgs::msg::Marker::LINE_STRIP;
+          face.action = visualization_msgs::msg::Marker::ADD;
+          face.pose.orientation.w = 1.0;
+          face.scale.x = width;
+          face.color.r = r; face.color.g = g; face.color.b = b; face.color.a = a;
+          for (const auto& v : loop) {
+            geometry_msgs::msg::Point p;
+            p.x = v.x(); p.y = v.y(); p.z = v.z();
+            face.points.push_back(p);
+          }
+          face.points.push_back(face.points.front());  // close the ring
+          arr.markers.push_back(face);
+        }
+      }
+    };
+
+    int raw_id = 0, shrunk_id = 0;
+    drawRegions(snap.raw, "regions_raw", 0.6f, 0.6f, 0.6f, 0.25f, 0.008, raw_id);
+    if (snap.accepted) {
+      drawRegions(snap.shrunk, "regions", 0.2f, 0.8f, 1.0f, 0.45f, 0.014, shrunk_id);
+    } else {
+      drawRegions(snap.shrunk, "regions", 1.0f, 0.2f, 0.2f, 0.55f, 0.014, shrunk_id);
     }
 
     if (snap.committed.size() >= 2) {

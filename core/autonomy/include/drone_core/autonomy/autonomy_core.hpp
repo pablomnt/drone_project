@@ -80,8 +80,20 @@ public:
     // box, and this must usually sit BELOW the planner's margin for the corridor
     // to be constructible at all — the trajectory is still confined to the
     // resulting boxes, so it stays this far from anything mapped or unknown.
-    double corridor_margin{0.5};
-    double max_segment_len{2.0};   // corridor resample cap: one box per piece [m]
+    double corridor_margin{0.4};
+    // Distance over which truncation's required clearance ramps from 0 at the
+    // drone up to the full frontier_margin [m]. Decoupled from the margin on
+    // purpose: ramping over the margin itself makes the requirement rise at
+    // 1 m/m, which on a thinly-mapped scene meets the shrinking clearance
+    // within centimetres and truncates the committed path to nothing. Longer =
+    // commits further before demanding full clearance. <= 0 disables the ramp.
+    double escape_ramp_dist{1.0};
+    double max_segment_len{2.0};   // corridor resample cap: one region per piece [m]
+    // Half-extents of the region-growth window in the SEGMENT-ALIGNED frame
+    // (x along the segment, y/z lateral) — not world axes. Caps how far a
+    // corridor region may extend from its segment, and with it how much of the
+    // obstacle cloud each decomposition considers.
+    Eigen::Vector3d corridor_bbox{2.0, 2.0, 1.0};
     // When false the worker stops after RRT*: it stores the geometric path for
     // visualisation but never runs min-snap or hands a trajectory to the
     // tracker, so control keeps following the direct setpoint. Used to bring the
@@ -169,17 +181,28 @@ public:
   // Snapshot of the most recent corridor-QP trajgen, for debug visualisation.
   // `committed` is the TRUNCATED prefix actually handed to the trajectory
   // solver — its last point is the intermediate goal inside known-safe space,
-  // which ratchets toward the real goal as the map grows — and `boxes` are the
-  // free axis-aligned boxes grown along it (one per resampled segment), i.e.
-  // the region the trajectory is provably confined to. Comparing `committed`
+  // which ratchets toward the real goal as the map grows — and `regions` are
+  // the convex free polyhedra grown along it (one per resampled segment), i.e.
+  // the volume the trajectory is provably confined to. Comparing `committed`
   // against geometricPath() shows exactly where truncation cut the optimistic
   // path. Empty unless cfg.debug_planner_viz AND cfg.use_corridor_qp are set,
   // and cleared whenever a trajgen tick truncates to nothing or fails to build
   // a corridor, so a stale corridor is never drawn as if it were current.
   // Thread-safe copy.
+  // Deliberately populated on FAILED ticks too, stage by stage, because a
+  // failing corridor is what you actually need to look at: a tick that only
+  // cleared the drawing left "viz broken", "flag off" and "failing every
+  // cycle" indistinguishable on screen. `committed` is filled as soon as
+  // truncation succeeds; `raw` and `shrunk` as soon as the decomposition runs,
+  // whether or not the result was accepted. `accepted` says whether this
+  // corridor was actually used — when false, `shrunk` is the geometry that was
+  // rejected. Drawing `raw` against `shrunk` makes the usual failure obvious
+  // at a glance: raw has volume, shrunk has none, so the margin ate it.
   struct CorridorSnapshot {
     std::vector<Eigen::Vector3d> committed;
-    std::vector<planning::Box> boxes;
+    std::vector<planning::ConvexRegion> raw;     // as decomposed, before the margin
+    std::vector<planning::ConvexRegion> shrunk;  // after the margin pull-in
+    bool accepted{false};
   };
   CorridorSnapshot corridorSnapshot() const;
 
@@ -189,11 +212,14 @@ private:
                      const planning::MapHandle& map,
                      std::vector<std::vector<double>>& path);
   // Trajectory generation for the committed path. cons_edt is the distance
-  // field of the conservative map view (nullptr when unavailable): with
-  // use_corridor_qp set it drives truncation + corridor growth; without it (or
-  // with the flag off) trajgen is plain min-snap over the waypoints.
+  // field of the conservative map view and cons_map the octree it was built
+  // from (nullptr when unavailable): with use_corridor_qp set the field drives
+  // truncation and the octree supplies the windowed obstacle points the
+  // polyhedral corridor decomposition consumes; without them (or with the flag
+  // off) trajgen is plain min-snap over the waypoints.
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
+                  const planning::MapHandle& cons_map,
                   common::Trajectory& traj);
   void stagePending(const common::Trajectory& traj);
   void plannerLoop();

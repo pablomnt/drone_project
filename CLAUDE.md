@@ -216,24 +216,42 @@ Module roles:
   geometric search runs on the raw **optimistic** map (unknown = free, so EIT*/BIT* accept a goal
   beyond the mapped frontier instead of failing "no goal states available"), while safety comes from
   the **conservative** (frontier-stamped) view. `corridor.{hpp,cpp}`: `truncatePath` cuts the
-  committed path where conservative clearance drops below `FRONTIER_MARGIN` (required clearance
-  ramps with distance from the start — the escape-sphere idea without its dead band), `resamplePath`
-  + `growBox`/`buildCorridor` grow one maximal free axis-aligned box (at `CORRIDOR_MARGIN`) per
-  ≤`MAX_SEGMENT_LEN` piece, written against a **clearance oracle** (`CorridorClearanceFn`) so tests
-  drive them with analytic fields. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
+  committed path where conservative clearance drops below `FRONTIER_MARGIN` (the requirement ramps
+  from 0 at the drone to the full margin over `ESCAPE_RAMP_DIST` — the escape-sphere idea without its
+  dead band, and with the ramp *length* decoupled from the margin so a large margin doesn't make the
+  ramp steep), `resamplePath`
+  + `buildCorridor` grows one maximal free **convex polyhedron** (at `CORRIDOR_MARGIN`) per
+  ≤`MAX_SEGMENT_LEN` piece via **DecompUtil**'s ellipsoid inflation (Liu et al. RA-L 2017, the
+  decomposition FASTER uses): the ellipsoid grows along the segment and cuts a half-space at each
+  obstacle that binds, so the region follows the path instead of a bounding box. It consumes an
+  obstacle **point list** (occupied + frontier-stamped voxel centres, windowed around the prefix by
+  `runTrajgen` — a whole room at 5 cm is 1e5-1e6 points and DecompUtil rescans per segment), while
+  `truncatePath` keeps using the EDT **clearance oracle**; tests drive both with analytic data. Faces
+  are pulled in by `CORRIDOR_MARGIN` + the voxel half-diagonal (obstacle points are voxel *centres*),
+  then each region is validated for a non-empty overlap with its neighbour, since C0 continuity pins
+  the junction into that intersection and shrinking can empty it. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
   solves degree-7 min-snap as an **OSQP QP** — monomial coefficients (same snap `Q`), C0–C4
-  continuity, rest-to-rest ends, Bézier control points of position confined to the boxes and of
+  continuity, rest-to-rest ends, Bézier control points of position confined to the regions and of
   vel/acc/jerk within per-axis `VMAX/AMAX/JMAX` (hull property ⇒ the whole curve complies; solved in
   per-segment normalized time or OSQP stalls on conditioning), plus a feasibility-aware BOBYQA time
   search (infeasible ⇒ flat penalty; velocity-consistent seed grown until feasible). Fallback ladder
   in `runTrajgen`: corridor failure → plain min-snap on the **truncated prefix** (never the full
   optimistic path); empty truncation → stage nothing (tracker rides out the old trajectory into the
   stale hover-hold). Each fallback logs which stage failed and why — `truncated to N wp / L m`
-  (pipeline refusing to commit toward unknown space), `box growth FAILED … tightest conservative
-  clearance C m vs required M m` (raise the room or lower `CORRIDOR_MARGIN`), or `QP INFEASIBLE over
-  S boxes` (corridor fine, no trajectory fits it within `VMAX/AMAX/JMAX`). These are distinct faults
+  (pipeline refusing to commit toward unknown space), `decomposition FAILED (<which check>) …
+  tightest conservative clearance C m vs required M m` — the parenthetical names the actual check
+  that rejected it (margin shrink pushed a region past the start/goal, or two regions stopped
+  overlapping), since the clearance figure is context, not the cause — or `QP INFEASIBLE over S
+  regions` (corridor fine, no trajectory fits it within `VMAX/AMAX/JMAX`). These are distinct faults
   needing opposite fixes, hence distinct messages. A successful corridor logs one line only when
   `DEBUG_PLANNER_VIZ` is on.
+
+  **A known, correct-looking-wrong interaction.** `truncatePath` ramps its requirement near the drone
+  (`ESCAPE_RAMP_DIST`) so a vehicle in a tight pocket can root a path at all, but a convex region
+  cannot be "less safe at one end" — the corridor applies `CORRIDOR_MARGIN` uniformly, including
+  right next to the drone. So truncation can commit a short prefix the corridor then refuses. That is
+  the pipeline telling the truth (there is no trajectory with that clearance through that space), not
+  a bug to hunt.
 - **`control`** — see the flight-critical note below.
 
 ### control (`core/control/`) — flight-critical, be careful
@@ -324,12 +342,22 @@ publish nothing and cost nothing when the flag is off:
   for tuning `CLEARANCE_WEIGHT` / `CLEARANCE_THRESHOLD`. Sampled on the worker thread only when the
   map changes.
 - `/planner/corridor` (`visualization_msgs/MarkerArray`) — the corridor-QP pipeline's intermediate
-  products: semi-transparent cyan **CUBEs** (alpha 0.2) for the free boxes the trajectory is confined
-  to, a white **line strip** for the truncated committed prefix, and an orange **sphere** at the
-  truncation endpoint (the intermediate goal in known-safe space, which should ratchet toward the red
-  goal marker as the room is mapped). Where the white line stops short of the green
-  `/planner/geometric_path` is where truncation cut the optimistic path. Needs `PLAN_TRAJECTORY` +
-  `USE_CORRIDOR_QP`; a failed trajgen tick clears it rather than leaving a stale corridor drawn.
+  products, **published on failed ticks too**, stage by stage, because a failing corridor is what you
+  need to look at (clearing the drawing made "viz broken", "flag off" and "failing every tick" look
+  identical). Face **outlines** rather than filled hulls, since regions overlap by construction and
+  stacked translucent solids turn to mush:
+  - grey outlines — the polyhedra **as decomposed**, before `CORRIDOR_MARGIN` is applied;
+  - cyan outlines — the same regions **after** the margin pull-in, when the corridor was accepted;
+  - red outlines — ditto when it was **rejected**;
+  - white line strip — the truncated committed prefix (drawn as soon as truncation succeeds);
+  - orange sphere — the truncation endpoint, the intermediate goal in known-safe space, which should
+    ratchet toward the red goal marker as the room is mapped.
+
+  Reading it: grey present but nothing coloured ⇒ the margin collapsed the regions, so there is less
+  room than `CORRIDOR_MARGIN` demands. Red ⇒ regions survived the shrink but failed validation (the
+  `[trajgen]` line names which check). Where the white line stops short of the green
+  `/planner/geometric_path` is where truncation refused to commit into unknown space. Needs
+  `PLAN_TRAJECTORY` + `USE_CORRIDOR_QP` + `DEBUG_PLANNER_VIZ`.
 
 **Planning-related node parameters** (all live-reconfigurable via `onParameterChange`):
 - `PLAN_TRAJECTORY` (bool, default `true`) — the geometry-first phase gate. False stops the worker
@@ -349,7 +377,7 @@ publish nothing and cost nothing when the flag is off:
 - `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
 - `CLEARANCE_WEIGHT` (double, default `1.0`) — obstacle-proximity penalty weight. Lowered from 4.0
   during bench work; raising it pushes the search off the walls, which is one way to buy the corridor
-  stage the room it needs to grow boxes.
+  stage the room it needs to grow regions.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
 - `DEBUG_PLANNER_VIZ` (bool, default `true`) — **single switch** for the debug planner
   visualisation (search tree, clearance field, corridor). Designed to be zero-cost when off: with it
@@ -378,16 +406,30 @@ publish nothing and cost nothing when the flag is off:
   unknown space (the truncation margin against the conservative EDT). Enforced exactly as set; a
   committed point must still have strictly positive clearance whatever the value, so the prefix can
   never reach into an occupied or unknown voxel.
-- `CORRIDOR_MARGIN` (double, default `0.5` m) — clearance the *corridor boxes* keep from obstacles
+- `ESCAPE_RAMP_DIST` (double, default `1.0` m) — distance over which truncation's required clearance
+  ramps from 0 at the drone up to the full `FRONTIER_MARGIN`. **Deliberately independent of the
+  margin.** Ramping over the margin itself makes the requirement climb at 1 m/m, so on a thinly
+  mapped scene the rising requirement meets the shrinking clearance within centimetres and the
+  committed path collapses to almost nothing (observed on the bench: 0.25 m committed out of a
+  2.47 m path). A longer ramp commits further before demanding full clearance. `<= 0` disables the
+  ramp entirely. Clearance must still be strictly positive everywhere, so leniency near the start is
+  never blindness — the prefix cannot enter an occupied or unknown voxel at any setting.
+- `CORRIDOR_MARGIN` (double, default `0.4` m) — clearance the *corridor regions* keep from obstacles
   and unknown space. **This is a strictly harder test than the planner's `kCollisionMargin`**: the
-  search validates only its centreline (and exempts a sphere at the start), while box growth needs
-  the margin over a whole 3D region of the frontier-stamped map. A path that only just satisfies the
-  search therefore leaves no room to grow a box, and in tight indoor space this usually has to sit
-  **below** 0.5 m for a corridor to exist at all. Lowering it does not forfeit the safety
-  guarantee — the trajectory stays provably confined to the boxes, so it keeps exactly this
-  clearance. If `[trajgen] corridor: box growth FAILED` reports a tightest conservative clearance
+  search validates only its centreline (and exempts a sphere at the start), while the corridor needs
+  the margin over a whole 3D volume of the frontier-stamped map. Lowering it does not forfeit the
+  safety guarantee — the trajectory stays provably confined to the regions, so it keeps exactly this
+  clearance — but it is the clearance you actually fly with, so weigh it against the airframe's
+  half-width. If `[trajgen] corridor: decomposition FAILED` reports a tightest conservative clearance
   below the required margin, this is the knob.
-- `MAX_SEGMENT_LEN` (double, default `2.0` m) — corridor resample cap; one free box per piece.
+- `MAX_SEGMENT_LEN` (double, default `2.0` m) — corridor resample cap; one free region per piece.
+- `CORRIDOR_BBOX` (double[3], default `[0, 0, 0]` = derive) — **minimum usable** half-extents of the
+  region-growth window in the **segment-aligned** frame (component 0 = slack along the segment, 1/2 =
+  lateral), not world axes. A floor, not a literal size: `buildCorridor` scales it with the longest
+  segment (lateral ≥ segment length, along-track ≥ half of it, so consecutive regions overlap
+  generously) and adds the margin pull-in on top, so the window planes can never eat into the volume
+  the trajectory can actually use. Raise a component for wider regions, at the cost of more obstacle
+  points per decomposition.
 
 **Planning mode matrix.** Three flags compose into the pipeline's operating modes. `PLAN_TRAJECTORY`
 gates trajgen entirely; `USE_CORRIDOR_QP` picks the trajgen algorithm; `TREAT_FRONTIER_AS_OBSTACLE`
@@ -417,6 +459,16 @@ the only configuration that delivers the Stage 1 safety claim.
 **Additional dependency**: `libdynamicedt3d-dev` (apt, version-matched to octomap 1.9.7). Used in
 `autonomy_core.cpp` only; linked into `drone_core_autonomy`. Headers at
 `<dynamicEDT3D/dynamicEDTOctomap.h>`. Re-install if rebuilding on a fresh machine.
+
+**DecompUtil (safe-flight-corridor decomposition)**: system CMake install at `/usr/local` from
+https://github.com/sikang/DecompUtil — **header-only**, so `find_package(decomp_util)` supplies only
+`${DECOMP_UTIL_INCLUDE_DIRS}`, added PRIVATE to `drone_core_planning` with its types confined to
+`corridor.cpp`; nothing is linked and no target reaches the `drone_core` export. Its CMake declares
+`cmake_minimum_required(VERSION 2.8.3)`, so on CMake >= 4 it must be configured with
+`-DCMAKE_POLICY_VERSION_MINIMUM=3.5`. Keep the source out of `src/` — it ships a `package.xml` and
+colcon would try to build it. Note an upstream bug we route around: `EllipsoidDecomp::add_global_bbox`
+(3D) places both the +Y and -Y planes at `global_bbox_max_(1)`, so the `(origin, dim)` constructor is
+never used — only `set_local_bbox`.
 
 **OSQP (corridor-QP solver)**: system CMake install at `/usr/local` (v1.x C API,
 `libosqpstatic.a`). Deliberately located as a **concrete library path** (`find_library` in

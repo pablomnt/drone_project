@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -14,25 +15,53 @@ namespace drone_core::planning {
 // generator knowing anything about octomap.
 using CorridorClearanceFn = std::function<double(double x, double y, double z)>;
 
-// Axis-aligned free box: a convex region the trajectory may occupy. Each box
-// becomes six linear half-space rows (lo <= p <= hi per axis) in the corridor
-// QP.
-struct Box {
-  Eigen::Vector3d lo;
-  Eigen::Vector3d hi;
+// Convex free region: the space one trajectory segment may occupy, as the
+// half-space intersection A·p <= b (one row per face, row normals unit-length
+// so b carries metric distance). General polyhedra rather than axis-aligned
+// boxes: a box seeded on a diagonal segment's AABB is mostly volume the path
+// never visits, and it fails on geometry the drone would never approach —
+// polyhedra grown along the path (DecompUtil's ellipsoid inflation) cut at the
+// obstacles that actually bind, recovering the free volume next to complex
+// nearby geometry. Plain Eigen data on purpose: DecompUtil types never cross
+// this public header.
+struct ConvexRegion {
+  Eigen::Matrix<double, Eigen::Dynamic, 3> A;
+  Eigen::VectorXd b;
 
   bool contains(const Eigen::Vector3d& p, double tol = 0.0) const {
-    return (p.array() >= lo.array() - tol).all() && (p.array() <= hi.array() + tol).all();
+    return A.rows() == 0 || ((A * p - b).array() <= tol).all();
   }
 };
 
 // Tunables for corridor construction.
 struct CorridorParams {
   double max_segment_len = 2.0;  // resample cap: no segment longer than this [m]
-  double step = 0.10;            // box face growth increment / free-test grid [m]
-  double margin = 0.5;           // required clearance for a point to count as free [m]
-  double max_box_growth = 3.0;   // cap on how far any face grows from its seed [m]
+  double margin = 0.5;           // clearance every region keeps from obstacle points [m]
+  // Minimum USABLE half-extents of the region-growth window, in the
+  // SEGMENT-ALIGNED frame — component 0 is slack along the segment beyond its
+  // endpoints, 1 and 2 are lateral — not world axes. Treated as a floor, not a
+  // literal size: buildCorridor raises it to scale with the longest segment
+  // (lateral >= segment length, along-track >= half of it, so consecutive
+  // regions overlap generously) and then adds the margin shrink on top, so the
+  // window planes never eat into the volume the trajectory can actually use.
+  // Raise this to let regions grow wider than the segments themselves; note
+  // that a wider window also means more obstacle points per decomposition.
+  Eigen::Vector3d local_bbox{0.0, 0.0, 0.0};
+  // Half-diagonal of an occupancy voxel [m]: obstacle points are voxel
+  // centres, so faces are pushed this much further in addition to `margin`
+  // for the margin to hold against the voxel's worst-case corner. Set from
+  // the map resolution (res * sqrt(3) / 2); the default matches 0.05 m.
+  double voxel_half_diagonal = 0.0433;
 };
+
+// Vertex loops of a region's faces, for visualisation: one entry per face that
+// has at least three vertices, each an ordered ring of that face's corners
+// (angularly sorted about the face centroid, so drawing it as a closed line
+// strip traces the face outline). Vertices are enumerated by intersecting every
+// triple of faces and keeping the points that satisfy all the others, which is
+// O(faces^3) — fine for the ~10-20 faces a corridor region carries, at debug
+// visualisation rates, but not something to call on the flight path.
+std::vector<std::vector<Eigen::Vector3d>> regionFaceLoops(const ConvexRegion& region);
 
 // Subdivide any path segment longer than max_segment_len into equal pieces so
 // every output segment respects the cap. Keeps the original waypoints; never
@@ -41,14 +70,6 @@ struct CorridorParams {
 std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& path,
                                           double max_segment_len);
 
-// Grow a maximal free axis-aligned box around segment [a, b]: seed at the
-// segment's tight AABB, then push each of the six faces outward in `step`
-// increments while the newly swept slab stays free (every grid sample has
-// clearance >= margin) and within max_box_growth. Returns false when even the
-// seed AABB clips an obstacle (no free box exists around this segment). The
-// resulting box always contains both endpoints.
-bool growBox(const CorridorClearanceFn& clearance, const Eigen::Vector3d& a,
-             const Eigen::Vector3d& b, const CorridorParams& p, Box& box_out);
 
 // Truncate a (possibly optimistically planned) path to its safe committed
 // prefix: walk it from the start outward, sampling finely, and cut at the first
@@ -60,27 +81,71 @@ bool growBox(const CorridorClearanceFn& clearance, const Eigen::Vector3d& a,
 // over-conservatively) the collision margin against mapped obstacles. This is
 // what keeps a best-effort path — which may run through unexplored space — from
 // committing the vehicle beyond the mapped frontier; the endpoint ratchets
-// forward as the map grows. Near the start the required clearance ramps up with
-// distance travelled — required = min(margin, distance from start) — serving
-// the planner's start-escape purpose (a drone parked near the mapped floor or
-// inside the frontier keep-out can still root a path) without a hard sphere's
-// dead band; clearance must always be strictly positive. The result is the safe
-// prefix: the original waypoints passed, plus the last safe sampled point as
-// its endpoint. A result with fewer than 2 points means nothing of the path is
-// safely committable (the caller falls back / holds).
+// forward as the map grows.
+//
+// Near the start the required clearance RAMPS UP with distance travelled:
+//   required = margin * min(1, distance_from_start / escape_ramp)
+// reaching the full margin only at `escape_ramp` metres out. This serves the
+// planner's start-escape purpose — a drone parked near the mapped floor, or
+// sitting in a small pocket of known-free space, can still root a path — without
+// a hard sphere's dead band. `escape_ramp` is deliberately decoupled from
+// `margin`: tying the two (ramping to full margin over `margin` metres) makes
+// the ramp steeper exactly when the margin is large, and on a thinly-mapped
+// scene the rising requirement meets the shrinking clearance within
+// centimetres, truncating the path to nothing. A longer ramp commits further
+// before demanding full clearance. Pass <= 0 to disable the ramp (full margin
+// everywhere). Clearance must always be strictly positive regardless, so the
+// prefix can never enter an occupied or unknown voxel.
+//
+// The result is the safe prefix: the original waypoints passed, plus the last
+// safe sampled point as its endpoint. A result with fewer than 2 points means
+// nothing of the path is safely committable (the caller falls back / holds).
 std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservative_clearance,
                                           const std::vector<Eigen::Vector3d>& path,
-                                          double margin, double sample_step = 0.05);
+                                          double margin, double escape_ramp = 1.0,
+                                          double sample_step = 0.05);
 
-// Full corridor for a path: resample to the segment cap, then grow one free box
-// per segment. Consecutive boxes overlap by construction (each contains its
-// segment's endpoints, and adjacent segments share one). On success
-// boxes_out.size() == resampled_out.size() - 1; on any un-growable segment both
+// Full corridor for a path: resample to the segment cap, then grow one convex
+// free region per segment via DecompUtil's ellipsoid decomposition against the
+// given obstacle points (occupied + frontier-stamped voxel centres of the
+// conservative map, pre-windowed by the caller — this function scans the whole
+// list per segment). Each region is shrunk by margin + voxel_half_diagonal
+// along every face normal so the trajectory it confines keeps true metric
+// clearance from the voxels themselves, then validated: each segment's
+// midpoint must survive the shrink, and each junction waypoint must lie in
+// BOTH adjacent regions (the QP pins the junction position to the pair's
+// intersection, which shrinking can empty). On any violated region both
 // outputs are cleared and false is returned (the caller falls back).
-bool buildCorridor(const CorridorClearanceFn& clearance,
+// On success regions_out.size() == resampled_out.size() - 1.
+// `reason`, if given, receives a short human-readable explanation on failure
+// (which check rejected the corridor) — the caller's one-line diagnostic
+// otherwise cannot distinguish "the margin collapsed a region" from "two
+// regions stopped overlapping", which need different responses.
+//
+// `attempt`, if given, receives the geometry as it was built REGARDLESS of
+// whether the corridor is then accepted — the primary outputs are still
+// cleared on failure so a rejected corridor can never be flown, but a rejected
+// corridor is exactly what you want to look at. Holding both the raw and the
+// shrunk regions makes the common failure self-evident on sight: if `raw` has
+// volume and `shrunk` has none, the margin ate the region.
+struct CorridorAttempt {
+  std::vector<Eigen::Vector3d> resampled;  // segments the decomposition ran on
+  std::vector<ConvexRegion> raw;           // as DecompUtil built them, no margin applied
+  std::vector<ConvexRegion> shrunk;        // after the margin + voxel pull-in
+};
+
+bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    const std::vector<Eigen::Vector3d>& path,
                    const CorridorParams& p,
                    std::vector<Eigen::Vector3d>& resampled_out,
-                   std::vector<Box>& boxes_out);
+                   std::vector<ConvexRegion>& regions_out,
+                   std::string* reason = nullptr,
+                   CorridorAttempt* attempt = nullptr);
+
+// Upper bound on how far from the committed path a region can reach, given the
+// same params — i.e. how wide the obstacle window the caller extracts must be
+// for the decomposition to see everything that could bound a region. Keeps the
+// caller's windowing in step with buildCorridor's internal bbox sizing.
+double corridorObstacleWindowPad(const CorridorParams& p);
 
 }  // namespace drone_core::planning

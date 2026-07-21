@@ -234,8 +234,8 @@ bool AutonomyCore::planOnce() {
   if (!runGlobalPlan(state, goal, map, path)) return false;
 
   common::Trajectory traj;
-  if (!runTrajgen(path, now(), conservativeField(conservative ? conservative : map), traj))
-    return false;
+  const planning::MapHandle cons = conservative ? conservative : map;
+  if (!runTrajgen(path, now(), conservativeField(cons), cons, traj)) return false;
 
   stagePending(traj);
   return true;
@@ -324,10 +324,11 @@ bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal&
 
 bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                               const std::shared_ptr<DynamicEDTOctomap>& cons_edt,
+                              const planning::MapHandle& cons_map,
                               common::Trajectory& traj) {
   if (path.size() < 2) return false;
 
-  if (cfg_.use_corridor_qp && cons_edt) {
+  if (cfg_.use_corridor_qp && cons_edt && cons_map) {
     // Corridor pipeline: truncate the (possibly optimistic) path to the prefix
     // that is safely inside known-free space, grow one free box per resampled
     // segment, and solve the corridor-constrained min-snap QP. Every stage runs
@@ -348,26 +349,46 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     planning::CorridorParams params;
     params.max_segment_len = cfg_.max_segment_len;
     params.margin = cfg_.corridor_margin;
+    params.local_bbox = cfg_.corridor_bbox;
+    // Obstacle points are voxel centres; the corridor must clear the voxel's
+    // worst-case corner, so tell it the map's half-diagonal.
+    params.voxel_half_diagonal = cons_map->getResolution() * std::sqrt(3.0) / 2.0;
 
     // Truncation enforces the configured frontier margin exactly — it is NOT
     // floored by the corridor margin, so FRONTIER_MARGIN means what it says and
     // the two stages can be tuned independently. Whatever it is set to, a
     // committed point must still have strictly positive clearance, so the
     // prefix can never reach into an occupied or unknown voxel.
-    const auto committed = planning::truncatePath(cons_fn, epath, cfg_.frontier_margin);
+    const auto committed =
+        planning::truncatePath(cons_fn, epath, cfg_.frontier_margin, cfg_.escape_ramp_dist);
 
     // Debug viz snapshot, published by the host. Cleared on every corridor tick
     // and refilled only once a corridor is actually built, so a failed tick
     // erases the drawing instead of leaving a stale corridor on screen. Costs
     // nothing when debug_planner_viz is off.
-    const auto snapshotCorridor = [this](const std::vector<Eigen::Vector3d>& path,
-                                         const std::vector<planning::Box>& boxes) {
+    // Snapshot each stage as it completes rather than only on success: a
+    // failing corridor is precisely what needs looking at, and clearing the
+    // drawing made "viz broken", "flag off" and "failing every tick" look
+    // identical. Reset here, then fill in as truncation and the decomposition
+    // produce geometry.
+    const auto resetSnapshot = [this]() {
+      if (!cfg_.debug_planner_viz) return;
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      last_corridor_ = CorridorSnapshot{};
+    };
+    const auto snapshotCommitted = [this](const std::vector<Eigen::Vector3d>& path) {
       if (!cfg_.debug_planner_viz) return;
       std::lock_guard<std::mutex> lock(traj_mutex_);
       last_corridor_.committed = path;
-      last_corridor_.boxes = boxes;
     };
-    snapshotCorridor({}, {});
+    const auto snapshotRegions = [this](const planning::CorridorAttempt& att, bool accepted) {
+      if (!cfg_.debug_planner_viz) return;
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      last_corridor_.raw = att.raw;
+      last_corridor_.shrunk = att.shrunk;
+      last_corridor_.accepted = accepted;
+    };
+    resetSnapshot();
 
     if (committed.size() < 2) {
       // Nothing of the path is safely committable (start hemmed in by frontier
@@ -376,14 +397,14 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       DRONE_LOG_INFO("[trajgen] corridor: truncation empty -> no new trajectory");
       return false;
     }
+    snapshotCommitted(committed);
 
-    // Numbers for the logs below. "corridor QP failed" covered two very
-    // different faults — no free box could be grown, versus boxes fine but the
-    // QP infeasible — which need opposite fixes, so report them separately and
-    // quantify. The tightest CONSERVATIVE clearance is the number that explains
-    // a box-growth failure: the search validated its centreline against the
-    // optimistic map, while box growth needs this much room over a whole 3D
-    // region of the frontier-stamped map. Computed only on the paths that log.
+    // Numbers for the logs below. The corridor stage and the QP are separate
+    // faults needing opposite fixes, so they report separately and quantified.
+    // The tightest CONSERVATIVE clearance is the number that explains a
+    // decomposition failure: the search validated its centreline against the
+    // optimistic map, while the corridor must clear the frontier-stamped map by
+    // CORRIDOR_MARGIN. Computed only on the paths that log.
     const auto polylineLength = [](const std::vector<Eigen::Vector3d>& p) {
       double len = 0.0;
       for (std::size_t i = 0; i + 1 < p.size(); ++i) len += (p[i + 1] - p[i]).norm();
@@ -411,27 +432,74 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                      << " m (frontier margin " << cfg_.frontier_margin << " m)");
     }
 
+    // Obstacle points for the decomposition: occupied leaves of the
+    // conservative map (real obstacles AND stamped frontier) within a window
+    // around the committed prefix. Windowed on purpose — a whole room at 5 cm
+    // is 1e5-1e6 voxels and DecompUtil scans the list per segment, which would
+    // never fit the 1 Hz trajgen budget. The window is the prefix's AABB grown
+    // by the region-growth extent plus the margin, so nothing that could bound
+    // a region is missed. Coarse (unpruned) leaves are expanded to resolution
+    // voxels, mirroring toOcTree() in the ROS node, so a single big leaf does
+    // not under-represent a solid block as one point.
+    const auto obstacles = [&]() {
+      Eigen::Vector3d lo = committed.front(), hi = committed.front();
+      for (const auto& w : committed) {
+        lo = lo.cwiseMin(w);
+        hi = hi.cwiseMax(w);
+      }
+      const double pad = planning::corridorObstacleWindowPad(params);
+      lo.array() -= pad;
+      hi.array() += pad;
+      const double res = cons_map->getResolution();
+      std::vector<Eigen::Vector3d> pts;
+      const octomap::point3d bmin(static_cast<float>(lo.x()), static_cast<float>(lo.y()),
+                                  static_cast<float>(lo.z()));
+      const octomap::point3d bmax(static_cast<float>(hi.x()), static_cast<float>(hi.y()),
+                                  static_cast<float>(hi.z()));
+      for (auto it = cons_map->begin_leafs_bbx(bmin, bmax), end = cons_map->end_leafs_bbx();
+           it != end; ++it) {
+        if (!cons_map->isNodeOccupied(*it)) continue;
+        const double size = it.getSize();
+        const octomap::point3d c = it.getCoordinate();
+        if (size <= res * 1.5) {
+          pts.emplace_back(c.x(), c.y(), c.z());
+          continue;
+        }
+        const double half = (size - res) / 2.0;
+        for (double dx = -half; dx <= half + 1e-6; dx += res)
+          for (double dy = -half; dy <= half + 1e-6; dy += res)
+            for (double dz = -half; dz <= half + 1e-6; dz += res)
+              pts.emplace_back(c.x() + dx, c.y() + dy, c.z() + dz);
+      }
+      return pts;
+    }();
+
     std::vector<Eigen::Vector3d> resampled;
-    std::vector<planning::Box> boxes;
-    if (!planning::buildCorridor(cons_fn, committed, params, resampled, boxes)) {
-      DRONE_LOG_INFO("[trajgen] corridor: box growth FAILED over " << committed.size()
-                     << " wp / " << polylineLength(committed) << " m — tightest conservative "
-                     << "clearance " << minConservativeClearance(committed)
-                     << " m vs required " << params.margin
-                     << " m (CORRIDOR_MARGIN) -> min-snap fallback");
+    std::vector<planning::ConvexRegion> regions;
+    std::string why;
+    planning::CorridorAttempt attempt;
+    if (!planning::buildCorridor(obstacles, committed, params, resampled, regions, &why,
+                                 cfg_.debug_planner_viz ? &attempt : nullptr)) {
+      snapshotRegions(attempt, /*accepted=*/false);
+      DRONE_LOG_INFO("[trajgen] corridor: decomposition FAILED (" << why << ") over "
+                     << committed.size() << " wp / " << polylineLength(committed)
+                     << " m — tightest conservative clearance "
+                     << minConservativeClearance(committed) << " m vs required " << params.margin
+                     << " m (CORRIDOR_MARGIN), " << obstacles.size()
+                     << " obstacle pts -> min-snap fallback");
     } else {
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
-      if (optimizer.optimizeTrajectory(resampled, boxes, traj)) {
-        snapshotCorridor(resampled, boxes);
+      snapshotRegions(attempt, /*accepted=*/true);
+      if (optimizer.optimizeTrajectory(resampled, regions, traj)) {
         traj.t0 = t0;
         if (cfg_.debug_planner_viz) {
-          DRONE_LOG_INFO("[trajgen] corridor: OK " << boxes.size() << " boxes / "
+          DRONE_LOG_INFO("[trajgen] corridor: OK " << regions.size() << " regions / "
                          << polylineLength(committed) << " m / " << traj.total_duration << " s");
         }
         return true;
       }
-      DRONE_LOG_INFO("[trajgen] corridor: QP INFEASIBLE over " << boxes.size() << " boxes / "
+      DRONE_LOG_INFO("[trajgen] corridor: QP INFEASIBLE over " << regions.size() << " regions / "
                      << polylineLength(committed) << " m — corridor built but no trajectory "
                      << "fits it within VMAX/AMAX/JMAX -> min-snap fallback");
     }
@@ -729,8 +797,8 @@ void AutonomyCore::plannerLoop() {
         std::vector<std::vector<double>> path = cached_path_;
         path.front() = {state.pos.x(), state.pos.y(), state.pos.z()};
         common::Trajectory traj;
-        if (runTrajgen(path, now(),
-                       conservativeField(conservative ? conservative : map), traj)) {
+        const planning::MapHandle cons = conservative ? conservative : map;
+        if (runTrajgen(path, now(), conservativeField(cons), cons, traj)) {
           stagePending(traj);
           last_trajgen_ = t;
         }

@@ -126,93 +126,130 @@ Csc toCsc(const Eigen::MatrixXd& A, bool upper_only) {
 bool CorridorTrajectoryOptimizer::solveQP(const Eigen::Vector3d& start,
                                           const Eigen::Vector3d& goal,
                                           const std::vector<double>& times,
-                                          const std::vector<Box>& boxes,
+                                          const std::vector<ConvexRegion>& regions,
                                           common::Trajectory& out,
                                           double* cost_out) const {
   const int S = static_cast<int>(times.size());
-  if (S < 1 || boxes.size() != times.size()) return false;
+  if (S < 1 || regions.size() != times.size()) return false;
   for (double t : times) {
     if (!(t > 0.0) || !std::isfinite(t)) return false;
   }
 
-  const int n = S * kCoeffs;
+  // ONE coupled QP over all three axes. A polyhedron face row mixes x, y and
+  // z, so the per-axis decomposition an axis-aligned box allowed (one
+  // factorization, three solves swapping bounds) no longer exists. Variable
+  // layout: segment-major, axis-minor — index(s, axis, k) = s*24 + axis*8 + k.
+  const int kAxes = 3;
+  const int seg_vars = kAxes * kCoeffs;  // 24
+  const int n = S * seg_vars;
+  const auto idx = [seg_vars](int s, int axis) { return s * seg_vars + axis * kCoeffs; };
 
   // The QP is solved in per-segment normalized time: tau = t/T_s with scaled
   // coefficients ct_k = c_k * T_s^k, so p(t) = sum ct_k tau^k. Raw monomials
   // over multi-second segments put ~1e9 snap-Hessian entries next to ~1
   // position rows and OSQP stalls at max_iter ("solved inaccurate"); in tau
-  // every constraint row is O(1) and the solver converges in tens of
-  // iterations. The d-th time-derivative picks up a 1/T^d factor and the snap
-  // integral becomes ct' (Q(1)/T^7) ct; output coefficients are rescaled back
-  // (c_k = ct_k / T^k) so callers still get real-time monomials.
+  // every constraint row is O(1) and the solver converges quickly. The d-th
+  // time-derivative picks up a 1/T^d factor and the snap integral becomes
+  // ct' (Q(1)/T^7) ct; output coefficients are rescaled back (c_k = ct_k / T^k)
+  // so callers still get real-time monomials.
 
-  // Quadratic cost: block-diagonal snap Hessian. P = 2Q so the OSQP objective
-  // 0.5 x'Px equals the snap integral c'Qc.
+  // Quadratic cost: the same snap Hessian, once per axis per segment,
+  // block-diagonal. P = 2Q so the OSQP objective 0.5 x'Px equals c'Qc.
   Eigen::MatrixXd P = Eigen::MatrixXd::Zero(n, n);
   for (int s = 0; s < S; ++s) {
-    P.block(s * kCoeffs, s * kCoeffs, kCoeffs, kCoeffs) =
-        2.0 * snapCostBlock(1.0) / std::pow(times[s], 7);
+    const Eigen::MatrixXd Qs = 2.0 * snapCostBlock(1.0) / std::pow(times[s], 7);
+    for (int ax = 0; ax < kAxes; ++ax) {
+      P.block(idx(s, ax), idx(s, ax), kCoeffs, kCoeffs) = Qs;
+    }
   }
 
-  // Constraint rows, shared by all three axes (only the bounds differ):
-  //   equality (l == u): boundary pos + rest vel/acc/jerk at both ends,
-  //                      C0..C4 continuity at each interior junction;
-  //   inequality: Bezier control points of position in the segment's box,
-  //               of velocity/acceleration/jerk within the per-axis limits.
-  const int m_eq = 8 + 5 * (S - 1);
-  const int m_in = S * (8 + 7 + 6 + 5);
+  // Row budget:
+  //   equality (l == u): boundary pos + rest vel/acc/jerk at both ends and
+  //     C0..C4 continuity per junction, each replicated per axis;
+  //   inequality: one row per polyhedron face per position control point
+  //     (spanning all three axis blocks), plus per-axis vel/acc/jerk
+  //     control-point limits.
+  int faces_total = 0;
+  for (const auto& r : regions) faces_total += static_cast<int>(r.A.rows());
+  const int m_eq = kAxes * (8 + 5 * (S - 1));
+  const int m_in = faces_total * kCoeffs + S * kAxes * (7 + 6 + 5);
   const int m = m_eq + m_in;
 
   Eigen::MatrixXd A = Eigen::MatrixXd::Zero(m, n);
-  // Per-axis bounds; the boundary/box entries are filled per axis below, the
-  // structural zeros (continuity rows, symmetric limit rows) once here.
-  Eigen::Matrix<double, Eigen::Dynamic, 3> lower(m, 3), upper(m, 3);
+  Eigen::VectorXd lower(m), upper(m);
 
   int row = 0;
 
   // Start boundary: p(0) = start, v/a/jerk(0) = 0 (rest — matches the existing
   // min-snap; inheriting the live velocity is a Stage-2 improvement).
   for (int d = 0; d <= 3; ++d) {
-    A.block(row, 0, 1, kCoeffs) = derivRow(d, 0.0) / std::pow(times[0], d);
-    for (int ax = 0; ax < 3; ++ax) lower(row, ax) = upper(row, ax) = d == 0 ? start(ax) : 0.0;
-    ++row;
+    const Eigen::RowVectorXd r0 = derivRow(d, 0.0) / std::pow(times[0], d);
+    for (int ax = 0; ax < kAxes; ++ax) {
+      A.block(row, idx(0, ax), 1, kCoeffs) = r0;
+      lower(row) = upper(row) = d == 0 ? start(ax) : 0.0;
+      ++row;
+    }
   }
 
-  // Interior junctions: derivative d of segment s at its end equals derivative d
-  // of segment s+1 at its start, for d = 0..4 (C0 through snap). In tau the
-  // segment end is tau = 1, and each side carries its own 1/T^d scale.
+  // Interior junctions: derivative d of segment s at its end equals derivative
+  // d of segment s+1 at its start, for d = 0..4 (C0 through snap), per axis.
+  // In tau the segment end is tau = 1 and each side carries its own 1/T^d.
   for (int s = 0; s + 1 < S; ++s) {
     for (int d = 0; d <= 4; ++d) {
-      A.block(row, s * kCoeffs, 1, kCoeffs) = derivRow(d, 1.0) / std::pow(times[s], d);
-      A.block(row, (s + 1) * kCoeffs, 1, kCoeffs) = -derivRow(d, 0.0) / std::pow(times[s + 1], d);
-      for (int ax = 0; ax < 3; ++ax) lower(row, ax) = upper(row, ax) = 0.0;
-      ++row;
+      const Eigen::RowVectorXd re = derivRow(d, 1.0) / std::pow(times[s], d);
+      const Eigen::RowVectorXd rs = derivRow(d, 0.0) / std::pow(times[s + 1], d);
+      for (int ax = 0; ax < kAxes; ++ax) {
+        A.block(row, idx(s, ax), 1, kCoeffs) = re;
+        A.block(row, idx(s + 1, ax), 1, kCoeffs) = -rs;
+        lower(row) = upper(row) = 0.0;
+        ++row;
+      }
     }
   }
 
   // End boundary: p(T) = goal, rest. The rest end doubles as a safety stop if
   // replanning ever halts mid-flight.
   for (int d = 0; d <= 3; ++d) {
-    A.block(row, (S - 1) * kCoeffs, 1, kCoeffs) = derivRow(d, 1.0) / std::pow(times[S - 1], d);
-    for (int ax = 0; ax < 3; ++ax) lower(row, ax) = upper(row, ax) = d == 0 ? goal(ax) : 0.0;
-    ++row;
+    const Eigen::RowVectorXd rT = derivRow(d, 1.0) / std::pow(times[S - 1], d);
+    for (int ax = 0; ax < kAxes; ++ax) {
+      A.block(row, idx(S - 1, ax), 1, kCoeffs) = rT;
+      lower(row) = upper(row) = d == 0 ? goal(ax) : 0.0;
+      ++row;
+    }
   }
 
-  // Corridor + dynamic limits via Bezier control points (in tau, so the
-  // control-point map uses a unit interval and the d-th derivative rows carry
-  // the 1/T^d physical scale).
+  // Corridor: the j-th position control point of segment s is
+  // r_j = (G_pos.row(j) * ct_s^x, ..., ct_s^y, ..., ct_s^z) and must satisfy
+  // every face A_f . r_j <= b_f — one row per (face, control point) spanning
+  // the three axis blocks. The Bezier hull property lifts the control-point
+  // bound to the whole curve.
+  const Eigen::MatrixXd G_pos = bezierControlRows(0, 1.0);
+  for (int s = 0; s < S; ++s) {
+    for (int f = 0; f < regions[s].A.rows(); ++f) {
+      for (int j = 0; j < kCoeffs; ++j) {
+        for (int ax = 0; ax < kAxes; ++ax) {
+          A.block(row, idx(s, ax), 1, kCoeffs) = regions[s].A(f, ax) * G_pos.row(j);
+        }
+        lower(row) = -OSQP_INFTY;
+        upper(row) = regions[s].b(f);
+        ++row;
+      }
+    }
+  }
+
+  // Dynamic limits: per-axis vel/acc/jerk control points, unchanged in meaning.
   const double lim[4] = {0.0, limits_.vmax, limits_.amax, limits_.jmax};
   for (int s = 0; s < S; ++s) {
-    for (int d = 0; d <= 3; ++d) {
+    for (int d = 1; d <= 3; ++d) {
       const Eigen::MatrixXd G = bezierControlRows(d, 1.0) / std::pow(times[s], d);
-      A.block(row, s * kCoeffs, G.rows(), kCoeffs) = G;
-      for (int r = 0; r < G.rows(); ++r) {
-        for (int ax = 0; ax < 3; ++ax) {
-          lower(row + r, ax) = d == 0 ? boxes[s].lo(ax) : -lim[d];
-          upper(row + r, ax) = d == 0 ? boxes[s].hi(ax) : lim[d];
+      for (int ax = 0; ax < kAxes; ++ax) {
+        A.block(row, idx(s, ax), G.rows(), kCoeffs) = G;
+        for (int r = 0; r < G.rows(); ++r) {
+          lower(row + r) = -lim[d];
+          upper(row + r) = lim[d];
         }
+        row += static_cast<int>(G.rows());
       }
-      row += static_cast<int>(G.rows());
     }
   }
 
@@ -230,19 +267,16 @@ bool CorridorTrajectoryOptimizer::solveQP(const Eigen::Vector3d& start,
   settings.polishing = 1;    // recover a high-accuracy solution from the ADMM iterate
   settings.eps_abs = 1e-5;   // tight tolerances: corridor rows are safety constraints
   settings.eps_rel = 1e-5;
-  // A well-conditioned (tau-normalized) solve converges in tens of iterations;
-  // only near-infeasible probes from the outer time search grind longer. Cap
-  // them well below OSQP's 4000 default so a whole BOBYQA search stays cheap —
-  // an unconverged probe is treated as infeasible, which is what it borders on.
+  // A well-conditioned (tau-normalized) solve converges quickly; only
+  // near-infeasible probes from the outer time search grind longer. Cap them
+  // well below OSQP's 4000 default so a whole BOBYQA search stays cheap — an
+  // unconverged probe is treated as infeasible, which is what it borders on.
   settings.max_iter = 1000;
 
-  // One factorization, three solves: the constraint matrix is identical for the
-  // three axes (boxes and boundaries only move the bounds), so set up on the
-  // x-axis bounds and swap l/u for y and z.
   std::vector<OSQPFloat> l(m), u(m);
   for (int r = 0; r < m; ++r) {
-    l[r] = static_cast<OSQPFloat>(lower(r, 0));
-    u[r] = static_cast<OSQPFloat>(upper(r, 0));
+    l[r] = static_cast<OSQPFloat>(lower(r));
+    u[r] = static_cast<OSQPFloat>(upper(r));
   }
 
   OSQPSolver* solver = nullptr;
@@ -251,38 +285,24 @@ bool CorridorTrajectoryOptimizer::solveQP(const Eigen::Vector3d& start,
     return false;
   }
 
-  std::vector<Eigen::VectorXd> axis_coeffs(3);
-  double cost = 0.0;
   bool ok = true;
-  for (int ax = 0; ax < 3 && ok; ++ax) {
-    if (ax > 0) {
-      for (int r = 0; r < m; ++r) {
-        l[r] = static_cast<OSQPFloat>(lower(r, ax));
-        u[r] = static_cast<OSQPFloat>(upper(r, ax));
-      }
-      if (osqp_update_data_vec(solver, nullptr, l.data(), u.data()) != 0) {
-        ok = false;
-        break;
-      }
-    }
-    if (osqp_solve(solver) != 0) {
-      // API-level failure (not a solve outcome) — always worth a line.
-      DRONE_LOG_ERROR("[corridor-qp] OSQP solve error on axis " << ax);
-      ok = false;
-      break;
-    }
-    if (solver->info->status_val != OSQP_SOLVED) {
-      // Primal infeasible, or unconverged at the iteration cap (which only
-      // happens bordering infeasibility) — either way there is no trustworthy
-      // trajectory. Silent: the outer time search probes this region on every
-      // run and scores it as a penalty; the caller's fallback does the one-line
-      // reporting if a *final* solve ends up here.
-      ok = false;
-      break;
-    }
-    axis_coeffs[ax] = Eigen::Map<const Eigen::VectorXd>(
+  double cost = 0.0;
+  Eigen::VectorXd sol;
+  if (osqp_solve(solver) != 0) {
+    // API-level failure (not a solve outcome) — always worth a line.
+    DRONE_LOG_ERROR("[corridor-qp] OSQP solve error");
+    ok = false;
+  } else if (solver->info->status_val != OSQP_SOLVED) {
+    // Primal infeasible, or unconverged at the iteration cap (which only
+    // happens bordering infeasibility) — either way there is no trustworthy
+    // trajectory. Silent: the outer time search probes this region on every
+    // run and scores it as a penalty; the caller's fallback does the one-line
+    // reporting if a *final* solve ends up here.
+    ok = false;
+  } else {
+    sol = Eigen::Map<const Eigen::VectorXd>(
         reinterpret_cast<const double*>(solver->solution->x), n);
-    cost += solver->info->obj_val;
+    cost = solver->info->obj_val;
   }
   osqp_cleanup(solver);
   if (!ok) return false;
@@ -294,9 +314,9 @@ bool CorridorTrajectoryOptimizer::solveQP(const Eigen::Vector3d& start,
     // Undo the tau normalization: c_k = ct_k / T^k gives real-time monomials.
     Eigen::VectorXd rescale(kCoeffs);
     for (int k = 0; k < kCoeffs; ++k) rescale(k) = std::pow(times[s], -k);
-    out.coeffs_x.push_back(axis_coeffs[0].segment(s * kCoeffs, kCoeffs).cwiseProduct(rescale));
-    out.coeffs_y.push_back(axis_coeffs[1].segment(s * kCoeffs, kCoeffs).cwiseProduct(rescale));
-    out.coeffs_z.push_back(axis_coeffs[2].segment(s * kCoeffs, kCoeffs).cwiseProduct(rescale));
+    out.coeffs_x.push_back(sol.segment(idx(s, 0), kCoeffs).cwiseProduct(rescale));
+    out.coeffs_y.push_back(sol.segment(idx(s, 1), kCoeffs).cwiseProduct(rescale));
+    out.coeffs_z.push_back(sol.segment(idx(s, 2), kCoeffs).cwiseProduct(rescale));
     out.total_duration += times[s];
   }
   if (cost_out) *cost_out = cost;
@@ -311,7 +331,7 @@ struct CorridorTimeContext {
   const CorridorTrajectoryOptimizer* solver;
   Eigen::Vector3d start;
   Eigen::Vector3d goal;
-  const std::vector<Box>* boxes;
+  const std::vector<ConvexRegion>* regions;
   double time_penalty;
   double infeasible_penalty;
 };
@@ -329,7 +349,7 @@ double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& 
 
   common::Trajectory traj;
   double cost = 0.0;
-  if (!ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->boxes, traj, &cost)) {
+  if (!ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost)) {
     return ctx->infeasible_penalty;
   }
   return cost + ctx->time_penalty * total;
@@ -338,10 +358,10 @@ double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& 
 }  // namespace
 
 bool CorridorTrajectoryOptimizer::optimizeTrajectory(
-    const std::vector<Eigen::Vector3d>& waypoints, const std::vector<Box>& boxes,
+    const std::vector<Eigen::Vector3d>& waypoints, const std::vector<ConvexRegion>& regions,
     common::Trajectory& out) const {
-  if (waypoints.size() < 2 || boxes.size() != waypoints.size() - 1) return false;
-  const int S = static_cast<int>(boxes.size());
+  if (waypoints.size() < 2 || regions.size() != waypoints.size() - 1) return false;
+  const int S = static_cast<int>(regions.size());
 
   // Velocity-consistent seed: long enough to traverse each segment at vmax with
   // some slack. BOBYQA must start on the feasible side (the infeasible region
@@ -357,14 +377,14 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     common::Trajectory probe;
     int grow = 0;
     while (grow < kMaxSeedGrowth &&
-           !solveQP(waypoints.front(), waypoints.back(), times, boxes, probe)) {
+           !solveQP(waypoints.front(), waypoints.back(), times, regions, probe)) {
       for (double& t : times) t *= 1.5;
       ++grow;
     }
     if (grow == kMaxSeedGrowth) return false;  // corridor unusable at any sane duration
   }
 
-  CorridorTimeContext ctx{this, waypoints.front(), waypoints.back(), &boxes,
+  CorridorTimeContext ctx{this, waypoints.front(), waypoints.back(), &regions,
                           kTimePenalty, kInfeasiblePenalty};
 
   nlopt::opt optimizer(nlopt::LN_BOBYQA, S);
@@ -386,9 +406,9 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // Final solve at the chosen allocation. The search started feasible, but
   // BOBYQA returns its lowest evaluated point, which can sit just inside the
   // infeasible boundary; retry once with a modest stretch before giving up.
-  if (solveQP(waypoints.front(), waypoints.back(), times, boxes, out)) return true;
+  if (solveQP(waypoints.front(), waypoints.back(), times, regions, out)) return true;
   for (double& t : times) t *= 1.5;
-  return solveQP(waypoints.front(), waypoints.back(), times, boxes, out);
+  return solveQP(waypoints.front(), waypoints.back(), times, regions, out);
 }
 
 }  // namespace drone_core::planning

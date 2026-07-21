@@ -27,7 +27,9 @@ target_link_libraries(drone_core_planning PUBLIC
 # in src/, so the include dir and library stay PRIVATE (the library is a
 # concrete path — see the top-level CMakeLists — so the export carries no
 # osqp target and consumers need no find_dependency).
-target_include_directories(drone_core_planning PRIVATE ${OSQP_INCLUDE_DIR})
+target_include_directories(drone_core_planning PRIVATE
+  ${OSQP_INCLUDE_DIR}
+  ${DECOMP_UTIL_INCLUDE_DIRS})   # header-only; nothing to link
 target_link_libraries(drone_core_planning PRIVATE ${OSQP_LIBRARY})
 
 set_target_properties(drone_core_planning PROPERTIES EXPORT_NAME planning)
