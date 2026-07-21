@@ -64,6 +64,48 @@ int main() {
     check(core.inHoverHold(), "watchdog fell back to hover-hold when guidance went stale");
   }
 
+  // Corridor-QP mode: planOnce must route trajgen through the corridor
+  // pipeline (truncation + box corridor + QP against the conservative EDT) and
+  // still stage a trajectory. A mapped floor gives the distance field real
+  // obstacles; the corridor's collision margin must then keep the trajectory
+  // well off that floor, which plain min-snap would not guarantee.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.use_corridor_qp = true;
+    cfg.rrt_solve_time = 0.5;
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    // Solid floor at z = 0 under the whole flight volume.
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    for (double x = -1.0; x <= 4.0; x += 0.1) {
+      for (double y = -1.0; y <= 1.0; y += 0.1) {
+        octree->updateNode(octomap::point3d(x, y, 0.0), true);
+      }
+    }
+    core.setMap(octree);  // no conservative view: the raw map serves both roles
+    core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+
+    check(core.planOnce(), "corridor-QP planOnce produced a trajectory");
+    core.stepControl(0.02);
+    check(core.hasTrajectory(), "corridor trajectory is active");
+
+    const auto sampled = core.sampledPlannedPath();
+    check(!sampled.empty(), "corridor trajectory is sampleable");
+    bool above_floor = !sampled.empty();
+    for (const auto& p : sampled) {
+      if (p[2] < 0.45) above_floor = false;  // corridor margin (0.5) minus tolerance
+    }
+    check(above_floor, "corridor trajectory keeps the collision margin off the floor");
+  }
+
   // Background planner thread: should plan and stage without help.
   {
     autonomy::AutonomyCore::Config cfg;

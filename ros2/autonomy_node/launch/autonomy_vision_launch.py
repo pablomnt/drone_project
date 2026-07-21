@@ -14,12 +14,16 @@ def generate_launch_description():
         # Start the autonomy node (wraps the drone_core stack).
         # The map now comes from RTAB-Map's own ray-traced octomap (see the rtabmap
         # block below) rather than a standalone octomap_server, so remap the node's
-        # /octomap_binary subscription onto /rtabmap/octomap_binary.
+        # /octomap_binary subscription onto /rtabmap/octomap_binary. The frontier
+        # (known-free/unknown boundary) subscription is remapped onto RTAB-Map's
+        # octomap_global_frontier_space, which the node burns into the map as
+        # obstacles when TREAT_FRONTIER_AS_OBSTACLE is on.
         launch.actions.ExecuteProcess(
             cmd=[
                 'bash', '-c',
                 'ros2 run autonomy_node autonomy_node '
-                '--ros-args -r /octomap_binary:=/rtabmap/octomap_binary'
+                '--ros-args -r /octomap_binary:=/rtabmap/octomap_binary '
+                '-r /octomap_frontier:=/rtabmap/octomap_global_frontier_space'
             ],
             output='screen'
         ),

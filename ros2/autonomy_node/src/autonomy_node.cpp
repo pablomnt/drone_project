@@ -76,6 +76,34 @@ std::shared_ptr<octomap::OcTree> toOcTree(const TreeT& in) {
   out->updateInnerOccupancy();
   return out;
 }
+
+// Burn a frontier point cloud into an OcTree as *occupied* voxels. The frontier
+// (RTAB-Map's octomap_global_frontier_space) is the shell of known-free voxels
+// that border unmapped space; stamping it occupied makes the planner's EDT treat
+// the edge of the known world as an obstacle, so paths stay inside explored-free
+// space instead of cutting through the unknown. Frontier cells are themselves
+// *free* voxels (negative log-odds), so a plain hit update would not necessarily
+// flip them — force the clamping-max occupied value so isNodeOccupied() is
+// unambiguous. lazy_eval defers the inner-node refresh to one final pass.
+// keep_out_r leaves a frontier-free ball of that radius around `drone` (the live
+// drone position) so a vehicle boxed in by unknown space can still root the
+// search; kept small (see kFrontierKeepOutRadius) so the surrounding frontier
+// margin reseals the gap and the planner can't route out into the unknown.
+void stampFrontierOccupied(octomap::OcTree& tree, const sensor_msgs::msg::PointCloud2& cloud,
+                           const octomap::point3d& drone, double keep_out_r) {
+  const float occ = tree.getClampingThresMaxLog();
+  const double r2 = keep_out_r * keep_out_r;
+  sensor_msgs::PointCloud2ConstIterator<float> ix(cloud, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> iy(cloud, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> iz(cloud, "z");
+  for (; ix != ix.end(); ++ix, ++iy, ++iz) {
+    if (!std::isfinite(*ix) || !std::isfinite(*iy) || !std::isfinite(*iz)) continue;
+    const octomap::point3d p(*ix, *iy, *iz);
+    if ((p - drone).norm_sq() <= r2) continue;  // start-escape carve-out
+    tree.setNodeValue(p, occ, /*lazy_eval=*/true);
+  }
+  tree.updateInnerOccupancy();
+}
 }  // namespace
 
 class AutonomyNode : public rclcpp::Node {
@@ -118,6 +146,12 @@ public:
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     sub_map_ = create_subscription<octomap_msgs::msg::Octomap>(
         "/octomap_binary", map_qos, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1));
+    // Frontier (known-free/unknown boundary) as a PointCloud2, latched like the
+    // octomap and published on the same motion-gated map updates. Cached and
+    // burned into each incoming octomap as occupied voxels (see onOctomap) when
+    // TREAT_FRONTIER_AS_OBSTACLE is on, so the planner won't route into unknown space.
+    sub_frontier_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        "/octomap_frontier", map_qos, std::bind(&AutonomyNode::onFrontier, this, std::placeholders::_1));
     sub_goal_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         "/planner/goal", 10, std::bind(&AutonomyNode::onGoal, this, std::placeholders::_1));
 
@@ -131,6 +165,8 @@ public:
     pub_goal_marker_ = create_publisher<visualization_msgs::msg::Marker>("/planner/goal_marker", 10);
     pub_search_tree_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/search_tree", 10);
     pub_clearance_field_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/clearance_field", 10);
+    pub_occupancy_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/occupancy_map", 10);
+    pub_corridor_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/corridor", 10);
 
     control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this));
     viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this));
@@ -169,19 +205,63 @@ private:
     // tunables live in geometric_planner.hpp (PlannerConfig).
     declare_parameter<std::string>("PLANNER_TYPE", "EITstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
-    declare_parameter("CLEARANCE_WEIGHT", 4.0);
+    declare_parameter("CLEARANCE_WEIGHT", 1.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
     declare_parameter("TRAJGEN_PERIOD", 1.0);
     // Geometry-first bring-up: with this false the planner only runs RRT* and
     // publishes the geometric path; it does not generate a trajectory or feed
     // the controller, which keeps following POS_SP. Flip to true to enable the
     // min-snap trajectory + tracking stage.
-    declare_parameter("PLAN_TRAJECTORY", false);
+    declare_parameter("PLAN_TRAJECTORY", true);
     // Single switch for the planner debug visualisation: publishes the RRT*
     // search tree (/planner/search_tree) and the EDT clearance field
     // (/planner/clearance_field). Off by default so regular flights pay nothing;
     // flip true for a debugging/tuning run (live-reconfigurable).
     declare_parameter("DEBUG_PLANNER_VIZ", true);
+    // Treat frontier voxels (the known-free/unknown boundary from RTAB-Map's
+    // octomap_global_frontier_space) as obstacles, so the planner refuses to
+    // route through unmapped space and only flies through explored-free space.
+    // Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
+    // so with this on the drone is boxed in until it has mapped its surroundings
+    // (e.g. an initial 360deg scan) — flip it off for open-loop bench tests.
+    declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", true);
+    // Best-effort goal seeking. When true (default), a goal in unreachable or
+    // still-unmapped space no longer produces "no path": the planner routes to the
+    // reachable point closest to the goal (the frontier edge) and the worker keeps
+    // advancing that endpoint as new space is mapped and the frontier recedes, so
+    // the drone gets as close as it can and ratchets forward. Set false to make the
+    // planner insist on (near-)exact arrival and hold when the goal is unreachable.
+    // Live-reconfigurable.
+    declare_parameter("BEST_EFFORT_GOAL", true);
+    // Corridor-QP trajectory generation (Stage 1). When true, trajgen replaces
+    // plain min-snap with the safe-corridor pipeline: the geometric search runs
+    // on the raw (optimistic) map so goals beyond the mapped frontier are
+    // accepted, the committed path is truncated against the frontier-stamped
+    // conservative map (needs TREAT_FRONTIER_AS_OBSTACLE for the frontier to
+    // count), and the trajectory is a corridor-constrained min-snap QP that
+    // provably stays in known-free space within the per-axis limits below. Any
+    // stage failing falls back to plain min-snap on the truncated prefix.
+    // Live-reconfigurable; default off until bench-validated.
+    declare_parameter("USE_CORRIDOR_QP", true);
+    declare_parameter("VMAX", 1.0);   // per-axis velocity limit [m/s]
+    declare_parameter("AMAX", 1.5);   // per-axis acceleration limit [m/s^2]
+    declare_parameter("JMAX", 3.0);   // per-axis jerk limit [m/s^3]
+    // Clearance the committed trajectory must keep from unknown space [m];
+    // may exceed the 0.5 m collision margin (unknown is riskier than a wall).
+    declare_parameter("FRONTIER_MARGIN", 0.5);
+    // Clearance the corridor boxes keep from obstacles and unknown space [m].
+    // A strictly harder test than the planner's 0.5 m collision margin: the
+    // search only validates its centreline (and exempts a sphere at the start),
+    // while box growth needs this much room over a whole 3D region of the
+    // frontier-stamped map. So a path that only just passes the search can
+    // leave no room for a box, and this usually has to sit BELOW 0.5 for the
+    // corridor to be constructible in tight indoor space. Safety is not lost by
+    // lowering it — the trajectory is still provably confined to the boxes, so
+    // it keeps exactly this clearance from anything mapped or unknown.
+    declare_parameter("CORRIDOR_MARGIN", 0.5);
+    // Corridor resample cap: one free box is grown per path piece of at most
+    // this length [m].
+    declare_parameter("MAX_SEGMENT_LEN", 2.0);
   }
 
   drone_core::autonomy::AutonomyCore::Config configFromParameters() {
@@ -219,6 +299,14 @@ private:
     cfg.trajgen_period = get_parameter("TRAJGEN_PERIOD").as_double();
     cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
     cfg.debug_planner_viz = get_parameter("DEBUG_PLANNER_VIZ").as_bool();
+    cfg.best_effort_goal = get_parameter("BEST_EFFORT_GOAL").as_bool();
+    cfg.use_corridor_qp = get_parameter("USE_CORRIDOR_QP").as_bool();
+    cfg.vmax = get_parameter("VMAX").as_double();
+    cfg.amax = get_parameter("AMAX").as_double();
+    cfg.jmax = get_parameter("JMAX").as_double();
+    cfg.frontier_margin = get_parameter("FRONTIER_MARGIN").as_double();
+    cfg.corridor_margin = get_parameter("CORRIDOR_MARGIN").as_double();
+    cfg.max_segment_len = get_parameter("MAX_SEGMENT_LEN").as_double();
     return cfg;
   }
 
@@ -293,6 +381,12 @@ private:
     t_sensor_ = get_clock()->now().seconds();
   }
 
+  void onFrontier(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    // Just cache the latest frontier cloud; it is applied when the next octomap
+    // arrives (onOctomap). Single-threaded executor, so no lock needed.
+    frontier_cloud_ = msg;
+  }
+
   void onOctomap(const octomap_msgs::msg::Octomap::SharedPtr msg) {
     octomap::AbstractOcTree* tree = octomap_msgs::binaryMsgToMap(*msg);
     if (!tree) {
@@ -317,9 +411,28 @@ private:
       return;
     }
 
+    // Dual-map feed. The raw map is the core's OPTIMISTIC view (unknown reads
+    // as free — what the corridor pipeline's geometric search runs on so goals
+    // beyond the frontier are accepted). When frontier treatment is on, a
+    // stamped deep copy becomes the CONSERVATIVE view (frontier voxels read as
+    // occupied) used for truncation, corridor growth — and, with the corridor
+    // QP off, as the legacy single search map. Read live (map rate is sparse),
+    // matching the loop's live-parameter pattern; before the first frontier
+    // cloud arrives only the raw map is fed.
+    std::shared_ptr<octomap::OcTree> conservative;
+    if (get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool() && frontier_cloud_) {
+      const Eigen::Vector3d& p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
+      conservative = std::make_shared<octomap::OcTree>(*map);
+      stampFrontierOccupied(*conservative, *frontier_cloud_,
+                            octomap::point3d(p.x(), p.y(), p.z()),
+                            drone_core::planning::GeometricPlanner::frontierKeepOutRadius());
+    }
+
     // One-time confirmation the core is actually being fed a map (and how dense).
     RCLCPP_INFO_ONCE(get_logger(), "First octomap received: %zu nodes", map->size());
-    core_->setMap(map);
+    got_octomap_ = true;
+    core_->setMap(map, conservative);
+    publishOccupancyMap(conservative ? *conservative : *map);
   }
 
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -527,11 +640,38 @@ private:
   }
 
   void publishViz() {
+    warnIfNoMap();
     publishGoalMarker();
     publishGeometricPath();
     publishPlannedPath();
     publishSearchTree();
     publishClearanceField();
+    publishCorridor();
+  }
+
+  // Until the first octomap arrives the planner cannot run at all (the core's
+  // worker idles), so say why rather than letting the node look healthy while
+  // nothing plans. The publisher count separates the two very different causes:
+  // zero publishers means the map source itself is not emitting — RTAB-Map only
+  // republishes its octomap on motion-gated map-graph updates, so it stays
+  // silent until the camera has moved AND odometry is good enough to add graph
+  // nodes. A non-zero count with nothing arriving instead points at the
+  // subscription (QoS or a wrong remap). Reports the resolved topic name, so a
+  // bad remap is visible directly. Stops entirely once a map has been received.
+  void warnIfNoMap() {
+    if (got_octomap_) return;
+    const char* topic = sub_map_->get_topic_name();
+    const size_t npub = count_publishers(topic);
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "No octomap received yet on '%s' (%zu publisher(s)) — the planner cannot run "
+        "without a map. %s",
+        topic, npub,
+        npub == 0
+            ? "Nothing is publishing it: check RTAB-Map is up, and move the camera — "
+              "it only emits on map-graph updates, which need good odometry."
+            : "Someone is publishing but nothing arrives: suspect a QoS mismatch or "
+              "the wrong topic remap.");
   }
 
   // The active goal as a single sphere marker, so it renders as a point in RViz
@@ -603,6 +743,89 @@ private:
     }
 
     pub_geom_path_->publish(arr);
+  }
+
+  // Debug-only (gated by DEBUG_PLANNER_VIZ): the corridor-QP pipeline's
+  // intermediate products, in one MarkerArray on /planner/corridor:
+  //   - "boxes": the free axis-aligned boxes the trajectory is confined to, as
+  //     semi-transparent CUBEs (alpha 0.2) so the map and trajectory stay
+  //     readable through them;
+  //   - "committed": the TRUNCATED prefix as a white line strip. Where it stops
+  //     short of the green /planner/geometric_path is exactly where truncation
+  //     cut the optimistic path against unknown space;
+  //   - "committed_goal": an orange sphere at the truncation endpoint — the
+  //     intermediate goal inside known-safe space, which should ratchet toward
+  //     the red final goal marker as the drone maps more of the room.
+  // Empty when the corridor QP is off, when a tick truncates to nothing, or
+  // when corridor construction failed — in all of those the array is just the
+  // DELETEALL, which erases the previous drawing rather than leaving a stale
+  // corridor on screen. Returns before touching the core when the debug flag
+  // is off (the core does not populate the snapshot then either).
+  void publishCorridor() {
+    if (!get_parameter("DEBUG_PLANNER_VIZ").as_bool()) return;
+    const auto snap = core_->corridorSnapshot();
+
+    visualization_msgs::msg::MarkerArray arr;
+    visualization_msgs::msg::Marker clear;
+    clear.header.frame_id = "map";
+    clear.header.stamp = now();
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+
+    int id = 0;
+    for (const auto& b : snap.boxes) {
+      visualization_msgs::msg::Marker cube;
+      cube.header.frame_id = "map";
+      cube.header.stamp = now();
+      cube.ns = "boxes";
+      cube.id = id++;
+      cube.type = visualization_msgs::msg::Marker::CUBE;
+      cube.action = visualization_msgs::msg::Marker::ADD;
+      cube.pose.position.x = 0.5 * (b.lo.x() + b.hi.x());
+      cube.pose.position.y = 0.5 * (b.lo.y() + b.hi.y());
+      cube.pose.position.z = 0.5 * (b.lo.z() + b.hi.z());
+      cube.pose.orientation.w = 1.0;
+      // A zero-extent axis (a box grown around an axis-aligned segment can be
+      // flat) would make RViz drop the marker; give it a visible sliver.
+      cube.scale.x = std::max(b.hi.x() - b.lo.x(), 0.02);
+      cube.scale.y = std::max(b.hi.y() - b.lo.y(), 0.02);
+      cube.scale.z = std::max(b.hi.z() - b.lo.z(), 0.02);
+      cube.color.r = 0.2f; cube.color.g = 0.8f; cube.color.b = 1.0f; cube.color.a = 0.2f;
+      arr.markers.push_back(cube);
+    }
+
+    if (snap.committed.size() >= 2) {
+      visualization_msgs::msg::Marker line;
+      line.header.frame_id = "map";
+      line.header.stamp = now();
+      line.ns = "committed";
+      line.id = 0;
+      line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      line.action = visualization_msgs::msg::Marker::ADD;
+      line.pose.orientation.w = 1.0;
+      line.scale.x = 0.04;  // line width [m]
+      line.color.r = 1.0f; line.color.g = 1.0f; line.color.b = 1.0f; line.color.a = 0.9f;
+      for (const auto& w : snap.committed) {
+        geometry_msgs::msg::Point p;
+        p.x = w.x(); p.y = w.y(); p.z = w.z();
+        line.points.push_back(p);
+      }
+      arr.markers.push_back(line);
+
+      visualization_msgs::msg::Marker end;
+      end.header = line.header;
+      end.ns = "committed_goal";
+      end.id = 0;
+      end.type = visualization_msgs::msg::Marker::SPHERE;
+      end.action = visualization_msgs::msg::Marker::ADD;
+      end.pose.position = line.points.back();
+      end.pose.orientation.w = 1.0;
+      end.scale.x = end.scale.y = end.scale.z = 0.25;  // sphere diameter [m]
+      end.color.r = 1.0f; end.color.g = 0.6f; end.color.b = 0.0f; end.color.a = 1.0f;
+      arr.markers.push_back(end);
+    }
+
+    pub_corridor_->publish(arr);
   }
 
   // Debug-only (gated by DEBUG_PLANNER_VIZ): the search tree from the most recent
@@ -701,6 +924,41 @@ private:
     pub_clearance_field_->publish(cloud);
   }
 
+  // Publishes exactly what the safety side of the pipeline sees as an obstacle:
+  // every occupied leaf of the conservative map handed to core_->setMap() (the
+  // raw octomap plus, when TREAT_FRONTIER_AS_OBSTACLE is on, the frontier
+  // voxels stamped occupied in onOctomap; the raw map alone otherwise). Not
+  // gated by DEBUG_PLANNER_VIZ — it fires once per octomap
+  // update (sparse, motion-gated), not per control tick, so it costs nothing on
+  // the flight-critical path.
+  void publishOccupancyMap(const octomap::OcTree& map) {
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.frame_id = "map";
+    cloud.header.stamp = now();
+    cloud.height = 1;
+    cloud.is_dense = true;
+    cloud.is_bigendian = false;
+
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2FieldsByString(1, "xyz");
+    mod.resize(map.size());
+
+    sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iy(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iz(cloud, "z");
+    std::size_t n = 0;
+    for (auto it = map.begin_leafs(), end = map.end_leafs(); it != end; ++it) {
+      if (!map.isNodeOccupied(*it)) continue;
+      *ix = static_cast<float>(it.getX());
+      *iy = static_cast<float>(it.getY());
+      *iz = static_cast<float>(it.getZ());
+      ++ix; ++iy; ++iz;
+      ++n;
+    }
+    mod.resize(n);
+    pub_occupancy_map_->publish(cloud);
+  }
+
   void publishPlannedPath() {
     const auto sampled = core_->sampledPlannedPath();
     if (sampled.empty()) return;
@@ -729,7 +987,13 @@ private:
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr sub_status_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_vio_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr sub_map_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_frontier_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_goal_;
+
+  // Latest frontier cloud (octomap_global_frontier_space), applied to each
+  // incoming octomap in onOctomap. Null until the first frontier arrives.
+  sensor_msgs::msg::PointCloud2::SharedPtr frontier_cloud_;
+  bool got_octomap_{false};  // has onOctomap ever fired? (see warnIfNoMap)
 
   rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
   rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_;
@@ -740,6 +1004,8 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_goal_marker_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_search_tree_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_clearance_field_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_occupancy_map_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_corridor_;
 
   rclcpp::TimerBase::SharedPtr control_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;

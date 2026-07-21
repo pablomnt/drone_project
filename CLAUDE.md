@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Answering style: be brief.** Lead with the answer. Don't develop reasoning at length unless asked.
+
+**HARD RULE — 30-second test budget.** Never let a test run longer than **30 s**: pass
+`--timeout 30` to `ctest`, and if something is still going at 30 s, **kill it** and report that it
+was killed. Do not wait it out, do not background it and check back, do not "give it another
+minute". **Never run the full suite** (`ctest` with no `-R`) — run only the specific fast test for
+what you changed, e.g. `ctest --test-dir build/core --timeout 30 -R corridor`. `planner` and
+`autonomy_core` drive real OMPL solves and are the slow ones; `planner` in particular has been
+observed spinning for **8+ minutes** — treat it as long-running and do not run it casually.
+
 ## Project
 
 `drone_project`: software for an autonomous vision-based quadcopter. The drone runs PX4 firmware,
@@ -87,14 +97,18 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
 
 ## Test / Lint
 
-- **Core unit tests (no ROS).** This is the primary test path and the proof the core is ROS-free:
+- **Core unit tests (no ROS).** This is the primary test path and the proof the core is ROS-free.
+  Always bound the run and select the test for what you changed — see the 30-second rule at the top
+  of this file:
   ```bash
   cmake -S src/core -B build/core -DDRONE_CORE_BUILD_TESTS=ON
   cmake --build build/core
-  ctest --test-dir build/core --output-on-failure
+  ctest --test-dir build/core --timeout 30 --output-on-failure -R corridor   # NOT the whole suite
   ```
   Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
-  OFF ≡ baseline), `flatness_mapper`, `planner`, `autonomy_core` (plan→track→watchdog).
+  OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (fast, map-free corridor-QP checks
+  against analytic oracles — run it with `ctest -R corridor` on every planning edit),
+  `autonomy_core` (plan→track→watchdog).
 - ROS packages use `ament_lint_auto` / `ament_lint_common` via `colcon test`; the python packages
   (`pc_publisher` C++ aside, `system_monitor_pkg`) carry the standard flake8/pep257/copyright triplet.
 
@@ -150,6 +164,13 @@ and the fast control thread:
   without the wall-hugging that pure `simplifyMax` would cause (a `kMaxShortcutSegment` cap keeps
   waypoint density for min-snap). Each tick logs one line (phase, committed cost, min clearance,
   blocked/why, outcome); OMPL's own console is set to `LOG_WARN` to keep the terminal clean.
+  A tick that **cannot** plan (no goal, or no map) logs `[plan] idle: …` naming the missing
+  precondition, on every change of reason and then every 5 s — otherwise "I sent a goal and nothing
+  happened" is indistinguishable from a dead worker, since the planning branch is the only one that
+  produces output. The node pairs this with a throttled warning while no octomap has arrived, which
+  reports the **resolved** map topic and its publisher count: zero publishers means the map source is
+  silent (RTAB-Map only emits on motion-gated map-graph updates, so it needs camera motion *and*
+  usable odometry), a non-zero count means a QoS or remap mismatch on our side.
 - **Trajectory generation (~1 Hz, `trajgen_period`):** re-anchors min-snap to current position.
   **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
   control stays on `kDirect` / POS_SP.
@@ -190,6 +211,29 @@ Module roles:
   time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a `Trajectory`
   of **per-segment polynomial coefficients + durations** (not sampled points) so the flatness mapper
   can differentiate it analytically.
+  **Corridor-QP trajectory generation (Stage 1, gated by `USE_CORRIDOR_QP`)** replaces plain
+  min-snap with a provably collision-free pipeline over a **dual map view** (see `setMap`): the
+  geometric search runs on the raw **optimistic** map (unknown = free, so EIT*/BIT* accept a goal
+  beyond the mapped frontier instead of failing "no goal states available"), while safety comes from
+  the **conservative** (frontier-stamped) view. `corridor.{hpp,cpp}`: `truncatePath` cuts the
+  committed path where conservative clearance drops below `FRONTIER_MARGIN` (required clearance
+  ramps with distance from the start — the escape-sphere idea without its dead band), `resamplePath`
+  + `growBox`/`buildCorridor` grow one maximal free axis-aligned box (at `CORRIDOR_MARGIN`) per
+  ≤`MAX_SEGMENT_LEN` piece, written against a **clearance oracle** (`CorridorClearanceFn`) so tests
+  drive them with analytic fields. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
+  solves degree-7 min-snap as an **OSQP QP** — monomial coefficients (same snap `Q`), C0–C4
+  continuity, rest-to-rest ends, Bézier control points of position confined to the boxes and of
+  vel/acc/jerk within per-axis `VMAX/AMAX/JMAX` (hull property ⇒ the whole curve complies; solved in
+  per-segment normalized time or OSQP stalls on conditioning), plus a feasibility-aware BOBYQA time
+  search (infeasible ⇒ flat penalty; velocity-consistent seed grown until feasible). Fallback ladder
+  in `runTrajgen`: corridor failure → plain min-snap on the **truncated prefix** (never the full
+  optimistic path); empty truncation → stage nothing (tracker rides out the old trajectory into the
+  stale hover-hold). Each fallback logs which stage failed and why — `truncated to N wp / L m`
+  (pipeline refusing to commit toward unknown space), `box growth FAILED … tightest conservative
+  clearance C m vs required M m` (raise the room or lower `CORRIDOR_MARGIN`), or `QP INFEASIBLE over
+  S boxes` (corridor fine, no trajectory fits it within `VMAX/AMAX/JMAX`). These are distinct faults
+  needing opposite fixes, hence distinct messages. A successful corridor logs one line only when
+  `DEBUG_PLANNER_VIZ` is on.
 - **`control`** — see the flight-critical note below.
 
 ### control (`core/control/`) — flight-critical, be careful
@@ -279,10 +323,19 @@ publish nothing and cost nothing when the flag is off:
   (0.15 m) samples of the cached EDT, colour near→far. Shows exactly what the clearance cost "sees",
   for tuning `CLEARANCE_WEIGHT` / `CLEARANCE_THRESHOLD`. Sampled on the worker thread only when the
   map changes.
+- `/planner/corridor` (`visualization_msgs/MarkerArray`) — the corridor-QP pipeline's intermediate
+  products: semi-transparent cyan **CUBEs** (alpha 0.2) for the free boxes the trajectory is confined
+  to, a white **line strip** for the truncated committed prefix, and an orange **sphere** at the
+  truncation endpoint (the intermediate goal in known-safe space, which should ratchet toward the red
+  goal marker as the room is mapped). Where the white line stops short of the green
+  `/planner/geometric_path` is where truncation cut the optimistic path. Needs `PLAN_TRAJECTORY` +
+  `USE_CORRIDOR_QP`; a failed trajgen tick clears it rather than leaving a stale corridor drawn.
 
 **Planning-related node parameters** (all live-reconfigurable via `onParameterChange`):
-- `PLAN_TRAJECTORY` (bool, default `false`) — geometry-first phase gate; set `true` to enable
-  min-snap + trajectory tracking.
+- `PLAN_TRAJECTORY` (bool, default `true`) — the geometry-first phase gate. False stops the worker
+  after the geometric search (path published for viz, control stays on `POS_SP`); true runs trajgen
+  and hands trajectories to the tracker. **Now defaulted true for Stage 1 bench validation** — set it
+  false to go back to pure geometric planning.
 - `RRT_MONITOR_PERIOD` (double, default `0.5` s) — path validity re-check cadence.
 - `RRT_IMPROVE_PERIOD` (double, default `5.0` s) — clearance-aware improvement search cadence.
 - `RRT_SOLVE_TIME` (double, default `5.0` s) — planner optimisation budget per solve (all planners
@@ -294,13 +347,67 @@ publish nothing and cost nothing when the flag is off:
   `geometric_planner.hpp`**; edit there and rebuild the core to tune a specific planner. (RRT*'s old
   `RRT_RANGE` param is gone — it's now `PlannerConfig::rrtstar.range`.)
 - `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
-- `CLEARANCE_WEIGHT` (double, default `4.0`) — obstacle-proximity penalty weight.
+- `CLEARANCE_WEIGHT` (double, default `1.0`) — obstacle-proximity penalty weight. Lowered from 4.0
+  during bench work; raising it pushes the search off the walls, which is one way to buy the corridor
+  stage the room it needs to grow boxes.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
-- `DEBUG_PLANNER_VIZ` (bool, default `false`) — **single switch** for the debug planner
-  visualisation (search tree + clearance field above). Off by default so a regular flight pays
-  nothing: with it false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is
-  never sampled, and the two publish methods early-return. Flip it true for a bench/tuning run; it is
-  live-reconfigurable, so no relaunch.
+- `DEBUG_PLANNER_VIZ` (bool, default `true`) — **single switch** for the debug planner
+  visualisation (search tree, clearance field, corridor). Designed to be zero-cost when off: with it
+  false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is never sampled, the
+  corridor snapshot is never taken, and the publish methods early-return. **Now defaulted true for
+  bench validation** — turn it off for a real flight so the NUC pays nothing for it.
+- `TREAT_FRONTIER_AS_OBSTACLE` (bool, default `true`) — stamp RTAB-Map's frontier cloud
+  (`/rtabmap/octomap_global_frontier_space`, remapped in the launch) as occupied voxels into a deep
+  **copy** of each incoming octomap, fed to the core as the **conservative** map view (the raw map
+  stays the optimistic search view — dual-map; a small keep-out ball around the drone stays
+  unstamped so it can root the search). With `USE_CORRIDOR_QP` off the search itself runs on the
+  conservative view (legacy behavior); with it on, the conservative view only drives truncation +
+  corridor. NOTE: on a fresh map almost everything is frontier — the drone is boxed in until it has
+  scanned its surroundings.
+- `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
+  short of the goal (the reachable point closest to it) instead of reporting "no path"; the worker
+  keeps advancing the endpoint as the map grows.
+- `USE_CORRIDOR_QP` (bool, default `true`) — switch trajgen from plain min-snap to the
+  corridor-constrained QP pipeline (see the planning module notes). Off = byte-identical legacy
+  trajgen. Needs `TREAT_FRONTIER_AS_OBSTACLE` for the frontier to count as unsafe (without it the
+  conservative view equals the raw map and nothing guards against unknown space).
+- `VMAX` / `AMAX` / `JMAX` (double, defaults `1.0` / `1.5` / `3.0`) — per-axis velocity /
+  acceleration / jerk limits enforced by the corridor QP (conservative box bounds; the true norm can
+  reach √3× in the corner case).
+- `FRONTIER_MARGIN` (double, default `0.5` m) — clearance the committed *path prefix* keeps from
+  unknown space (the truncation margin against the conservative EDT). Enforced exactly as set; a
+  committed point must still have strictly positive clearance whatever the value, so the prefix can
+  never reach into an occupied or unknown voxel.
+- `CORRIDOR_MARGIN` (double, default `0.5` m) — clearance the *corridor boxes* keep from obstacles
+  and unknown space. **This is a strictly harder test than the planner's `kCollisionMargin`**: the
+  search validates only its centreline (and exempts a sphere at the start), while box growth needs
+  the margin over a whole 3D region of the frontier-stamped map. A path that only just satisfies the
+  search therefore leaves no room to grow a box, and in tight indoor space this usually has to sit
+  **below** 0.5 m for a corridor to exist at all. Lowering it does not forfeit the safety
+  guarantee — the trajectory stays provably confined to the boxes, so it keeps exactly this
+  clearance. If `[trajgen] corridor: box growth FAILED` reports a tightest conservative clearance
+  below the required margin, this is the knob.
+- `MAX_SEGMENT_LEN` (double, default `2.0` m) — corridor resample cap; one free box per piece.
+
+**Planning mode matrix.** Three flags compose into the pipeline's operating modes. `PLAN_TRAJECTORY`
+gates trajgen entirely; `USE_CORRIDOR_QP` picks the trajgen algorithm; `TREAT_FRONTIER_AS_OBSTACLE`
+decides whether a conservative map view exists at all (without it the conservative view *is* the raw
+map, so nothing distinguishes unknown space from free space).
+
+| `PLAN_TRAJECTORY` | `USE_CORRIDOR_QP` | `TREAT_FRONTIER` | Search map | Trajgen | Guards unknown space |
+|---|---|---|---|---|---|
+| false | *(any)* | false | raw | none — control stays on `POS_SP` | n/a |
+| false | *(any)* | true | conservative | none — control stays on `POS_SP` | search only |
+| true | false | false | raw | plain min-snap | **no** |
+| true | false | true | conservative | plain min-snap | search only (trajectory may still cut corners between waypoints) |
+| true | true | false | raw | corridor QP | obstacles only — corridor is collision-free but unknown reads as free |
+| true | true | true | **optimistic** (raw) | corridor QP | **yes** — full Stage 1: optimistic search, conservative truncation + corridor |
+
+Notes: with `PLAN_TRAJECTORY=false` the corridor snapshot is never populated, so `/planner/corridor`
+stays empty regardless of the other flags — trajgen is where truncation and corridor growth happen.
+`BEST_EFFORT_GOAL` is orthogonal and matters whenever the goal is unreachable or unmapped: true
+(default) commits to the closest reachable point and ratchets forward, false holds. The last row is
+the only configuration that delivers the Stage 1 safety claim.
 
 > **Instrumentation principle (apply to any future debug/viz):** keep it behind a *single*,
 > *default-off* runtime parameter and make it *zero-cost when off* — no extraction, no allocation, no
@@ -310,6 +417,13 @@ publish nothing and cost nothing when the flag is off:
 **Additional dependency**: `libdynamicedt3d-dev` (apt, version-matched to octomap 1.9.7). Used in
 `autonomy_core.cpp` only; linked into `drone_core_autonomy`. Headers at
 `<dynamicEDT3D/dynamicEDTOctomap.h>`. Re-install if rebuilding on a fresh machine.
+
+**OSQP (corridor-QP solver)**: system CMake install at `/usr/local` (v1.x C API,
+`libosqpstatic.a`). Deliberately located as a **concrete library path** (`find_library` in
+`src/core/CMakeLists.txt`), *not* `find_package(osqp)`, and linked **PRIVATE** into
+`drone_core_planning` with the C API confined to `corridor_trajectory.cpp` — so the exported
+`drone_coreTargets.cmake` carries no `osqp::` target and consumers need no `find_dependency(osqp)`.
+The solver requires a double-precision OSQP build (static_assert on `OSQPFloat`).
 
 ### Frames & TF (OKVIS ↔ RTAB-Map) — why odom can look fine while the voxel map is wrong
 

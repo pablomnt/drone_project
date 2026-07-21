@@ -9,6 +9,7 @@
 
 #include "drone_core/common/types.hpp"
 #include "drone_core/control/trajectory_tracker.hpp"
+#include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/min_snap_trajectory.hpp"
 #include "drone_core/planning/geometric_planner.hpp"
 
@@ -35,7 +36,7 @@ public:
     Eigen::Vector3d vel_d{0.2, 0.2, 0.2};
     double hover_thrust{0.35};
     bool enable_feedforward{false};
-    double stale_timeout{0.5};        // hover-hold fallback threshold [s]
+    double stale_timeout{1.5};        // hover-hold fallback threshold [s]
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
     double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
     double rrt_solve_time{3.0};       // planner optimisation budget per solve [s]
@@ -44,9 +45,43 @@ public:
     // geometric_planner.hpp, the single place to tune them.
     planning::PlannerType planner_type{planning::PlannerType::RRTstar};
     double replan_improve_ratio{0.85};  // adopt candidate iff cost <= ratio*committed
+    // Best-effort goal seeking. When true, a goal in unreachable/unmapped space no
+    // longer yields "no path": the planner returns a route to the reachable point
+    // closest to the goal (the frontier edge), and the worker commits it and keeps
+    // advancing the endpoint as new space is mapped and the frontier recedes — the
+    // drone gets as close as it can and ratchets forward. When false the planner
+    // insists on (near-)exact arrival and holds if the goal is unreachable.
+    bool best_effort_goal{true};
     double clearance_weight{4.0};     // obstacle-proximity penalty weight
     double clearance_threshold{1.0};  // clearance saturation distance / EDT maxdist [m]
     double trajgen_period{1.0};       // local trajectory replan period [s]
+    // Corridor-QP trajectory generation (Stage 1). When true, runTrajgen
+    // replaces plain min-snap with the safe-corridor pipeline: truncate the
+    // committed path against the conservative map view (see setMap) so it never
+    // commits into unknown space, grow an axis-aligned free corridor along the
+    // safe prefix, and solve the corridor-constrained min-snap QP under the
+    // per-axis limits below. Any stage failing falls back to plain min-snap on
+    // the truncated prefix (or stages nothing when even truncation is empty, so
+    // the tracker's stale path holds). When false, trajgen is exactly the
+    // pre-corridor min-snap.
+    bool use_corridor_qp{false};
+    double vmax{1.0};              // per-axis velocity limit [m/s]
+    double amax{1.5};              // per-axis acceleration limit [m/s^2]
+    double jmax{3.0};              // per-axis jerk limit [m/s^3]
+    // Required clearance from unknown space for the committed trajectory [m].
+    // Enforced by truncation against the conservative (frontier-stamped) map;
+    // may exceed the collision margin (unknown is riskier than a mapped wall).
+    double frontier_margin{0.5};
+    // Clearance the corridor boxes must have from obstacles AND unknown space
+    // [m]. This is a strictly harder test than the planner's collision margin:
+    // the search only checks its centreline (and exempts a sphere at the
+    // start), whereas box growth needs this clearance over a whole 3D region.
+    // So a path that only just satisfies the search can leave no room to grow a
+    // box, and this must usually sit BELOW the planner's margin for the corridor
+    // to be constructible at all — the trajectory is still confined to the
+    // resulting boxes, so it stays this far from anything mapped or unknown.
+    double corridor_margin{0.5};
+    double max_segment_len{2.0};   // corridor resample cap: one box per piece [m]
     // When false the worker stops after RRT*: it stores the geometric path for
     // visualisation but never runs min-snap or hands a trajectory to the
     // tracker, so control keeps following the direct setpoint. Used to bring the
@@ -71,7 +106,19 @@ public:
 
   // Inputs (thread-safe).
   void setState(const common::State& state);
-  void setMap(const planning::MapHandle& map);
+  // Feed the occupancy map(s) — the dual-map view of the corridor pipeline.
+  // `map` is the raw (optimistic) map: unknown space reads as free, so the
+  // geometric search can chase a goal beyond the mapped frontier (informed
+  // planners refuse an unreachable goal outright). `conservative` is the
+  // frontier-stamped copy — unknown space reads as occupied — used for
+  // truncation, corridor growth and trajectory safety; pass nullptr when no
+  // frontier information is available (the raw map then serves both roles and
+  // nothing guards against unknown space, matching the pre-frontier behavior).
+  // With use_corridor_qp off and a conservative map present, the search runs on
+  // the conservative view instead — the legacy single-map behavior of
+  // TREAT_FRONTIER_AS_OBSTACLE.
+  void setMap(const planning::MapHandle& map,
+              const planning::MapHandle& conservative = nullptr);
   void setGoal(const common::Goal& goal);
 
   // Direct position/yaw setpoint for takeoff and manual hover. A fresh planner
@@ -119,12 +166,34 @@ public:
   // unless cfg.debug_planner_viz is set. Thread-safe copy.
   std::vector<std::array<double, 4>> clearanceSamples() const;
 
+  // Snapshot of the most recent corridor-QP trajgen, for debug visualisation.
+  // `committed` is the TRUNCATED prefix actually handed to the trajectory
+  // solver — its last point is the intermediate goal inside known-safe space,
+  // which ratchets toward the real goal as the map grows — and `boxes` are the
+  // free axis-aligned boxes grown along it (one per resampled segment), i.e.
+  // the region the trajectory is provably confined to. Comparing `committed`
+  // against geometricPath() shows exactly where truncation cut the optimistic
+  // path. Empty unless cfg.debug_planner_viz AND cfg.use_corridor_qp are set,
+  // and cleared whenever a trajgen tick truncates to nothing or fails to build
+  // a corridor, so a stale corridor is never drawn as if it were current.
+  // Thread-safe copy.
+  struct CorridorSnapshot {
+    std::vector<Eigen::Vector3d> committed;
+    std::vector<planning::Box> boxes;
+  };
+  CorridorSnapshot corridorSnapshot() const;
+
 private:
   double now() const { return clock_(); }
   bool runGlobalPlan(const common::State& state, const common::Goal& goal,
                      const planning::MapHandle& map,
                      std::vector<std::vector<double>>& path);
+  // Trajectory generation for the committed path. cons_edt is the distance
+  // field of the conservative map view (nullptr when unavailable): with
+  // use_corridor_qp set it drives truncation + corridor growth; without it (or
+  // with the flag off) trajgen is plain min-snap over the waypoints.
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
+                  const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
                   common::Trajectory& traj);
   void stagePending(const common::Trajectory& traj);
   void plannerLoop();
@@ -146,6 +215,14 @@ private:
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> clearanceField(
       const planning::MapHandle& map);
 
+  // Cached distance field over the conservative map view, for truncation and
+  // corridor growth. Mirrors clearanceField's rebuild-on-map-change caching;
+  // when the conservative and search maps are the same object (no frontier
+  // information), the search field is reused instead of building a second EDT.
+  // Worker thread only.
+  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> conservativeField(
+      const planning::MapHandle& map);
+
   // Sample the cached EDT on a coarse grid over the map's bounding box. Called
   // only from the planner worker thread (it reads edt_ / edt_source_map_, which
   // the worker owns), and only when debug_planner_viz is set.
@@ -158,7 +235,8 @@ private:
 
   mutable std::mutex io_mutex_;
   common::State state_;
-  planning::MapHandle map_;
+  planning::MapHandle map_;               // optimistic view (unknown = free)
+  planning::MapHandle conservative_map_;  // frontier-stamped view; may be null
   common::Goal goal_;
   bool has_goal_{false};
   bool new_goal_{false};  // raised by setGoal, consumed by the worker to force a replan
@@ -175,6 +253,7 @@ private:
   std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
   planning::GeometricPlanner::SearchTree last_search_tree_;  // debug viz; empty unless enabled
   std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
+  CorridorSnapshot last_corridor_;  // debug viz; empty unless corridor QP + viz on
 
   std::thread worker_;
   std::atomic<bool> running_{false};
@@ -185,6 +264,10 @@ private:
   // model for both collision validity and the clearance cost. See clearanceField.
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> edt_;
   planning::MapHandle edt_source_map_;
+  // Second cached field over the conservative map view (truncation + corridor).
+  // See conservativeField.
+  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> cons_edt_;
+  planning::MapHandle cons_edt_source_map_;
   planning::MapHandle viz_sampled_map_;  // map the debug clearance samples were taken from
 };
 

@@ -14,10 +14,17 @@
 
 #include "drone_core/common/logging.hpp"
 #include "drone_core/control/flatness_mapper.hpp"
+#include "drone_core/planning/corridor.hpp"
+#include "drone_core/planning/corridor_trajectory.hpp"
 
 namespace drone_core::autonomy {
 
 namespace {
+
+// How often the planner worker re-reports a persistent "cannot plan" state [s].
+// Slow enough not to bury the rest of the log, fast enough that a stalled bench
+// run explains itself while you are watching it.
+constexpr double kIdleLogPeriod = 5.0;
 
 double steadyNowSeconds() {
   const auto t = std::chrono::steady_clock::now().time_since_epoch();
@@ -111,9 +118,11 @@ void AutonomyCore::setState(const common::State& state) {
   state_ = state;
 }
 
-void AutonomyCore::setMap(const planning::MapHandle& map) {
+void AutonomyCore::setMap(const planning::MapHandle& map,
+                          const planning::MapHandle& conservative) {
   std::lock_guard<std::mutex> lock(io_mutex_);
   map_ = map;
+  conservative_map_ = conservative;
 }
 
 void AutonomyCore::setGoal(const common::Goal& goal) {
@@ -207,12 +216,14 @@ void AutonomyCore::stopPlanner() {
 bool AutonomyCore::planOnce() {
   common::State state;
   planning::MapHandle map;
+  planning::MapHandle conservative;
   common::Goal goal;
   bool has_goal = false;
   {
     std::lock_guard<std::mutex> lock(io_mutex_);
     state = state_;
     map = map_;
+    conservative = conservative_map_;
     goal = goal_;
     has_goal = has_goal_;
   }
@@ -223,7 +234,8 @@ bool AutonomyCore::planOnce() {
   if (!runGlobalPlan(state, goal, map, path)) return false;
 
   common::Trajectory traj;
-  if (!runTrajgen(path, now(), traj)) return false;
+  if (!runTrajgen(path, now(), conservativeField(conservative ? conservative : map), traj))
+    return false;
 
   stagePending(traj);
   return true;
@@ -270,6 +282,11 @@ std::vector<std::array<double, 4>> AutonomyCore::clearanceSamples() const {
   return last_clearance_samples_;
 }
 
+AutonomyCore::CorridorSnapshot AutonomyCore::corridorSnapshot() const {
+  std::lock_guard<std::mutex> lock(traj_mutex_);
+  return last_corridor_;
+}
+
 std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
   std::vector<std::array<double, 4>> out;
   if (!edt_ || !edt_source_map_) return out;
@@ -299,14 +316,137 @@ bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal&
                                  std::vector<std::vector<double>>& path) {
   planning::GeometricPlanner planner(map, cfg_.rrt_solve_time);
   planner.setPlannerType(cfg_.planner_type);
+  planner.setBestEffort(cfg_.best_effort_goal);
   const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
   const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
   return planner.planPath(start, goal_vec, path);
 }
 
 bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, double t0,
+                              const std::shared_ptr<DynamicEDTOctomap>& cons_edt,
                               common::Trajectory& traj) {
   if (path.size() < 2) return false;
+
+  if (cfg_.use_corridor_qp && cons_edt) {
+    // Corridor pipeline: truncate the (possibly optimistic) path to the prefix
+    // that is safely inside known-free space, grow one free box per resampled
+    // segment, and solve the corridor-constrained min-snap QP. Every stage runs
+    // against the conservative distance field, so unknown space counts as an
+    // obstacle throughout.
+    std::vector<Eigen::Vector3d> epath;
+    epath.reserve(path.size());
+    for (const auto& w : path) epath.emplace_back(w[0], w[1], w[2]);
+
+    const double maxd = std::max(cfg_.clearance_threshold, cfg_.frontier_margin);
+    const planning::CorridorClearanceFn cons_fn = [cons_edt, maxd](double x, double y,
+                                                                   double z) {
+      const double d = cons_edt->getDistance(octomap::point3d(
+          static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+      return d < 0.0 ? maxd : d;  // outside the EDT bbx => nothing mapped nearby
+    };
+
+    planning::CorridorParams params;
+    params.max_segment_len = cfg_.max_segment_len;
+    params.margin = cfg_.corridor_margin;
+
+    // Truncation enforces the configured frontier margin exactly — it is NOT
+    // floored by the corridor margin, so FRONTIER_MARGIN means what it says and
+    // the two stages can be tuned independently. Whatever it is set to, a
+    // committed point must still have strictly positive clearance, so the
+    // prefix can never reach into an occupied or unknown voxel.
+    const auto committed = planning::truncatePath(cons_fn, epath, cfg_.frontier_margin);
+
+    // Debug viz snapshot, published by the host. Cleared on every corridor tick
+    // and refilled only once a corridor is actually built, so a failed tick
+    // erases the drawing instead of leaving a stale corridor on screen. Costs
+    // nothing when debug_planner_viz is off.
+    const auto snapshotCorridor = [this](const std::vector<Eigen::Vector3d>& path,
+                                         const std::vector<planning::Box>& boxes) {
+      if (!cfg_.debug_planner_viz) return;
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      last_corridor_.committed = path;
+      last_corridor_.boxes = boxes;
+    };
+    snapshotCorridor({}, {});
+
+    if (committed.size() < 2) {
+      // Nothing of the path is safely committable (start hemmed in by frontier
+      // or obstacles). Stage nothing: the tracker rides out its current
+      // trajectory and falls to the stale hover-hold if this persists.
+      DRONE_LOG_INFO("[trajgen] corridor: truncation empty -> no new trajectory");
+      return false;
+    }
+
+    // Numbers for the logs below. "corridor QP failed" covered two very
+    // different faults — no free box could be grown, versus boxes fine but the
+    // QP infeasible — which need opposite fixes, so report them separately and
+    // quantify. The tightest CONSERVATIVE clearance is the number that explains
+    // a box-growth failure: the search validated its centreline against the
+    // optimistic map, while box growth needs this much room over a whole 3D
+    // region of the frontier-stamped map. Computed only on the paths that log.
+    const auto polylineLength = [](const std::vector<Eigen::Vector3d>& p) {
+      double len = 0.0;
+      for (std::size_t i = 0; i + 1 < p.size(); ++i) len += (p[i + 1] - p[i]).norm();
+      return len;
+    };
+    const auto minConservativeClearance = [&cons_fn](const std::vector<Eigen::Vector3d>& p) {
+      double lo = std::numeric_limits<double>::infinity();
+      for (std::size_t i = 0; i + 1 < p.size(); ++i) {
+        const double seg = (p[i + 1] - p[i]).norm();
+        const int n = std::max(1, static_cast<int>(std::ceil(seg / 0.05)));
+        for (int k = 0; k <= n; ++k) {
+          const Eigen::Vector3d q = p[i] + (static_cast<double>(k) / n) * (p[i + 1] - p[i]);
+          lo = std::min(lo, cons_fn(q.x(), q.y(), q.z()));
+        }
+      }
+      return lo;
+    };
+
+    // Truncation shortening the path is the pipeline refusing to commit toward
+    // unknown space — worth a line, since the endpoint it picked is where the
+    // drone will actually fly this cycle. Silent when the whole path survives.
+    if ((committed.back() - epath.back()).norm() > 1e-6) {
+      DRONE_LOG_INFO("[trajgen] corridor: truncated to " << committed.size() << " wp / "
+                     << polylineLength(committed) << " m of " << polylineLength(epath)
+                     << " m (frontier margin " << cfg_.frontier_margin << " m)");
+    }
+
+    std::vector<Eigen::Vector3d> resampled;
+    std::vector<planning::Box> boxes;
+    if (!planning::buildCorridor(cons_fn, committed, params, resampled, boxes)) {
+      DRONE_LOG_INFO("[trajgen] corridor: box growth FAILED over " << committed.size()
+                     << " wp / " << polylineLength(committed) << " m — tightest conservative "
+                     << "clearance " << minConservativeClearance(committed)
+                     << " m vs required " << params.margin
+                     << " m (CORRIDOR_MARGIN) -> min-snap fallback");
+    } else {
+      planning::CorridorTrajectoryOptimizer optimizer(
+          planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
+      if (optimizer.optimizeTrajectory(resampled, boxes, traj)) {
+        snapshotCorridor(resampled, boxes);
+        traj.t0 = t0;
+        if (cfg_.debug_planner_viz) {
+          DRONE_LOG_INFO("[trajgen] corridor: OK " << boxes.size() << " boxes / "
+                         << polylineLength(committed) << " m / " << traj.total_duration << " s");
+        }
+        return true;
+      }
+      DRONE_LOG_INFO("[trajgen] corridor: QP INFEASIBLE over " << boxes.size() << " boxes / "
+                     << polylineLength(committed) << " m — corridor built but no trajectory "
+                     << "fits it within VMAX/AMAX/JMAX -> min-snap fallback");
+    }
+
+    // Fall back to plain min-snap, but on the truncated prefix — the full path
+    // may run into unknown space, which plain min-snap knows nothing about.
+    std::vector<std::vector<double>> tpath;
+    tpath.reserve(committed.size());
+    for (const auto& w : committed) tpath.push_back({w.x(), w.y(), w.z()});
+    planning::MinSnapTimeOptimizer fallback;
+    if (!fallback.optimizeTrajectory(tpath, traj)) return false;
+    traj.t0 = t0;
+    return true;
+  }
+
   planning::MinSnapTimeOptimizer optimizer;
   if (!optimizer.optimizeTrajectory(path, traj)) return false;
   traj.t0 = t0;
@@ -339,6 +479,23 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
   return edt_;
 }
 
+std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
+    const planning::MapHandle& map) {
+  if (!map || map->size() == 0) {
+    cons_edt_.reset();
+    cons_edt_source_map_.reset();
+    return nullptr;
+  }
+  // No frontier information => the conservative view IS the search map; reuse
+  // its field rather than building a second identical EDT.
+  if (map == edt_source_map_ && edt_) return edt_;
+  if (map != cons_edt_source_map_) {
+    cons_edt_ = buildEdt(map, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
+    cons_edt_source_map_ = map;
+  }
+  return cons_edt_;
+}
+
 bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
                                            const planning::MapHandle& map) {
   auto edt = clearanceField(map);
@@ -358,11 +515,23 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
 void AutonomyCore::plannerLoop() {
   std::uint64_t run = 0;  // planner ticks taken (advanced only while a goal and map exist)
 
+  // Idle diagnostics. A tick that cannot plan produces no [plan] line at all,
+  // which from outside is indistinguishable from a crashed worker — "I sent a
+  // goal and nothing happens" has two very different causes (no goal reached
+  // the core, or no map has). Name the missing precondition instead of going
+  // quiet: log on every change of reason, then periodically so a persistent
+  // stall stays visible without spamming at the tick rate. Worker-thread
+  // locals, so this costs nothing once planning is running.
+  enum class Idle { kNone, kNoGoal, kNoMap };
+  Idle idle = Idle::kNone;
+  double last_idle_log = -1.0e9;
+
   while (running_.load()) {
     const double t = now();
 
     common::State state;
     planning::MapHandle map;
+    planning::MapHandle conservative;
     common::Goal goal;
     bool has_goal = false;
     bool new_goal = false;
@@ -370,6 +539,7 @@ void AutonomyCore::plannerLoop() {
       std::lock_guard<std::mutex> lock(io_mutex_);
       state = state_;
       map = map_;
+      conservative = conservative_map_;
       goal = goal_;
       has_goal = has_goal_;
       new_goal = new_goal_;
@@ -395,27 +565,39 @@ void AutonomyCore::plannerLoop() {
         last_geometric_path_ = p;
       };
 
+      // Which map view the geometric search (and the committed-path monitor)
+      // runs on. Corridor mode searches the OPTIMISTIC view — unknown reads as
+      // free, so the informed planners (BIT*/AIT*/EIT*) accept a goal beyond
+      // the mapped frontier instead of refusing it ("no goal states
+      // available"); safety against unknown space is enforced downstream by
+      // truncation + corridor, not by the search. Without corridor mode the
+      // legacy single-map behavior is preserved: the conservative
+      // (frontier-stamped) view, when present, is the one obstacle model.
+      const planning::MapHandle search_map =
+          (!cfg_.use_corridor_qp && conservative) ? conservative : map;
+
       // One planner per tick. Set the clearance field FIRST: it is now the single
       // obstacle model for both the collision check (clearance > margin) and the
       // cost, so the committed-path re-check below sees the same obstacles the
       // search would. The field is cached (rebuilt only on a map change), so this
       // is cheap on the common still-valid tick.
-      planning::GeometricPlanner planner(map, cfg_.rrt_solve_time);
+      planning::GeometricPlanner planner(search_map, cfg_.rrt_solve_time);
       planner.setPlannerType(cfg_.planner_type);
+      planner.setBestEffort(cfg_.best_effort_goal);
       planner.setRecordTree(cfg_.debug_planner_viz);
-      applyClearanceObjective(planner, map);
+      applyClearanceObjective(planner, search_map);
 
       // Debug-only: re-sample the clearance field when the map changes (the EDT
       // is now current for this tick). Gated so a regular flight never walks the
       // grid. Sampling only on map change keeps even a debug run cheap on a
       // static scene.
-      if (cfg_.debug_planner_viz && map != viz_sampled_map_) {
+      if (cfg_.debug_planner_viz && search_map != viz_sampled_map_) {
         auto samples = sampleClearanceField();
         {
           std::lock_guard<std::mutex> lock(traj_mutex_);
           last_clearance_samples_ = std::move(samples);
         }
-        viz_sampled_map_ = map;
+        viz_sampled_map_ = search_map;
       }
 
       const bool had_path = !cached_path_.empty();
@@ -443,6 +625,17 @@ void AutonomyCore::plannerLoop() {
         std::ostringstream os;
         os << cb.total << " (len=" << cb.length << " + clr_cost=" << cb.clearance << ")";
         return os.str();
+      };
+
+      // Straight-line distance from a path's endpoint to the goal. In best-effort
+      // mode a path may deliberately stop short (at the frontier edge), so this is
+      // how much of the goal still remains; the committed and a candidate path are
+      // compared on it to see which reaches closer.
+      auto gapToGoal = [&goal_vec](const std::vector<std::vector<double>>& p) {
+        if (p.empty()) return std::numeric_limits<double>::infinity();
+        const auto& e = p.back();
+        const double dx = e[0] - goal_vec[0], dy = e[1] - goal_vec[1], dz = e[2] - goal_vec[2];
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
       };
 
       if (path_invalid || improve_run) {
@@ -479,32 +672,52 @@ void AutonomyCore::plannerLoop() {
           // Improve — switch only past the hysteresis margin. RRT* is randomised,
           // so without the margin a near-identical re-solve would chatter.
           //
-          // Score the candidate against the committed path's *remaining* cost from
-          // the drone's current position, not its full original cost. Both candidate
-          // and remaining are rooted at the drone (`start`), so the margin is a fair
-          // like-for-like test; billing the full committed cost would let a candidate
-          // win automatically as the drone nears the goal (its root creeps closer
-          // while the committed cost still charges the already-traversed prefix).
+          // Two things can make a candidate better. (1) Reach: in best-effort mode a
+          // fresh solve may end closer to the goal than the committed path — new
+          // space was mapped, so the frontier, and the reachable point nearest the
+          // goal, moved forward. A candidate that closes the goal gap by more than
+          // kGoalProgress is adopted outright: advancing toward the goal outranks
+          // path cost, and its necessarily-longer route would otherwise lose the
+          // cost test below precisely because it reaches further. (2) Cost, at
+          // comparable reach: score the candidate against the committed path's
+          // *remaining* cost from the drone's current position, not its full
+          // original cost. Both are rooted at the drone (`start`), so the margin is
+          // a fair like-for-like test; billing the full committed cost would let a
+          // candidate win merely because the drone advanced (its root creeps toward
+          // the goal while the committed cost still charges the traversed prefix).
+          constexpr double kGoalProgress = 0.25;  // min gap reduction [m] to count as advancing
+          const double committed_gap = gapToGoal(cached_path_);
+          const double cand_gap =
+              solved ? planner.lastGoalGap() : std::numeric_limits<double>::infinity();
           const auto remaining = remainingCommittedSuffix(cached_path_, start);
           const double remaining_cost = planner.pathCost(remaining);
           const double threshold = cfg_.replan_improve_ratio * remaining_cost;
           const auto cand = planner.costBreakdown(candidate);
-          if (solved && cand.total <= threshold) {
+          if (solved && cand_gap < committed_gap - kGoalProgress) {
+            adopt(candidate);
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE best-effort ADVANCE gap "
+                           << committed_gap << "m -> " << cand_gap << "m (goal) cost=" << fmtCost(cand) << " clr="
+                           << planner.minClearance(candidate) << "m");
+          } else if (solved && cand_gap <= committed_gap + kGoalProgress && cand.total <= threshold) {
             adopt(candidate);
             DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
                            << " (committed=" << fmtCost(committed) << ") -> ADOPT cost=" << fmtCost(cand) << " clr="
                            << planner.minClearance(candidate) << "m");
           } else {
             DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
-                           << " clr=" << committed_clr << "m candidate cost="
-                           << (solved ? fmtCost(cand) : std::string("inf"))
-                           << " -> keep (need <=" << threshold << ")");
+                           << " clr=" << committed_clr << "m gap=" << committed_gap << "m candidate cost="
+                           << (solved ? fmtCost(cand) : std::string("inf")) << " gap="
+                           << (solved ? std::to_string(cand_gap) : std::string("inf"))
+                           << "m -> keep");
           }
         }
       } else {
-        // Monitor only: committed path still clear of obstacles.
+        // Monitor only: committed path still clear of obstacles. gap is how far the
+        // committed path's end still is from the goal — ~0 once the goal is reached,
+        // or the best-effort closest-approach distance while the drone is ratcheting
+        // toward a goal beyond the mapped frontier.
         DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed cost=" << fmtCost(committed)
-                       << " clr=" << committed_clr << "m -> OK");
+                       << " clr=" << committed_clr << "m gap=" << gapToGoal(cached_path_) << "m -> OK");
       }
 
       // Trajectory generation is the next pipeline stage; while plan_trajectory is
@@ -516,10 +729,24 @@ void AutonomyCore::plannerLoop() {
         std::vector<std::vector<double>> path = cached_path_;
         path.front() = {state.pos.x(), state.pos.y(), state.pos.z()};
         common::Trajectory traj;
-        if (runTrajgen(path, now(), traj)) {
+        if (runTrajgen(path, now(),
+                       conservativeField(conservative ? conservative : map), traj)) {
           stagePending(traj);
           last_trajgen_ = t;
         }
+      }
+      idle = Idle::kNone;  // planning again; a later stall re-reports immediately
+    } else {
+      const Idle reason = !has_goal ? Idle::kNoGoal : Idle::kNoMap;
+      if (reason != idle || t - last_idle_log >= kIdleLogPeriod) {
+        if (reason == Idle::kNoGoal) {
+          DRONE_LOG_INFO("[plan] idle: no goal set — nothing to plan toward");
+        } else {
+          DRONE_LOG_INFO("[plan] idle: goal set but no map yet — waiting for the first "
+                         "octomap; the planner cannot run without one");
+        }
+        idle = reason;
+        last_idle_log = t;
       }
     }
 

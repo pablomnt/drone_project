@@ -121,8 +121,34 @@ public:
   // from the PlannerConfig defaults in this header. Default is RRT*.
   void setPlannerType(PlannerType type) { planner_type_ = type; }
 
+  // Best-effort goal mode. Off (default): an approximate solution that stops more
+  // than kGoalFlexibility short of the goal is rejected (planPath returns false),
+  // so a goal in unreachable/unmapped space yields no path. On: that approximate
+  // solution is accepted and returned — a path to the reachable point closest to
+  // the goal (which, with frontier stamped as an obstacle, sits at the frontier
+  // edge pointing at the goal). Combined with continuous replanning this lets the
+  // host chase a goal through space as it is mapped, "getting as close as
+  // possible" and advancing as the frontier recedes. lastGoalGap() reports how far
+  // short the returned path stops.
+  void setBestEffort(bool on) { best_effort_ = on; }
+
+  // Straight-line distance [m] from the endpoint of the most recent planPath
+  // solution to the goal it was asked for: 0 for an exact solution, positive for
+  // an approximate (best-effort) one that stops short, +infinity if the last
+  // planPath found no solution at all. Lets the host score best-effort progress
+  // (a candidate reaching a smaller gap has advanced toward the goal).
+  double lastGoalGap() const { return last_goal_gap_; }
+
+  // How far short of the goal a solution may stop and still count as reaching it
+  // [m] (see kGoalFlexibility). Static so the host can decide "arrived" without a
+  // planner instance.
+  static constexpr double goalFlexibility() { return kGoalFlexibility; }
+
   // Plan from start to goal (each [x, y, z]); fills result_path with waypoints.
-  // Returns false if no solution is found within the planner time budget.
+  // Returns false if no solution is found within the planner time budget. In
+  // strict mode also returns false for an approximate solution stopping more than
+  // kGoalFlexibility from the goal; in best-effort mode (setBestEffort) such a
+  // solution is accepted and lastGoalGap() reports the residual.
   bool planPath(const std::vector<double>& start,
                 const std::vector<double>& goal,
                 std::vector<std::vector<double>>& result_path);
@@ -151,13 +177,22 @@ public:
   CostBreakdown costBreakdown(const std::vector<std::vector<double>>& path) const;
 
   // Smallest clearance (distance to the nearest obstacle, metres) along the path,
-  // sampled finely. Requires a clearance field (see setClearance); returns
-  // +infinity when none is set or the path has fewer than two points. Purely a
-  // diagnostic — it is what the validity check flags if it drops below the margin.
+  // sampled finely, considering only the points the validity check enforces —
+  // i.e. those outside the start escape sphere (points within kStartEscapeRadius
+  // of the first waypoint are exempt and skipped, mirroring isStateValid). So
+  // this reports the lowest clearance that could actually flag the path, not the
+  // absolute minimum. Requires a clearance field (see setClearance); returns
+  // +infinity when none is set, the path has fewer than two points, or every
+  // sampled point falls inside the escape sphere. Purely a diagnostic.
   double minClearance(const std::vector<std::vector<double>>& path) const;
 
   // The hard clearance the validity check enforces away from the start [m].
   double collisionMargin() const { return kCollisionMargin; }
+
+  // Radius [m] the host should leave frontier-free around the drone when stamping
+  // frontier as occupied (see kFrontierKeepOutRadius). Static so the ROS wrapper
+  // can read it without a planner instance.
+  static constexpr double frontierKeepOutRadius() { return kFrontierKeepOutRadius; }
 
   // Snapshot of the search tree from the most recent planPath, for debug
   // visualisation. `nodes` are the tree vertices in world XYZ; `edges` index
@@ -220,10 +255,22 @@ private:
   static constexpr double kStartMargin = 0.0;
   static constexpr double kStartEscapeRadius = 0.5;
 
+  // Radius [m] around the drone the host leaves frontier-free when burning
+  // frontier into the occupancy map (consumed by the ROS wrapper's frontier
+  // stamping, not the planner itself). Kept here beside kStartEscapeRadius since
+  // it serves the same "let a drone boxed in by unknown space still root the
+  // search" purpose. Must stay well below kStartEscapeRadius/kCollisionMargin so
+  // the surrounding frontier's margin reseals the gap — otherwise the planner
+  // could route out through the hole into (free-reading) unknown space.
+  static constexpr double kFrontierKeepOutRadius = 0.5;
+
   // Largest straight bypass [m] the clearance-aware shortcut will create. Caps
   // how much waypoint density it removes so the downstream min-snap optimiser
   // still has intermediate points on long runs instead of one giant segment.
   static constexpr double kMaxShortcutSegment = 4.0;
+
+  bool best_effort_ = false;    // accept approximate solutions (see setBestEffort)
+  double last_goal_gap_ = 0.0;  // residual goal distance of the last solve (see lastGoalGap)
 
   bool record_tree_ = false;  // capture the OMPL tree each solve (debug viz only)
   SearchTree last_tree_;      // tree from the most recent planPath

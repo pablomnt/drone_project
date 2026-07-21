@@ -146,6 +146,18 @@ bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
 
 double GeometricPlanner::minClearance(const std::vector<std::vector<double>>& path) const {
   if (!clearance_fn_ || path.size() < 2) return std::numeric_limits<double>::infinity();
+  // Only the region the validity check actually enforces is meaningful here:
+  // points within kStartEscapeRadius of the start are exempt (their margin drops
+  // to kStartMargin so a parked/lifting drone can root the search), so a tight
+  // clearance there is expected and would not block the path. Anchor the sphere
+  // at the first waypoint, mirroring isPathValid, and skip sampled points inside
+  // it so this reports the lowest clearance among the points that could actually
+  // flag the path. Returns +infinity if every sampled point is inside the sphere.
+  const std::array<double, 3> center{path.front()[0], path.front()[1], path.front()[2]};
+  auto insideEscape = [&](double x, double y, double z) {
+    const double dx = x - center[0], dy = y - center[1], dz = z - center[2];
+    return dx * dx + dy * dy + dz * dz <= kStartEscapeRadius * kStartEscapeRadius;
+  };
   double mind = std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i + 1 < path.size(); ++i) {
     const auto& a = path[i];
@@ -154,9 +166,11 @@ double GeometricPlanner::minClearance(const std::vector<std::vector<double>>& pa
     const int steps = std::max(1, static_cast<int>(std::ceil(seg / 0.05)));
     for (int s = 0; s <= steps; ++s) {
       const double u = static_cast<double>(s) / steps;
-      mind = std::min(mind, clearance_fn_(a[0] + u * (b[0] - a[0]),
-                                          a[1] + u * (b[1] - a[1]),
-                                          a[2] + u * (b[2] - a[2])));
+      const double x = a[0] + u * (b[0] - a[0]);
+      const double y = a[1] + u * (b[1] - a[1]);
+      const double z = a[2] + u * (b[2] - a[2]);
+      if (insideEscape(x, y, z)) continue;
+      mind = std::min(mind, clearance_fn_(x, y, z));
     }
   }
   return mind;
@@ -320,16 +334,26 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   }
 
   if (!solved) {
+    last_goal_gap_ = std::numeric_limits<double>::infinity();
     return false;
   }
 
+  // Distance from the returned solution's endpoint to the goal: 0 for an exact
+  // solution, getSolutionDifference() for an approximate one that stopped short.
+  // Recorded before any post-processing (which never moves the endpoint) so the
+  // host can score best-effort progress via lastGoalGap().
+  last_goal_gap_ = pdef->hasApproximateSolution() ? pdef->getSolutionDifference() : 0.0;
+
   // OMPL reports both exact and approximate solutions as "solved". An approximate
-  // solution stops short of the goal (the tree never connected to it). Accept one
-  // only if its endpoint is within kGoalFlexibility of the goal; otherwise reject
-  // the plan — the caller then treats this as no path (infinite cost) rather than
-  // committing the vehicle to a route that ends partway. getSolutionDifference()
-  // is the distance from the returned path's end to the goal.
-  if (pdef->hasApproximateSolution() && pdef->getSolutionDifference() > kGoalFlexibility) {
+  // solution stops short of the goal (the tree never connected to it). In strict
+  // mode accept one only if its endpoint is within kGoalFlexibility of the goal;
+  // otherwise reject the plan — the caller then treats this as no path (infinite
+  // cost) rather than committing the vehicle to a route that ends partway. In
+  // best-effort mode keep the approximate solution: it is the path to the
+  // reachable point closest to the goal, and the caller uses lastGoalGap() to
+  // decide how to act on the shortfall.
+  if (!best_effort_ &&
+      pdef->hasApproximateSolution() && pdef->getSolutionDifference() > kGoalFlexibility) {
     return false;
   }
 

@@ -30,6 +30,17 @@ if(NOT DYNAMICEDT3D_LIBRARY)
   message(FATAL_ERROR "dynamicEDT3D not found. Install libdynamicedt3d-dev.")
 endif()
 
+# OSQP (corridor-QP trajectory solver). Located as a concrete static-library
+# path — NOT via find_package(osqp) — so the exported drone_coreTargets.cmake
+# records an absolute path instead of the osqp::osqpstatic imported target,
+# and consumers need no find_dependency(osqp). Only the C API is used, in
+# planning/src, so no OSQP type reaches a public header.
+find_library(OSQP_LIBRARY NAMES osqpstatic osqp)
+find_path(OSQP_INCLUDE_DIR NAMES osqp.h PATH_SUFFIXES osqp)
+if(NOT OSQP_LIBRARY OR NOT OSQP_INCLUDE_DIR)
+  message(FATAL_ERROR "OSQP not found. Install libosqp-dev or the OSQP CMake package.")
+endif()
+
 if(DRONE_CORE_BUILD_TESTS)
   enable_testing()
 endif()
