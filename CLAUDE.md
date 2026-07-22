@@ -229,29 +229,53 @@ Module roles:
   `truncatePath` keeps using the EDT **clearance oracle**; tests drive both with analytic data. Faces
   are pulled in by `CORRIDOR_MARGIN` + the voxel half-diagonal (obstacle points are voxel *centres*),
   then each region is validated for a non-empty overlap with its neighbour, since C0 continuity pins
-  the junction into that intersection and shrinking can empty it. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
+  the junction into that intersection and shrinking can empty it. **The first region is the
+  exception** — see the start relaxation below. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
   solves degree-7 min-snap as an **OSQP QP** — monomial coefficients (same snap `Q`), C0–C4
   continuity, rest-to-rest ends, Bézier control points of position confined to the regions and of
   vel/acc/jerk within per-axis `VMAX/AMAX/JMAX` (hull property ⇒ the whole curve complies; solved in
   per-segment normalized time or OSQP stalls on conditioning), plus a feasibility-aware BOBYQA time
-  search (infeasible ⇒ flat penalty; velocity-consistent seed grown until feasible). Fallback ladder
-  in `runTrajgen`: corridor failure → plain min-snap on the **truncated prefix** (never the full
-  optimistic path); empty truncation → stage nothing (tracker rides out the old trajectory into the
-  stale hover-hold). Each fallback logs which stage failed and why — `truncated to N wp / L m`
+  search (infeasible ⇒ flat penalty; velocity-consistent seed grown until feasible).
+
+  **Failure stages nothing — there is no min-snap fallback under `USE_CORRIDOR_QP`.** Any corridor
+  failure (empty truncation, decomposition rejected, QP infeasible) makes `runTrajgen` return false,
+  so the tracker rides out whatever it already has and latches hover-hold after `STALE_TIMEOUT`.
+  There used to be a plain min-snap fallback on the truncated prefix; it was removed because min-snap
+  ignores obstacles entirely, which makes it least defensible in exactly the situation that produces
+  it — the corridor stage saying it cannot certify a safe trajectory. Standing still is the honest
+  answer. The caller does not advance `last_trajgen_` on false, so this retries every cadence and
+  recovers as soon as the map or the path allows a corridor. Each failure logs which stage failed and
+  why — `truncated to N wp / L m`
   (pipeline refusing to commit toward unknown space), `decomposition FAILED (<which check>) …
   tightest conservative clearance C m vs required M m` — the parenthetical names the actual check
-  that rejected it (margin shrink pushed a region past the start/goal, or two regions stopped
-  overlapping), since the clearance figure is context, not the cause — or `QP INFEASIBLE over S
-  regions` (corridor fine, no trajectory fits it within `VMAX/AMAX/JMAX`). These are distinct faults
-  needing opposite fixes, hence distinct messages. A successful corridor logs one line only when
-  `DEBUG_PLANNER_VIZ` is on.
+  that rejected it (two regions stopped overlapping, the goal fell outside the last region, or the
+  drone is inside/touching an occupied or unknown cell), since the clearance figure is context, not
+  the cause — or `QP INFEASIBLE over S regions` (corridor fine, no trajectory fits it within
+  `VMAX/AMAX/JMAX`). These are distinct faults needing opposite fixes, hence distinct messages. A
+  successful corridor logs one line only when `DEBUG_PLANNER_VIZ` is on.
 
-  **A known, correct-looking-wrong interaction.** `truncatePath` ramps its requirement near the drone
-  (`ESCAPE_RAMP_DIST`) so a vehicle in a tight pocket can root a path at all, but a convex region
-  cannot be "less safe at one end" — the corridor applies `CORRIDOR_MARGIN` uniformly, including
-  right next to the drone. So truncation can commit a short prefix the corridor then refuses. That is
-  the pipeline telling the truth (there is no trajectory with that clearance through that space), not
-  a bug to hunt.
+  **The start relaxation — why the first region is special.** `truncatePath` ramps its requirement to
+  *zero* at the drone (`ESCAPE_RAMP_DIST`) so a vehicle in a tight pocket can root a path at all. A
+  convex region has no interior gradient — one plane holds over the whole region — so a uniform
+  `CORRIDOR_MARGIN` next to the drone means truncation commits prefixes the corridor then refuses,
+  every tick, for a drone that is merely *near* a wall. `buildCorridor` closes that gap by relaxing
+  the first region, bounded in both available senses:
+  - **In extent.** The first segment is split at `ESCAPE_RAMP_DIST` (`CorridorParams::start_relax_dist`,
+    fed from the same ROS param), so reduced margin applies over that distance only and every later
+    region carries the full `CORRIDOR_MARGIN`. The split is the *only* place an extent bound can come
+    from, which is why it exists rather than just relaxing region 0 as-is (that would relax over a
+    whole `MAX_SEGMENT_LEN`).
+  - **In magnitude.** Region 0 is shrunk by the largest amount that still contains the drone —
+    `min_r(b_r − n_r·p_drone)`, one pass over the faces, no bisection — clamped to the full shrink.
+    Never more relaxation than the geometry forces, and it heals itself as the map fills in, with
+    nothing to retune. Growth-window planes can never trigger it: the window is sized `+ pull_in`
+    beyond what it wants to keep, so its slack always exceeds the shrink.
+
+  The floor is `voxel_half_diagonal`, and that is geometry rather than taste: below it the region
+  would contain points inside an occupied voxel's actual volume, not merely close to it. A drone
+  that close fails the corridor outright with its own message. `runTrajgen` logs `start margin
+  relaxed to X m` **unconditionally** (not behind `DEBUG_PLANNER_VIZ`) whenever it bites — it is the
+  number that says how much protection the first stretch of the flown trajectory actually has.
 - **`control`** — see the flight-critical note below.
 
 ### control (`core/control/`) — flight-critical, be careful
@@ -414,6 +438,10 @@ publish nothing and cost nothing when the flag is off:
   2.47 m path). A longer ramp commits further before demanding full clearance. `<= 0` disables the
   ramp entirely. Clearance must still be strictly positive everywhere, so leniency near the start is
   never blindness — the prefix cannot enter an occupied or unknown voxel at any setting.
+  **Also drives the corridor's start relaxation**: `buildCorridor` splits the first segment here, so
+  this one number is where "the vehicle is a special case" ends for both stages. `<= 0` disables the
+  relaxation too (uniform `CORRIDOR_MARGIN` everywhere, and a drone closer than that to anything
+  mapped or unknown gets no corridor at all).
 - `CORRIDOR_MARGIN` (double, default `0.4` m) — clearance the *corridor regions* keep from obstacles
   and unknown space. **This is a strictly harder test than the planner's `kCollisionMargin`**: the
   search validates only its centreline (and exempts a sphere at the start), while the corridor needs
@@ -423,13 +451,23 @@ publish nothing and cost nothing when the flag is off:
   half-width. If `[trajgen] corridor: decomposition FAILED` reports a tightest conservative clearance
   below the required margin, this is the knob.
 - `MAX_SEGMENT_LEN` (double, default `2.0` m) — corridor resample cap; one free region per piece.
-- `CORRIDOR_BBOX` (double[3], default `[0, 0, 0]` = derive) — **minimum usable** half-extents of the
+  **Lowering this is the lever against convex over-conservatism**: a region spanning a long segment
+  gets a plane cut across its *entire* length by one obstacle near the middle, so shorter segments
+  recover free volume next to complex geometry. Costs `S`: the QP is `24·S` variables and BOBYQA
+  searches in `S` dimensions. Do not lower it without pinning `CORRIDOR_BBOX` (below), or you give
+  back in region width what you gained in region length. Note the first segment is additionally split
+  at `ESCAPE_RAMP_DIST` for the start relaxation, so the true segment count can exceed
+  `ceil(L / MAX_SEGMENT_LEN)`.
+- `CORRIDOR_BBOX` (double[3], default `[1, 2, 2]`) — **minimum usable** half-extents of the
   region-growth window in the **segment-aligned** frame (component 0 = slack along the segment, 1/2 =
   lateral), not world axes. A floor, not a literal size: `buildCorridor` scales it with the longest
   segment (lateral ≥ segment length, along-track ≥ half of it, so consecutive regions overlap
   generously) and adds the margin pull-in on top, so the window planes can never eat into the volume
-  the trajectory can actually use. Raise a component for wider regions, at the cost of more obstacle
-  points per decomposition.
+  the trajectory can actually use. The default is exactly what `MAX_SEGMENT_LEN = 2.0` derives, so it
+  changes nothing at stock settings — it exists to **decouple the two knobs** the moment
+  `MAX_SEGMENT_LEN` is lowered, since a purely derived window would narrow in proportion. Raise a
+  component for wider regions, at the cost of more obstacle points per decomposition. All zeros
+  restores the purely derived behaviour.
 
 **Planning mode matrix.** Three flags compose into the pipeline's operating modes. `PLAN_TRAJECTORY`
 gates trajgen entirely; `USE_CORRIDOR_QP` picks the trajgen algorithm; `TREAT_FRONTIER_AS_OBSTACLE`
@@ -449,7 +487,9 @@ Notes: with `PLAN_TRAJECTORY=false` the corridor snapshot is never populated, so
 stays empty regardless of the other flags — trajgen is where truncation and corridor growth happen.
 `BEST_EFFORT_GOAL` is orthogonal and matters whenever the goal is unreachable or unmapped: true
 (default) commits to the closest reachable point and ratchets forward, false holds. The last row is
-the only configuration that delivers the Stage 1 safety claim.
+the only configuration that delivers the Stage 1 safety claim. Note the two `USE_CORRIDOR_QP=true`
+rows never fall back to min-snap: a corridor failure stages nothing and the vehicle hovers, so an
+unchecked polynomial is only reachable via the legacy `USE_CORRIDOR_QP=false` rows.
 
 > **Instrumentation principle (apply to any future debug/viz):** keep it behind a *single*,
 > *default-off* runtime parameter and make it *zero-cost when off* — no extraction, no allocation, no

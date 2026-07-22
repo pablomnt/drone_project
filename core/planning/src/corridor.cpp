@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -175,7 +176,8 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    std::vector<Eigen::Vector3d>& resampled_out,
                    std::vector<ConvexRegion>& regions_out,
                    std::string* reason,
-                   CorridorAttempt* attempt) {
+                   CorridorAttempt* attempt,
+                   double* start_margin) {
   // The primary outputs are always cleared on failure so a rejected corridor
   // can never be flown; `attempt` deliberately survives so the host can draw
   // what was rejected.
@@ -193,6 +195,26 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
 
   resampled_out = resamplePath(path, p.max_segment_len);
   if (resampled_out.size() < 2) return fail("resampling produced fewer than 2 waypoints");
+
+  // Confine the start relaxation below to a SHORT first region by splitting the
+  // first segment at start_relax_dist. Without this the relaxed region is a
+  // whole max_segment_len long, so a drone that needs 10 cm of leniency to get
+  // off the ground would fly two metres at reduced margin. The split is what
+  // makes the relaxation bounded in extent — a convex region has no interior
+  // gradient, so this is the only place that bound can come from. Skipped when
+  // the first segment is already short enough (it is then already inside the
+  // relax distance) or when the leftover piece would be a sliver, since a
+  // near-zero segment gives the QP's time allocation a degenerate T.
+  if (p.start_relax_dist > 0.0) {
+    constexpr double kMinSplitPiece = 0.15;
+    const Eigen::Vector3d& a = resampled_out[0];
+    const Eigen::Vector3d& b = resampled_out[1];
+    const double L = (b - a).norm();
+    if (p.start_relax_dist >= kMinSplitPiece && L > p.start_relax_dist + kMinSplitPiece) {
+      resampled_out.insert(resampled_out.begin() + 1,
+                           a + (p.start_relax_dist / L) * (b - a));
+    }
+  }
 
   // DecompUtil's ellipsoid decomposition: per segment, inflate an ellipsoid
   // spanning it and cut a half-space at each obstacle point in the order they
@@ -265,12 +287,45 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
       offsets.push_back(lc.b()(r) / norm);
     }
     const int rows = static_cast<int>(normals.size());
+
+    // The first region gets the largest shrink that still contains the drone,
+    // rather than the full one. The QP equality-constrains the trajectory to
+    // start at the vehicle's position, so a first region that excludes it is
+    // infeasible outright — and truncatePath, by design, hands us a start whose
+    // required clearance ramps to ZERO at the drone, so on a thin map the two
+    // stages disagree by construction and the corridor is refused every tick.
+    // Since every face is a plane and offsets carry metric distance, the
+    // vehicle's slack against face r is offsets[r] - n_r.p, and the tightest of
+    // those is the most we can pull in. Two things make this safe to do:
+    //   - It never relaxes more than it must. Give the drone room and the min
+    //     rises above pull_in, the clamp binds, and this is a no-op — the
+    //     relaxation heals itself as the map fills in, with no parameter to
+    //     retune.
+    //   - It never crosses the line from "less margin" into "into the
+    //     obstacle": the floor is voxel_half_diagonal, below which the region
+    //     would contain points inside an occupied voxel's actual volume rather
+    //     than merely close to it. That floor is geometry, not taste, which is
+    //     why there is no tunable minimum here.
+    // Deliberately NOT applied to later regions: the whole point of the split
+    // above is that leniency stops at start_relax_dist.
+    double shrink = pull_in;
+    if (s == 0 && p.start_relax_dist > 0.0) {
+      constexpr double kBoundarySlack = 1e-3;  // keep the QP off an exact face
+      double slack = std::numeric_limits<double>::infinity();
+      for (int r = 0; r < rows; ++r) {
+        slack = std::min(slack, offsets[r] - normals[r].dot(resampled_out.front()));
+      }
+      shrink = std::min(pull_in, slack - kBoundarySlack);
+      if (shrink < p.voxel_half_diagonal) shrink = p.voxel_half_diagonal;
+    }
+    if (s == 0 && start_margin) *start_margin = shrink - p.voxel_half_diagonal;
+
     ConvexRegion region;
     region.A.resize(rows, 3);
     region.b.resize(rows);
     for (int r = 0; r < rows; ++r) {
       region.A.row(r) = normals[r];
-      region.b(r) = offsets[r] - pull_in;
+      region.b(r) = offsets[r] - shrink;
     }
     if (attempt) {
       ConvexRegion raw;
@@ -293,10 +348,19 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
   // pair. Exact emptiness needs an LP; instead sample candidate points along
   // the mid[s] -> junction -> mid[s+1] polyline and accept the first inside
   // both regions. Approximate in the safe direction: it can fail a corridor
-  // whose overlap is real but sliver-thin (min-snap fallback, correct-ish),
-  // and never passes an empty one.
+  // whose overlap is real but sliver-thin (costing a tick of progress), and
+  // never passes an empty one.
+  // With the adaptive shrink above, the first region can only miss the drone if
+  // it was already outside the UNSHRUNK region or within half a voxel of it —
+  // i.e. the conservative map says the vehicle is in, or touching, an occupied
+  // or unknown cell. That is a different fault from a margin that was merely
+  // too greedy, and needs a different response (look at the map or the state
+  // estimate, not at CORRIDOR_MARGIN), so it says so.
   if (!regions_out.front().contains(resampled_out.front())) {
-    return fail("margin shrink pushed the first region past the start position");
+    return fail(p.start_relax_dist > 0.0
+                    ? "the drone's position is inside (or within half a voxel of) an occupied "
+                      "or unknown cell on the conservative map"
+                    : "margin shrink pushed the first region past the start position");
   }
   if (!regions_out.back().contains(resampled_out.back())) {
     return fail("margin shrink pushed the last region past the goal position");

@@ -308,10 +308,12 @@ int main() {
     } else {
       failures += checkRegionClearance(diag, obs, {-1, -1, 0.5}, {3, 3, 1.5}, dp.margin,
                                        "diagonal");
-      // The region must actually admit the path it was grown around.
-      if (!diag.front().contains(Eigen::Vector3d(1, 1, 1))) {
-        std::cerr << "FAIL: diagonal region excludes its own segment midpoint\n";
-        ++failures;
+      // Every region must actually admit the segment it was grown around.
+      for (std::size_t s = 0; s < diag.size(); ++s) {
+        if (!diag[s].contains(0.5 * (resampled[s] + resampled[s + 1]))) {
+          std::cerr << "FAIL: diagonal region " << s << " excludes its own segment midpoint\n";
+          ++failures;
+        }
       }
     }
   }
@@ -365,7 +367,9 @@ int main() {
     std::vector<ConvexRegion> c3;
     std::string why;
     drone_core::planning::CorridorAttempt attempt;
-    const bool ok = drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 1.5, 1}}, params,
+    CorridorParams np = params;
+    np.start_relax_dist = 0.0;  // uniform margin: this asserts the shrink itself
+    const bool ok = drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 1.5, 1}}, np,
                                                         r3, c3, &why, &attempt);
     if (ok) {
       std::cerr << "FAIL: a 0.5 m gap was accepted at a 0.4 m margin\n";
@@ -394,6 +398,106 @@ int main() {
         std::cerr << "FAIL: shrunk region still has volume in a 0.5 m gap at 0.4 m margin\n";
         ++failures;
       }
+    }
+  }
+
+  // ------------------------------------------------- start relaxation ------
+  // A drone parked closer to something than the margin. truncatePath ramps its
+  // requirement to zero at the vehicle so a path can still be rooted; the
+  // corridor has to meet it there or the pipeline refuses to move a drone that
+  // is merely near a wall. Obstacle sits 0.25 m BEHIND the start so only the
+  // first region is affected — later regions' growth windows do not reach it,
+  // which is what lets the test assert the relaxation is bounded in extent.
+  {
+    std::vector<Eigen::Vector3d> obs;
+    for (double x = -0.3; x <= 0.3; x += 0.1) {
+      for (double z = 0.7; z <= 1.3; z += 0.1) obs.emplace_back(x, -0.25, z);
+    }
+    const std::vector<Eigen::Vector3d> path = {{0, 0, 1}, {0, 3, 1}};
+
+    // Control: with the relaxation disabled this is exactly the failure seen on
+    // the bench — the full shrink puts the first region's back face in front of
+    // the drone. The pair is the point; either half alone proves nothing.
+    {
+      CorridorParams sp = params;
+      sp.start_relax_dist = 0.0;
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      std::string why;
+      if (drone_core::planning::buildCorridor(obs, path, sp, r, c, &why)) {
+        std::cerr << "FAIL: uniform margin accepted a start 0.25 m from an obstacle "
+                     "at a 0.4 m margin\n";
+        ++failures;
+      }
+    }
+
+    CorridorParams sp = params;
+    sp.start_relax_dist = 1.0;
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double start_margin = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, path, sp, r, c, &why, nullptr,
+                                             &start_margin)) {
+      std::cerr << "FAIL: start relaxation did not rescue a hemmed-in start (" << why << ")\n";
+      ++failures;
+    } else {
+      // Relaxed to what the geometry allows, and no further: the drone has
+      // 0.25 m, so that is what the first region keeps — not zero, and not the
+      // full margin either.
+      if (start_margin > 0.25 + kTol || start_margin < 0.25 - 0.01) {
+        std::cerr << "FAIL: start margin " << start_margin
+                  << " m is not the 0.25 m the geometry actually allows\n";
+        ++failures;
+      }
+      if (!c.front().contains(r.front())) {
+        std::cerr << "FAIL: relaxed first region still excludes the drone\n";
+        ++failures;
+      }
+      // Bounded in extent: the split puts the relaxed region's far end at
+      // start_relax_dist, so full margin resumes there.
+      if (std::abs((r[1] - r[0]).norm() - sp.start_relax_dist) > kTol) {
+        std::cerr << "FAIL: first segment is " << (r[1] - r[0]).norm()
+                  << " m, not the relax distance " << sp.start_relax_dist << " m\n";
+        ++failures;
+      }
+      if (c.size() < 2) {
+        std::cerr << "FAIL: no region beyond the relaxed one to carry the full margin\n";
+        ++failures;
+      } else {
+        const std::vector<ConvexRegion> beyond(c.begin() + 1, c.end());
+        failures += checkRegionClearance(beyond, obs, {-1, -0.5, 0.5}, {1, 3.5, 1.5},
+                                         sp.margin, "beyond-relaxation");
+      }
+      // And it still has to produce a flyable trajectory, not just geometry.
+      Trajectory rt;
+      if (!opt.optimizeTrajectory(r, c, rt)) {
+        std::cerr << "FAIL: no trajectory fits the relaxed corridor\n";
+        ++failures;
+      } else {
+        failures += checkTrajectory(rt, r.front(), r.back(), c, limits, "relaxed-start");
+      }
+    }
+  }
+
+  // The relaxation has a floor that is geometry, not taste: below half a voxel
+  // the region would contain points inside an occupied cell's actual volume, so
+  // a drone that close is a hard failure rather than a smaller margin.
+  {
+    CorridorParams sp = params;
+    sp.start_relax_dist = 1.0;
+    sp.voxel_half_diagonal = 0.05;
+    std::vector<Eigen::Vector3d> obs;
+    for (double x = -0.3; x <= 0.3; x += 0.1) {
+      for (double z = 0.7; z <= 1.3; z += 0.1) obs.emplace_back(x, -0.03, z);
+    }
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    if (drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 3, 1}}, sp, r, c, &why) ||
+        !r.empty() || !c.empty()) {
+      std::cerr << "FAIL: a start inside a voxel was relaxed into instead of rejected\n";
+      ++failures;
     }
   }
 

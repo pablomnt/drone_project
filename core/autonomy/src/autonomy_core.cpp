@@ -350,6 +350,11 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     params.max_segment_len = cfg_.max_segment_len;
     params.margin = cfg_.corridor_margin;
     params.local_bbox = cfg_.corridor_bbox;
+    // Same distance the truncation ramp uses, and for the same reason: it is
+    // how far from the drone we accept reduced clearance in exchange for being
+    // able to move at all. Sharing the parameter keeps the two stages from
+    // disagreeing about where the vehicle stops being a special case.
+    params.start_relax_dist = cfg_.escape_ramp_dist;
     // Obstacle points are voxel centres; the corridor must clear the voxel's
     // worst-case corner, so tell it the map's half-diagonal.
     params.voxel_half_diagonal = cons_map->getResolution() * std::sqrt(3.0) / 2.0;
@@ -478,16 +483,30 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     std::vector<planning::ConvexRegion> regions;
     std::string why;
     planning::CorridorAttempt attempt;
+    double start_margin = params.margin;
     if (!planning::buildCorridor(obstacles, committed, params, resampled, regions, &why,
-                                 cfg_.debug_planner_viz ? &attempt : nullptr)) {
+                                 cfg_.debug_planner_viz ? &attempt : nullptr, &start_margin)) {
       snapshotRegions(attempt, /*accepted=*/false);
       DRONE_LOG_INFO("[trajgen] corridor: decomposition FAILED (" << why << ") over "
                      << committed.size() << " wp / " << polylineLength(committed)
                      << " m — tightest conservative clearance "
                      << minConservativeClearance(committed) << " m vs required " << params.margin
                      << " m (CORRIDOR_MARGIN), " << obstacles.size()
-                     << " obstacle pts -> min-snap fallback");
+                     << " obstacle pts -> no new trajectory");
+      return false;
     } else {
+      // A corridor bought with reduced clearance around the vehicle is not the
+      // same event as one that cleared the full margin, so it never passes
+      // silently — this is the one number that says how much protection the
+      // first stretch of the flown trajectory actually has. Logged
+      // unconditionally (not behind debug_planner_viz, unlike the OK line): it
+      // is a safety fact, not a debugging aid.
+      if (start_margin < params.margin - 1e-6) {
+        DRONE_LOG_INFO("[trajgen] corridor: start margin relaxed to " << start_margin
+                       << " m (of " << params.margin << " m) over the first "
+                       << params.start_relax_dist
+                       << " m — the drone is hemmed in; full margin applies beyond that");
+      }
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
       snapshotRegions(attempt, /*accepted=*/true);
@@ -501,18 +520,21 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       }
       DRONE_LOG_INFO("[trajgen] corridor: QP INFEASIBLE over " << regions.size() << " regions / "
                      << polylineLength(committed) << " m — corridor built but no trajectory "
-                     << "fits it within VMAX/AMAX/JMAX -> min-snap fallback");
+                     << "fits it within VMAX/AMAX/JMAX -> no new trajectory");
     }
 
-    // Fall back to plain min-snap, but on the truncated prefix — the full path
-    // may run into unknown space, which plain min-snap knows nothing about.
-    std::vector<std::vector<double>> tpath;
-    tpath.reserve(committed.size());
-    for (const auto& w : committed) tpath.push_back({w.x(), w.y(), w.z()});
-    planning::MinSnapTimeOptimizer fallback;
-    if (!fallback.optimizeTrajectory(tpath, traj)) return false;
-    traj.t0 = t0;
-    return true;
+    // Every corridor failure path ends here, and it stages NOTHING. There used
+    // to be a plain min-snap fallback on the truncated prefix, which was a
+    // mistake: min-snap knows nothing about obstacles, so the one situation
+    // that produced it — the corridor stage saying it cannot guarantee a safe
+    // trajectory — is exactly the situation in which an unchecked polynomial is
+    // least defensible. Staging nothing means the tracker rides out whatever it
+    // already has and, if this persists past STALE_TIMEOUT, latches the current
+    // position and holds. Standing still is the only honest answer when the
+    // corridor cannot certify moving. Note the caller does not advance
+    // last_trajgen_ on false, so this retries next tick and recovers the moment
+    // the map or the path allows a corridor again.
+    return false;
   }
 
   planning::MinSnapTimeOptimizer optimizer;

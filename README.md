@@ -107,7 +107,15 @@ inside the core.
   seeded on a diagonal segment's bounding box is mostly volume the path never visits, so it is
   rejected by geometry the drone would never approach. Faces are then pulled in by the margin plus
   the voxel half-diagonal (obstacle points are voxel *centres*), and each region is checked for a
-  non-empty overlap with its neighbour, since C0 continuity pins the junction into that intersection. `CorridorTrajectoryOptimizer` solves the trajectory as a **QP** (OSQP): degree-7
+  non-empty overlap with its neighbour, since C0 continuity pins the junction into that intersection.
+  The **first** region is relaxed, because a convex region has no interior gradient: one plane holds
+  over the whole region, so a uniform margin next to the drone would refuse every prefix truncation
+  deliberately committed for a vehicle parked near a wall. The relaxation is bounded in extent (the
+  first segment is split at `ESCAPE_RAMP_DIST`; every later region keeps the full margin) and in
+  magnitude (the region is shrunk by the largest amount that still contains the drone, so it relaxes
+  no more than the geometry forces and heals itself as the map fills in), with a floor at half a
+  voxel diagonal — below that the region would contain points inside an occupied cell rather than
+  merely close to it, which is a hard failure instead. `CorridorTrajectoryOptimizer` solves the trajectory as a **QP** (OSQP): degree-7
   segments in the monomial basis, reusing the same snap cost matrix, with C⁰–C⁴ continuity and
   rest-to-rest ends as equalities, and the **Bézier** control points of position confined to the
   regions and of velocity/acceleration/jerk bounded per axis by `VMAX`/`AMAX`/`JMAX` as
@@ -120,7 +128,10 @@ inside the core.
   penalty so it is pushed back toward feasibility. Everything is written against a **clearance
   oracle** (`CorridorClearanceFn`, the same shape as the planner's `ClearanceFn`) rather than against
   octomap directly, so region growth and truncation are unit-tested with analytic data. Any stage
-  failing falls back to plain min-snap on the truncated prefix, logging which stage failed and why.
+  failing stages **nothing** — no trajectory is handed to the tracker, which rides out what it has
+  and then hovers — and logs which stage failed and why. There is deliberately no min-snap fallback
+  here: min-snap ignores obstacles, which makes it least defensible in precisely the situation that
+  would produce it, namely the corridor stage reporting that it cannot certify a safe trajectory.
 
 ### `control/` — flight-critical, handle with care
 
@@ -328,7 +339,8 @@ ctest --test-dir build/core --output-on-failure
 
 Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
 OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (truncation, polyhedral corridor generation
-and the corridor QP, against analytic clearance fields and synthetic obstacle clouds — fast, no map),
+including the start relaxation and its floor, and the corridor QP, against analytic clearance fields
+and synthetic obstacle clouds — fast, no map),
 `autonomy_core` (plan→track→watchdog).
 
 **Keep any test run under 30 s** (`ctest --timeout 30 -R <name>`) and never run the full suite —

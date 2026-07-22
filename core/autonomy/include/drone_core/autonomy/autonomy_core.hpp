@@ -58,12 +58,13 @@ public:
     // Corridor-QP trajectory generation (Stage 1). When true, runTrajgen
     // replaces plain min-snap with the safe-corridor pipeline: truncate the
     // committed path against the conservative map view (see setMap) so it never
-    // commits into unknown space, grow an axis-aligned free corridor along the
-    // safe prefix, and solve the corridor-constrained min-snap QP under the
-    // per-axis limits below. Any stage failing falls back to plain min-snap on
-    // the truncated prefix (or stages nothing when even truncation is empty, so
-    // the tracker's stale path holds). When false, trajgen is exactly the
-    // pre-corridor min-snap.
+    // commits into unknown space, grow a convex polyhedral free corridor along
+    // the safe prefix, and solve the corridor-constrained min-snap QP under the
+    // per-axis limits below. Any stage failing stages NOTHING — there is no
+    // min-snap fallback here, since min-snap ignores obstacles and the only
+    // thing that produces this path is the corridor reporting it cannot certify
+    // a safe trajectory. The tracker rides out what it has and hovers at
+    // stale_timeout. When false, trajgen is exactly the pre-corridor min-snap.
     bool use_corridor_qp{false};
     double vmax{1.0};              // per-axis velocity limit [m/s]
     double amax{1.5};              // per-axis acceleration limit [m/s^2]
@@ -89,11 +90,12 @@ public:
     // commits further before demanding full clearance. <= 0 disables the ramp.
     double escape_ramp_dist{1.0};
     double max_segment_len{2.0};   // corridor resample cap: one region per piece [m]
-    // Half-extents of the region-growth window in the SEGMENT-ALIGNED frame
-    // (x along the segment, y/z lateral) — not world axes. Caps how far a
-    // corridor region may extend from its segment, and with it how much of the
-    // obstacle cloud each decomposition considers.
-    Eigen::Vector3d corridor_bbox{2.0, 2.0, 1.0};
+    // Minimum half-extents of the region-growth window in the SEGMENT-ALIGNED
+    // frame (x along the segment, y/z lateral) — not world axes. A floor, not a
+    // cap: buildCorridor raises it to scale with the longest segment. Pinning
+    // it keeps the window from narrowing when max_segment_len is lowered, which
+    // would otherwise trade a region's length for its width.
+    Eigen::Vector3d corridor_bbox{1.0, 2.0, 2.0};
     // When false the worker stops after RRT*: it stores the geometric path for
     // visualisation but never runs min-snap or hands a trajectory to the
     // tracker, so control keeps following the direct setpoint. Used to bring the

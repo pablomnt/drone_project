@@ -240,8 +240,8 @@ private:
     // conservative map (needs TREAT_FRONTIER_AS_OBSTACLE for the frontier to
     // count), and the trajectory is a corridor-constrained min-snap QP that
     // provably stays in known-free space within the per-axis limits below. Any
-    // stage failing falls back to plain min-snap on the truncated prefix.
-    // Live-reconfigurable; default off until bench-validated.
+    // stage failing stages nothing and the vehicle hovers rather than flying an
+    // obstacle-blind polynomial. Live-reconfigurable.
     declare_parameter("USE_CORRIDOR_QP", true);
     declare_parameter("VMAX", 1.0);   // per-axis velocity limit [m/s]
     declare_parameter("AMAX", 1.5);   // per-axis acceleration limit [m/s^2]
@@ -271,12 +271,21 @@ private:
     declare_parameter("MAX_SEGMENT_LEN", 2.0);
     // MINIMUM usable half-extents of the corridor region-growth window, in the
     // SEGMENT-ALIGNED frame (0 = slack along the segment, 1/2 = lateral) — not
-    // world axes. All zeros (the default) means "derive it": the window scales
-    // with the longest segment and the margin shrink is added on top, so the
-    // window planes never eat into the volume the trajectory can use. Raise a
-    // component to let regions grow wider than the segments themselves, at the
-    // cost of more obstacle points per decomposition.
-    declare_parameter<std::vector<double>>("CORRIDOR_BBOX", {0.0, 0.0, 0.0});
+    // world axes. Acts as a FLOOR on a window that is otherwise derived from
+    // the longest segment (lateral >= its length, along-track >= half of it),
+    // with the margin shrink added on top so the window planes never eat into
+    // the volume the trajectory can use.
+    //
+    // The default pins the floor at exactly what MAX_SEGMENT_LEN = 2.0 derives,
+    // so it changes nothing at the default settings but decouples the two knobs
+    // the moment MAX_SEGMENT_LEN is lowered. That matters: shortening segments
+    // is the right response to a convex region losing volume to one obstacle
+    // cutting across its whole length, but with a purely derived window it also
+    // narrows the window proportionally, and you give back in width what you
+    // gained in length. Raise a component to let regions grow wider than the
+    // segments themselves, at the cost of more obstacle points per
+    // decomposition. All zeros restores the purely derived behaviour.
+    declare_parameter<std::vector<double>>("CORRIDOR_BBOX", {1.0, 2.0, 2.0});
   }
 
   drone_core::autonomy::AutonomyCore::Config configFromParameters() {

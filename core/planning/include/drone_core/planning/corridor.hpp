@@ -52,6 +52,24 @@ struct CorridorParams {
   // for the margin to hold against the voxel's worst-case corner. Set from
   // the map resolution (res * sqrt(3) / 2); the default matches 0.05 m.
   double voxel_half_diagonal = 0.0433;
+  // Distance from the drone over which the FIRST region's margin may be
+  // relaxed [m] — the corridor's counterpart to truncatePath's escape ramp and
+  // the planner's start-escape sphere, and the reason a drone parked close to
+  // the frontier can get a corridor at all.
+  //
+  // A convex region cannot be less safe at one end than the other: one plane
+  // holds everywhere, so the ramp truncation applies pointwise has no direct
+  // analogue here. The relaxation is instead bounded in the two ways that are
+  // available. In EXTENT: the first segment is split at this distance, so
+  // whatever margin is given up is given up over the first `start_relax_dist`
+  // metres only and every later region carries the full `margin`. In MAGNITUDE:
+  // the first region is shrunk by the largest amount that still contains the
+  // drone (see buildCorridor), never by less than it has to be, so the
+  // relaxation disappears on its own as the map fills in around the vehicle.
+  //
+  // Set <= 0 to disable both — no split, uniform `margin` everywhere, and a
+  // drone closer than `margin` to anything mapped or unknown gets no corridor.
+  double start_relax_dist = 1.0;
 };
 
 // Vertex loops of a region's faces, for visualisation: one entry per face that
@@ -111,11 +129,14 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
 // conservative map, pre-windowed by the caller — this function scans the whole
 // list per segment). Each region is shrunk by margin + voxel_half_diagonal
 // along every face normal so the trajectory it confines keeps true metric
-// clearance from the voxels themselves, then validated: each segment's
-// midpoint must survive the shrink, and each junction waypoint must lie in
-// BOTH adjacent regions (the QP pins the junction position to the pair's
-// intersection, which shrinking can empty). On any violated region both
-// outputs are cleared and false is returned (the caller falls back).
+// clearance from the voxels themselves — except the FIRST, which is shrunk by
+// as much of that as still contains the drone (see start_relax_dist, and
+// `start_margin` below for what it ended up guaranteeing). The result is then
+// validated against exactly what the QP pins: the start and goal positions are
+// equality-constrained, so each must lie in its region, and consecutive regions
+// must still share a point for the C0 handover (which shrinking can empty).
+// On any violated region both outputs are cleared and false is returned (the
+// caller falls back).
 // On success regions_out.size() == resampled_out.size() - 1.
 // `reason`, if given, receives a short human-readable explanation on failure
 // (which check rejected the corridor) — the caller's one-line diagnostic
@@ -134,13 +155,21 @@ struct CorridorAttempt {
   std::vector<ConvexRegion> shrunk;        // after the margin + voxel pull-in
 };
 
+// `start_margin`, if given, receives the clearance the FIRST region actually
+// guarantees [m] — normally `margin`, but less when the drone sits too close to
+// something mapped or unknown for the full shrink to contain it (see
+// CorridorParams::start_relax_dist). Reported unconditionally rather than only
+// under debug viz: a corridor that succeeded by giving up margin around the
+// vehicle is not the same event as one that did not, and the difference must
+// not be invisible in flight. Untouched on failure.
 bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    const std::vector<Eigen::Vector3d>& path,
                    const CorridorParams& p,
                    std::vector<Eigen::Vector3d>& resampled_out,
                    std::vector<ConvexRegion>& regions_out,
                    std::string* reason = nullptr,
-                   CorridorAttempt* attempt = nullptr);
+                   CorridorAttempt* attempt = nullptr,
+                   double* start_margin = nullptr);
 
 // Upper bound on how far from the committed path a region can reach, given the
 // same params — i.e. how wide the obstacle window the caller extracts must be
