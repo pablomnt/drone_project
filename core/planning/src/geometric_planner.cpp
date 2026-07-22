@@ -120,6 +120,11 @@ bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
   // horizontal-only fallback below — and is far cheaper than the cell scan.
   // Outside the field / unknown space reads as free (it returns the saturation
   // distance), matching the treat-unknown-as-free policy.
+  //
+  // This is deliberately clearance_fn_ and never the cost field: the cost may be
+  // scored against a conservative view in which the mapped frontier reads as an
+  // obstacle (see setCostClearance), and testing validity against that would
+  // make the frontier a closed surface the search could not cross anywhere.
   if (clearance_fn_) {
     return clearance_fn_(pos->values[0], pos->values[1], pos->values[2]) > margin;
   }
@@ -211,6 +216,12 @@ void GeometricPlanner::setClearance(ClearanceFn clearance, double weight, double
   clearance_threshold_ = threshold;
 }
 
+void GeometricPlanner::setCostClearance(ClearanceFn clearance) {
+  // Deliberately does not touch clearance_fn_, so a host may call the two
+  // setters in either order (see the header note on order-independence).
+  cost_clearance_fn_ = std::move(clearance);
+}
+
 ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
   // Build the selected OMPL planner and apply its PlannerConfig sub-struct. Only
   // the construction/parameters differ between planners; the SpaceInformation,
@@ -280,7 +291,11 @@ ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
 ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective() const {
   // With no clearance function the per-state cost is a constant 1, so this is
   // exactly a path-length objective; with one it adds the proximity penalty.
-  return std::make_shared<ClearanceObjective>(si_, clearance_fn_, clearance_weight_,
+  // The field sampled here is the cost field, which is the validity field
+  // unless the host set a separate one (see setCostClearance). Everything that
+  // scores a path — pathCost, costBreakdown, the shortcut pass — therefore
+  // agrees with what the search minimised.
+  return std::make_shared<ClearanceObjective>(si_, costClearanceFn(), clearance_weight_,
                                               clearance_threshold_);
 }
 
@@ -362,7 +377,7 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   // Straighten the jagged planner result. Deliberately skip B-spline smoothing so
   // the original waypoints survive for the minimum-snap optimiser downstream.
   // With no clearance field, plain length-only simplifyMax is correct and cheap.
-  if (!clearance_fn_) {
+  if (!clearanceMode()) {
     ompl::geometric::PathSimplifier simplifier(si_);
     simplifier.simplifyMax(*path);
   }
@@ -376,7 +391,7 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   // In clearance mode, use a cost-aware shortcut instead of simplifyMax: it cuts
   // the planner's zig-zag but, by gating on the clearance-aware cost, keeps the
   // detours the objective actually wanted (see shortcutClearanceAware).
-  if (clearance_fn_) {
+  if (clearanceMode()) {
     shortcutClearanceAware(result_path);
   }
   return true;

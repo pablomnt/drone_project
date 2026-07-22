@@ -155,9 +155,12 @@ and the fast control thread:
   are thus rooted at the drone, so a candidate can't win merely because the drone has advanced toward
   the goal (which would shrink a drone-rooted candidate while the full committed cost still billed the
   already-traversed prefix). One search ⇒ one
-  EDT use per tick. Both validity and cost use the **same cached `DynamicEDTOctomap`** (`maxdist =
-  clearance_threshold`), rebuilt only when the map object changes (see `clearanceField`), not per
-  tick. Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`. Path post-processing: with **no**
+  EDT use per tick. Validity and cost use **separate cached `DynamicEDTOctomap`s** when a distinct
+  conservative view exists: validity reads the search map's field, the cost reads the conservative
+  one (see *Two fields, two questions* below). Both are rebuilt only when their map object changes
+  (`clearanceField` / `conservativeField`), not per tick, and the conservative field is the same one
+  truncation and corridor growth already use, so the split costs no extra distance transform.
+  Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`. Path post-processing: with **no**
   clearance field, plain length-only `simplifyMax`; in clearance mode, a **cost-aware shortcut**
   (`shortcutClearanceAware`) drops an interior waypoint only when the straight bypass is
   collision-free *and* doesn't raise the clearance-aware cost — so it removes the RRT* zig-zag
@@ -203,10 +206,36 @@ Module roles:
   in `isPathValid`. `kGoalFlexibility` (0.3 m): RRT* approximate solutions that stop farther than this
   from the goal are **rejected** (`planPath` returns false → caller sees infinite cost) rather than
   committing to a path that ends short. All four are `static constexpr` in the class (deliberately not
-  ROS params). The same field feeds the **clearance-aware cost** via `setClearance(fn, weight,
-  threshold)` (obstacle-proximity integral penalty up to `clearance_threshold`); `isPathValid()`
-  re-checks a committed path under the same model; `pathCost()` scores a waypoint list for the
-  hysteresis gate; `minClearance()` reports a path's tightest clearance (diagnostic / logging).
+  ROS params). `setClearance(fn, weight, threshold)` sets that validity field and the
+  **clearance-aware cost**'s weight/threshold (obstacle-proximity integral penalty up to
+  `clearance_threshold`); `isPathValid()` re-checks a committed path under the same model;
+  `pathCost()` scores a waypoint list for the hysteresis gate; `minClearance()` reports a path's
+  tightest clearance (diagnostic / logging).
+
+  **Two fields, two questions — `setCostClearance`.** The cost may be scored against a *different*
+  field from the collision check, and under `USE_CORRIDOR_QP` + `TREAT_FRONTIER_AS_OBSTACLE` it is.
+  The two ask different questions. Validity asks "would the vehicle hit something here", and must
+  read unmapped space as free or the informed planners find no path to a goal beyond the frontier
+  at all — so it always uses the **optimistic** search field, never the conservative one. Stamped
+  frontier is a closed shell; validating against it would wall the search inside the mapped region.
+  The cost asks "is this somewhere we would rather fly", and there the frontier is worth being
+  repelled by. **The problem this fixes:** truncation cuts the committed prefix where *conservative*
+  clearance drops below `FRONTIER_MARGIN`, but the cost only ever saw the *optimistic* field, so the
+  search was optimising a metric blind to the criterion deciding how much of its path survived. It
+  had no reason not to return paths running tangent to the frontier, which then truncated to almost
+  nothing. Scoring both against the same field aligns them and the surviving prefix gets longer.
+  Because the frontier is stamped as a **thin shell** of known-free voxels bordering unknown (not the
+  whole unknown volume), the conservative field is `min(distance to real obstacle, distance to that
+  shell)` — a strict refinement of the optimistic field, identical wherever the shell is not the
+  nearest source, so no real-obstacle shaping is lost by scoring against it. The penalty saturates at
+  `w·threshold` where clearance is 0, so the shell is expensive to approach but never a barrier. The
+  cost-to-go heuristics stay admissible (the integrand is still ≥1). `setCostClearance` is
+  order-independent with `setClearance`; passing an empty function restores single-field scoring, and
+  with no distinct conservative view (frontier stamping off, or the legacy non-corridor mode where
+  the search already runs on the conservative map) the override is skipped entirely.
+  **Watch for:** with the goal at the frontier the cost is at its maximum exactly there, so the
+  search approaches reluctantly and `BEST_EFFORT_GOAL` may settle short — `CLEARANCE_WEIGHT` is the
+  knob if prefixes lengthen but the drone stops advancing.
   `MinSnapTrajectory` / `MinSnapTimeOptimizer` (KKT min-snap + NLopt BOBYQA
   time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a `Trajectory`
   of **per-segment polynomial coefficients + durations** (not sampled points) so the flatness mapper
@@ -364,7 +393,10 @@ publish nothing and cost nothing when the flag is off:
 - `/planner/clearance_field` (`sensor_msgs/PointCloud2`, `intensity` = clearance distance) — coarse
   (0.15 m) samples of the cached EDT, colour near→far. Shows exactly what the clearance cost "sees",
   for tuning `CLEARANCE_WEIGHT` / `CLEARANCE_THRESHOLD`. Sampled on the worker thread only when the
-  map changes.
+  map changes. **Follows the cost, not the collision check**: this samples the *conservative* field
+  whenever one exists as a distinct view (see *Two fields, two questions*), so the stamped frontier
+  shows up as a low-clearance shell. That is the point — it is the field the objective is scored
+  against. The optimistic field the collision check uses is not published.
 - `/planner/corridor` (`visualization_msgs/MarkerArray`) — the corridor-QP pipeline's intermediate
   products, **published on failed ticks too**, stage by stage, because a failing corridor is what you
   need to look at (clearing the drawing made "viz broken", "flag off" and "failing every tick" look
@@ -401,7 +433,10 @@ publish nothing and cost nothing when the flag is off:
 - `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
 - `CLEARANCE_WEIGHT` (double, default `1.0`) — obstacle-proximity penalty weight. Lowered from 4.0
   during bench work; raising it pushes the search off the walls, which is one way to buy the corridor
-  stage the room it needs to grow regions.
+  stage the room it needs to grow regions. Since the cost is scored against the **conservative**
+  field (see *Two fields, two questions*), this now also sets how hard the search is pushed off the
+  *frontier*, and is therefore the main lever on how much of the path survives truncation — at the
+  cost of longer detours, and of a goal at the frontier being approached more reluctantly.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
 - `DEBUG_PLANNER_VIZ` (bool, default `true`) — **single switch** for the debug planner
   visualisation (search tree, clearance field, corridor). Designed to be zero-cost when off: with it
@@ -413,9 +448,10 @@ publish nothing and cost nothing when the flag is off:
   **copy** of each incoming octomap, fed to the core as the **conservative** map view (the raw map
   stays the optimistic search view — dual-map; a small keep-out ball around the drone stays
   unstamped so it can root the search). With `USE_CORRIDOR_QP` off the search itself runs on the
-  conservative view (legacy behavior); with it on, the conservative view only drives truncation +
-  corridor. NOTE: on a fresh map almost everything is frontier — the drone is boxed in until it has
-  scanned its surroundings.
+  conservative view (legacy behavior); with it on, the conservative view drives truncation, corridor
+  growth **and the search's cost objective** — but never its collision check, which stays optimistic
+  (see *Two fields, two questions*). NOTE: on a fresh map almost everything is frontier — the drone
+  is boxed in until it has scanned its surroundings.
 - `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
   short of the goal (the reachable point closest to it) instead of reporting "no path"; the worker
   keeps advancing the endpoint as the map grows.
@@ -481,7 +517,7 @@ map, so nothing distinguishes unknown space from free space).
 | true | false | false | raw | plain min-snap | **no** |
 | true | false | true | conservative | plain min-snap | search only (trajectory may still cut corners between waypoints) |
 | true | true | false | raw | corridor QP | obstacles only — corridor is collision-free but unknown reads as free |
-| true | true | true | **optimistic** (raw) | corridor QP | **yes** — full Stage 1: optimistic search, conservative truncation + corridor |
+| true | true | true | **optimistic** (raw) validity, **conservative** cost | corridor QP | **yes** — full Stage 1: optimistic search, conservative truncation + corridor |
 
 Notes: with `PLAN_TRAJECTORY=false` the corridor snapshot is never populated, so `/planner/corridor`
 stays empty regardless of the other flags — trajgen is where truncation and corridor growth happen.

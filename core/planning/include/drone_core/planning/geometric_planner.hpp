@@ -117,6 +117,28 @@ public:
   // (the default) the planner optimises pure path length.
   void setClearance(ClearanceFn clearance, double weight, double threshold);
 
+  // Score the cost with a DIFFERENT distance field from the one the collision
+  // check uses. Without this, the single field passed to setClearance answers
+  // both questions. The host separates them when the two questions have
+  // different answers.
+  //
+  // The collision check asks "would the vehicle hit something here". It must
+  // read unmapped space as free, otherwise the informed planners find no path
+  // to a goal beyond the mapped frontier at all. The cost asks "is this
+  // somewhere we would rather fly", and there the boundary of what has been
+  // mapped is worth being repelled by, because a path that skims it is a path
+  // whose committed prefix gets cut short downstream.
+  //
+  // Passing a conservative (frontier-stamped) field here therefore makes the
+  // search prefer routes that stay well inside known-free space, without
+  // turning the stamped frontier into a wall the search cannot cross.
+  //
+  // Order-independent with setClearance: whichever is called last, the cost
+  // uses this field when one is set and falls back to the validity field when
+  // it is not. Pass an empty function to clear it. weight and threshold stay
+  // where setClearance put them; this changes only which field is sampled.
+  void setCostClearance(ClearanceFn clearance);
+
   // Select which OMPL planner planPath builds. The per-planner parameters come
   // from the PlannerConfig defaults in this header. Default is RRT*.
   void setPlannerType(PlannerType type) { planner_type_ = type; }
@@ -230,6 +252,21 @@ private:
   // that plain length-only simplifyMax would cause.
   void shortcutClearanceAware(std::vector<std::vector<double>>& waypoints) const;
 
+  // True when any clearance field is set, i.e. the planner is running in
+  // clearance-aware mode rather than optimising pure path length. Either field
+  // alone is enough to put it in that mode.
+  bool clearanceMode() const {
+    return static_cast<bool>(clearance_fn_) || static_cast<bool>(cost_clearance_fn_);
+  }
+
+  // The field the cost objective samples: the cost-specific one when the host
+  // set it (see setCostClearance), otherwise the validity field. Keeping the
+  // choice here rather than at the call sites is what makes the two setters
+  // order-independent.
+  const ClearanceFn& costClearanceFn() const {
+    return cost_clearance_fn_ ? cost_clearance_fn_ : clearance_fn_;
+  }
+
   MapHandle octree_ptr_;
   ompl::base::StateSpacePtr space_;
   ompl::base::SpaceInformationPtr si_;
@@ -244,7 +281,13 @@ private:
   // anchor it.
   mutable std::array<double, 3> start_pos_{};
 
-  ClearanceFn clearance_fn_;            // null => optimise pure path length
+  // The validity field: what isStateValid tests against the margin, and what
+  // minClearance reports. Null => optimise pure path length with the fallback
+  // octree scan for validity.
+  ClearanceFn clearance_fn_;
+  // Optional separate field for the cost only (see setCostClearance). Null =>
+  // the cost samples clearance_fn_, which is the single-field behaviour.
+  ClearanceFn cost_clearance_fn_;
   double clearance_weight_ = 1.0;       // obstacle-proximity penalty weight
   double clearance_threshold_ = 1.0;    // clearance saturation distance [m]
 

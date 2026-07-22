@@ -52,6 +52,22 @@ std::shared_ptr<DynamicEDTOctomap> buildEdt(const std::shared_ptr<octomap::OcTre
   return edt;
 }
 
+// Wrap a distance field as a clearance oracle. The planner's objective, the
+// planner's validity check and the corridor stages all take the same
+// std::function signature and all need the same out-of-bounds convention:
+// getDistance returns a negative sentinel outside the field's bounding box,
+// which means nothing is mapped nearby, so report the saturation distance
+// instead. Shared rather than written out at each call site so the convention
+// cannot drift apart between them.
+planning::CorridorClearanceFn makeClearanceFn(std::shared_ptr<DynamicEDTOctomap> edt,
+                                              double maxd) {
+  return [edt = std::move(edt), maxd](double x, double y, double z) {
+    const double d = edt->getDistance(octomap::point3d(
+        static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+    return d < 0.0 ? maxd : d;
+  };
+}
+
 // Remaining committed path from the drone's current position. Splits the committed
 // polyline at the drone by exact projection onto each segment (closed-form point-to-
 // segment, clamped to the segment), then returns [drone_pos, wp[i+1], ..., goal]
@@ -289,18 +305,28 @@ AutonomyCore::CorridorSnapshot AutonomyCore::corridorSnapshot() const {
 
 std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
   std::vector<std::array<double, 4>> out;
-  if (!edt_ || !edt_source_map_) return out;
+
+  // Sample whichever field the cost is actually scored against, since tuning
+  // clearance_weight / clearance_threshold by eye only works if the picture
+  // shows what the objective sees. That is the conservative field whenever one
+  // exists as a distinct view, and the search field otherwise. Both are current
+  // for this tick: applyClearanceObjective runs before this and populates them.
+  const bool use_cons = cons_edt_ && cons_edt_source_map_ &&
+                        cons_edt_source_map_ != edt_source_map_;
+  const auto& field = use_cons ? cons_edt_ : edt_;
+  const auto& source = use_cons ? cons_edt_source_map_ : edt_source_map_;
+  if (!field || !source) return out;
 
   double xmin, ymin, zmin, xmax, ymax, zmax;
-  edt_source_map_->getMetricMin(xmin, ymin, zmin);
-  edt_source_map_->getMetricMax(xmax, ymax, zmax);
+  source->getMetricMin(xmin, ymin, zmin);
+  source->getMetricMax(xmax, ymax, zmax);
 
   constexpr double step = 0.15;  // grid spacing [m] — coarse, debug-only
   const double maxd = cfg_.clearance_threshold;
   for (double x = xmin; x <= xmax; x += step) {
     for (double y = ymin; y <= ymax; y += step) {
       for (double z = zmin; z <= zmax; z += step) {
-        double d = edt_->getDistance(octomap::point3d(
+        double d = field->getDistance(octomap::point3d(
             static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
         if (d < 0.0) continue;       // outside the EDT bounding box
         if (d > maxd) d = maxd;      // clamp to the saturation threshold
@@ -339,12 +365,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     for (const auto& w : path) epath.emplace_back(w[0], w[1], w[2]);
 
     const double maxd = std::max(cfg_.clearance_threshold, cfg_.frontier_margin);
-    const planning::CorridorClearanceFn cons_fn = [cons_edt, maxd](double x, double y,
-                                                                   double z) {
-      const double d = cons_edt->getDistance(octomap::point3d(
-          static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
-      return d < 0.0 ? maxd : d;  // outside the EDT bbx => nothing mapped nearby
-    };
+    const planning::CorridorClearanceFn cons_fn = makeClearanceFn(cons_edt, maxd);
 
     planning::CorridorParams params;
     params.max_segment_len = cfg_.max_segment_len;
@@ -587,18 +608,42 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
 }
 
 bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
-                                           const planning::MapHandle& map) {
+                                           const planning::MapHandle& map,
+                                           const planning::MapHandle& cons) {
   auto edt = clearanceField(map);
   if (!edt) return false;
-  // One field, two consumers: the planner's collision check (clearance > margin)
-  // and its cost objective (proximity penalty up to clearance_threshold).
-  planner.setClearance(
-      [edt, maxd = cfg_.clearance_threshold](double x, double y, double z) {
-        const double d = edt->getDistance(octomap::point3d(
-            static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
-        return d < 0.0 ? maxd : d;  // outside the EDT bbx => treat as free
-      },
-      cfg_.clearance_weight, cfg_.clearance_threshold);
+  // The search map's field drives the collision check (clearance > margin). It
+  // has to be this view and not the conservative one, because the conservative
+  // view stamps the frontier as occupied and a validity check against that
+  // would wall the search inside the mapped region entirely.
+  planner.setClearance(makeClearanceFn(edt, cfg_.clearance_threshold),
+                       cfg_.clearance_weight, cfg_.clearance_threshold);
+
+  // The cost, however, is scored against the conservative field whenever one
+  // exists as a distinct map. The reason is that the search and the downstream
+  // truncation were previously measuring different things: truncation cuts the
+  // committed prefix where conservative clearance falls below frontier_margin,
+  // while the cost only ever saw the optimistic field, so the search had no way
+  // to know what would get it cut and happily returned paths that ran tangent
+  // to the frontier. Scoring both against the same field aligns them, and the
+  // prefix that survives truncation gets longer as a result.
+  //
+  // The frontier is stamped as a thin shell of known-free voxels bordering
+  // unknown space, not as the whole unknown volume, so this field is
+  // min(distance to a real obstacle, distance to that shell). It is therefore a
+  // strict refinement of the optimistic field: identical wherever the shell is
+  // not the nearest source, and additionally repulsive near the shell. Nothing
+  // about real-obstacle avoidance is lost by scoring against it.
+  //
+  // Skipped when the two views are the same object, which is the case with
+  // frontier stamping off and in the legacy non-corridor mode where the search
+  // already runs on the conservative view. There the override would be a no-op
+  // at best, and calling conservativeField would just hand back the same field.
+  if (cons && cons != map) {
+    if (auto cons_edt = conservativeField(cons)) {
+      planner.setCostClearance(makeClearanceFn(cons_edt, cfg_.clearance_threshold));
+    }
+  }
   return true;
 }
 
@@ -666,16 +711,19 @@ void AutonomyCore::plannerLoop() {
       const planning::MapHandle search_map =
           (!cfg_.use_corridor_qp && conservative) ? conservative : map;
 
-      // One planner per tick. Set the clearance field FIRST: it is now the single
-      // obstacle model for both the collision check (clearance > margin) and the
-      // cost, so the committed-path re-check below sees the same obstacles the
-      // search would. The field is cached (rebuilt only on a map change), so this
-      // is cheap on the common still-valid tick.
+      // One planner per tick. Set the clearance fields FIRST, so the
+      // committed-path re-check below sees the same obstacle model the search
+      // would. The search map's field is the obstacle model for the collision
+      // check; the conservative field, when it is a distinct view, additionally
+      // scores the cost so the search is repelled by the frontier it would
+      // otherwise skim (see applyClearanceObjective). Both are cached and
+      // rebuilt only on a map change, so this is cheap on the common
+      // still-valid tick.
       planning::GeometricPlanner planner(search_map, cfg_.rrt_solve_time);
       planner.setPlannerType(cfg_.planner_type);
       planner.setBestEffort(cfg_.best_effort_goal);
       planner.setRecordTree(cfg_.debug_planner_viz);
-      applyClearanceObjective(planner, search_map);
+      applyClearanceObjective(planner, search_map, conservative);
 
       // Debug-only: re-sample the clearance field when the map changes (the EDT
       // is now current for this tick). Gated so a regular flight never walks the

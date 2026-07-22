@@ -227,13 +227,22 @@ private:
   void plannerLoop();
 
   // Configure `planner` with the shared clearance-aware objective used by BOTH
-  // the monitor and improve passes (build the EDT over `map`, then setClearance
-  // with cfg_.clearance_weight / cfg_.clearance_threshold), so a forced replan
-  // and an improvement search minimise exactly the same cost. Returns false and
-  // leaves the planner length-optimal when the map has no obstacles (clearance
-  // is then uniform and the EDT meaningless).
+  // the monitor and improve passes, so a forced replan and an improvement
+  // search minimise exactly the same cost.
+  //
+  // `map` is the search view. Its EDT drives the planner's collision check and
+  // supplies the weight/threshold from cfg_. `cons` is the conservative
+  // (frontier-stamped) view, or null when there is none; when it is a distinct
+  // object from `map` its EDT additionally scores the cost, which is what stops
+  // the search returning paths that run tangent to the frontier and get cut to
+  // almost nothing by truncation. Validity is never scored against `cons` —
+  // that would make the stamped frontier impassable.
+  //
+  // Returns false and leaves the planner length-optimal when the search map has
+  // no obstacles (clearance is then uniform and the EDT meaningless).
   bool applyClearanceObjective(planning::GeometricPlanner& planner,
-                               const planning::MapHandle& map);
+                               const planning::MapHandle& map,
+                               const planning::MapHandle& cons);
 
   // Return the cached Euclidean distance field for `map`, rebuilding it only when
   // the map has actually changed (octomap hands us a fresh tree per message). A
@@ -251,9 +260,12 @@ private:
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> conservativeField(
       const planning::MapHandle& map);
 
-  // Sample the cached EDT on a coarse grid over the map's bounding box. Called
-  // only from the planner worker thread (it reads edt_ / edt_source_map_, which
-  // the worker owns), and only when debug_planner_viz is set.
+  // Sample the cached EDT on a coarse grid over the map's bounding box. Samples
+  // whichever field the cost objective is scored against — the conservative one
+  // when it is a distinct view, the search one otherwise — so the published
+  // cloud shows what the objective actually sees. Called only from the planner
+  // worker thread (it reads edt_ / cons_edt_ and their source maps, which the
+  // worker owns), and only when debug_planner_viz is set.
   std::vector<std::array<double, 4>> sampleClearanceField() const;
 
   Config cfg_;
