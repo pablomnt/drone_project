@@ -13,6 +13,7 @@
 #include <ompl/util/Console.h>
 
 #include "drone_core/common/logging.hpp"
+#include "drone_core/common/trajectory_eval.hpp"
 #include "drone_core/control/flatness_mapper.hpp"
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/corridor_trajectory.hpp"
@@ -190,6 +191,13 @@ void AutonomyCore::applyConfig(const Config& config) {
 
 void AutonomyCore::reset() {
   tracker_.reset();
+  // The tracker just dropped its trajectories, so there is nothing left to
+  // splice onto. Clearing this makes the next replan anchor at rest on the
+  // measured position, which is what a fresh engage needs.
+  std::lock_guard<std::mutex> lock(traj_mutex_);
+  has_pending_ = false;
+  has_last_planned_ = false;
+  last_planned_ = common::Trajectory{};
 }
 
 common::Command AutonomyCore::stepControl(double dt) {
@@ -267,12 +275,21 @@ bool AutonomyCore::planOnce() {
   std::vector<std::vector<double>> path;
   if (!runGlobalPlan(state, goal, map, path)) return false;
 
+  // Same splice anchoring as the worker's trajgen tick — see spliceAnchor.
+  const SpliceAnchor anchor = spliceAnchor(state, now());
+  if (!path.empty()) {
+    path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
+  }
+
   common::Trajectory traj;
   const planning::MapHandle cons = conservative ? conservative : map;
-  // Truncation stops at unobserved space only when a conservative view exists —
-  // see the worker's copy of this for why. The predicate reads the RAW map.
-  if (!runTrajgen(path, now(), conservativeField(cons), cons,
-                  conservative ? makeUnknownFn(map) : planning::CorridorUnknownFn{}, traj))
+  // Truncation stops at unobserved space only when the operator asked for it —
+  // see the worker's copy of this for why it keys off the flag and not off
+  // whether a conservative view exists. The predicate reads the RAW map.
+  if (!runTrajgen(path, anchor.t0, anchor.start, conservativeField(cons), cons,
+                  cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+                                               : planning::CorridorUnknownFn{},
+                  traj))
     return false;
 
   stagePending(traj);
@@ -371,6 +388,7 @@ bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal&
 }
 
 bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, double t0,
+                              const common::MotionState& start,
                               const std::shared_ptr<DynamicEDTOctomap>& cons_edt,
                               const planning::MapHandle& cons_map,
                               const planning::CorridorUnknownFn& unknown_fn,
@@ -577,7 +595,10 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
       snapshotRegions(attempt, /*accepted=*/true);
-      if (optimizer.optimizeTrajectory(resampled, regions, traj)) {
+      // `start` carries the splice state. Its position is path.front() by
+      // construction (the caller rooted the path there), so it satisfies
+      // regions[0]; the derivatives are what make the engage continuous.
+      if (optimizer.optimizeTrajectory(start, resampled, regions, traj)) {
         traj.t0 = t0;
         if (cfg_.debug_planner_viz) {
           DRONE_LOG_INFO("[trajgen] corridor: OK " << regions.size() << " regions / "
@@ -604,6 +625,14 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     return false;
   }
 
+  // Plain min-snap fallback (USE_CORRIDOR_QP off). NOTE: this path is still
+  // rest-to-rest. It inherits the splice POSITION — the caller rooted `path`
+  // there — and the lead-time anchor, but its solver has no way to accept a
+  // start velocity, so engaging it while moving steps the velocity reference
+  // from whatever the vehicle was doing to zero. That is the stutter the
+  // corridor path was just fixed for. Acceptable only because this mode is the
+  // obstacle-blind one already, and nothing should fly it near obstacles; give
+  // MinSnapTrajectory a start-derivative boundary before relying on it.
   planning::MinSnapTimeOptimizer optimizer;
   if (!optimizer.optimizeTrajectory(path, traj)) return false;
   traj.t0 = t0;
@@ -614,7 +643,44 @@ void AutonomyCore::stagePending(const common::Trajectory& traj) {
   std::lock_guard<std::mutex> lock(traj_mutex_);
   pending_ = traj;
   last_planned_ = traj;
+  last_planned_at_ = now();
+  has_last_planned_ = true;
   has_pending_ = true;
+}
+
+AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state,
+                                                      double t_now) const {
+  SpliceAnchor anchor;
+  anchor.t0 = t_now + trajgen_lead_;
+
+  common::Trajectory outgoing;
+  bool have = false;
+  double staged_at = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(traj_mutex_);
+    if (has_last_planned_) {
+      outgoing = last_planned_;
+      staged_at = last_planned_at_;
+      have = true;
+    }
+  }
+
+  // Only splice onto a trajectory the tracker is still following. Past the stale
+  // timeout it has latched a hover, so the vehicle is no longer on that curve
+  // and matching its state would step the reference rather than smooth it.
+  const bool still_tracked = have && !outgoing.empty() &&
+                             (t_now - staged_at) <= cfg_.stale_timeout;
+  if (still_tracked) {
+    anchor.start = common::sampleMotion(outgoing, anchor.t0);
+    anchor.from_trajectory = true;
+  } else {
+    // Rest at the measured position. Note sampleMotion would also return rest if
+    // the outgoing trajectory had simply run out (it ends at rest by
+    // construction) — this branch is for having no usable outgoing curve at all.
+    anchor.start.pos = state.pos;
+    anchor.from_trajectory = false;
+  }
+  return anchor;
 }
 
 std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
@@ -691,15 +757,12 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
     }
   }
 
-  // Charge for routing through unobserved space — but only when the host has
-  // supplied a conservative view at all, i.e. TREAT_FRONTIER_AS_OBSTACLE is on.
-  // A null `cons` is the host saying "unmapped space is not a hazard here", and
-  // the search's cost should not argue with that: with the flag off the intended
-  // mode is the legacy one where unknown reads as ordinary free space.
-  //
-  // Note this gates the COST only. truncatePath's stop at unobserved space is
-  // deliberately NOT gated — it is a safety property rather than a preference,
-  // and it reads the octree directly, so it holds whatever the flag says.
+  // Charge for routing through unobserved space, when the operator has asked for
+  // unmapped space to count as a hazard at all. Gated on the flag itself and NOT
+  // on `cons` being non-null: the host only builds a conservative view once a
+  // frontier cloud has arrived, so keying off it made a late or missing
+  // /octomap_frontier quietly disable this even with the flag on. This term
+  // needs no frontier cloud — it reads the raw octree directly.
   //
   // The predicate reads the SEARCH map, not the conservative one, because
   // frontier stamping writes voxels into its copy and any stamped point that did
@@ -709,7 +772,7 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   //
   // This never touches validity, so unknown space stays enterable and a goal
   // beyond the frontier is still accepted — it just stops being free.
-  if (cons) {
+  if (cfg_.treat_unknown_as_hazard) {
     planner.setUnknownPenalty(makeUnknownFn(map), cfg_.unknown_weight);
   }
   return true;
@@ -957,22 +1020,53 @@ void AutonomyCore::plannerLoop() {
       // enabled it re-anchors min-snap to where the vehicle is now, on its cadence.
       if (cfg_.plan_trajectory && !cached_path_.empty() &&
           t - last_trajgen_ >= cfg_.trajgen_period) {
+        // Anchor the replan on the state the vehicle will be in when it
+        // engages, not on where it is now, and root the path there so the
+        // corridor is grown around the point the trajectory actually starts
+        // from. Rooting at the measured position instead would leave the splice
+        // point outside region 0 whenever there is tracking error, and the QP's
+        // start equality would then be infeasible against region 0's faces.
+        const double t_gen = now();
+        const SpliceAnchor anchor = spliceAnchor(state, t_gen);
         std::vector<std::vector<double>> path = cached_path_;
-        path.front() = {state.pos.x(), state.pos.y(), state.pos.z()};
+        path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
         common::Trajectory traj;
         const planning::MapHandle cons = conservative ? conservative : map;
-        // Truncation stops at unobserved space only when a conservative view
-        // exists, i.e. TREAT_FRONTIER_AS_OBSTACLE is on. A null `conservative`
-        // is the host declaring unmapped space is not a hazard here, and with
-        // that flag off the intended mode is the legacy one throughout: nothing
-        // distinguishes unknown from free, in the cost or in truncation. The
-        // predicate reads the RAW map, never the stamped copy — frontier
-        // stamping writes voxels into that copy, and a stamped point that did
-        // not already exist would make genuinely unobserved space read as
-        // observed.
-        if (runTrajgen(path, now(), conservativeField(cons), cons,
-                       conservative ? makeUnknownFn(map) : planning::CorridorUnknownFn{},
-                       traj)) {
+        // Truncation stops at unobserved space only when the operator asked for
+        // it. With treat_unknown_as_hazard false the intended mode is the legacy
+        // one throughout: nothing distinguishes unknown from free, in the cost
+        // or in truncation.
+        //
+        // Keyed off the flag and NOT off `conservative` being non-null. The host
+        // only builds that view once a frontier cloud has arrived, so keying off
+        // it made a late or missing /octomap_frontier quietly drop this guard
+        // even with the flag on. Truncation needs no frontier cloud to make this
+        // check — the predicate reads the RAW map, never the stamped copy, since
+        // stamping writes voxels into that copy and a stamped point that did not
+        // already exist would make genuinely unobserved space read as observed.
+        const bool ok = runTrajgen(path, anchor.t0, anchor.start, conservativeField(cons), cons,
+                                   cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+                                                                : planning::CorridorUnknownFn{},
+                                   traj);
+
+        // Re-measure the lead from what this solve actually cost. Timed around
+        // the whole call, failures included: a corridor that fails late has
+        // still burned the time, and the next replan has to budget for it.
+        const double solve_time = now() - t_gen;
+        trajgen_solve_max_ = std::max(solve_time, kLeadMaxDecay * trajgen_solve_max_);
+        trajgen_lead_ = std::clamp(kLeadSafetyFactor * trajgen_solve_max_, kLeadMin, kLeadMax);
+        if (solve_time > anchor.t0 - t_gen) {
+          // The trajectory is due to engage before it was finished, so it will
+          // start slightly past its own beginning. Self-correcting (the lead
+          // just grew), but worth naming: this is the one case that puts a step
+          // in the reference, and a persistent one means the solve is too slow
+          // for TRAJGEN_PERIOD, not that the lead is mistuned.
+          DRONE_LOG_INFO("[trajgen] solve " << solve_time << " s overran its "
+                         << (anchor.t0 - t_gen) << " s lead — engaging late; lead now "
+                         << trajgen_lead_ << " s");
+        }
+
+        if (ok) {
           stagePending(traj);
           last_trajgen_ = t;
         }

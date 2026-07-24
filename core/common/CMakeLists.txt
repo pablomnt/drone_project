@@ -1,7 +1,7 @@
 # Shared types, frame conversions and logging. Header-heavy and dependency-light:
 # everything here speaks Eigen and nothing else.
 
-add_library(drone_core_common src/frames.cpp)
+add_library(drone_core_common src/frames.cpp src/trajectory_eval.cpp)
 add_library(drone_core::common ALIAS drone_core_common)
 
 target_include_directories(drone_core_common PUBLIC

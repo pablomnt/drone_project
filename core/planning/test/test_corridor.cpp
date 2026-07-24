@@ -32,6 +32,15 @@ double evalDeriv(const Eigen::VectorXd& c, int d, double t) {
   return v;
 }
 
+// A MotionState at rest at `p`: the boundary condition for the first plan of a
+// flight, and what every replan used before they learned to splice onto a
+// moving vehicle.
+drone_core::common::MotionState restAt(const Eigen::Vector3d& p) {
+  drone_core::common::MotionState s;
+  s.pos = p;
+  return s;
+}
+
 // An axis-aligned box as a ConvexRegion (6 unit-normal half-spaces). Lets the
 // QP tests state a corridor directly, independent of the decomposition.
 ConvexRegion boxRegion(const Eigen::Vector3d& lo, const Eigen::Vector3d& hi) {
@@ -52,13 +61,14 @@ ConvexRegion boxRegion(const Eigen::Vector3d& lo, const Eigen::Vector3d& hi) {
 // Full validity audit of a solved corridor trajectory: boundary conditions,
 // per-segment region containment, per-axis dynamic limits, and C0-C4 junction
 // continuity. Returns the number of violated checks (0 == valid).
-int checkTrajectory(const Trajectory& traj, const Eigen::Vector3d& start,
+int checkTrajectory(const Trajectory& traj, const drone_core::common::MotionState& start,
                     const Eigen::Vector3d& goal, const std::vector<ConvexRegion>& regions,
                     const CorridorLimits& limits, const char* label) {
   int failures = 0;
   const int S = static_cast<int>(traj.segment_times.size());
 
-  // Boundary: exact position ends, rest (v = a = j = 0) both ends.
+  // Boundary: the start matches the requested motion state to third order (a
+  // replan splices onto a moving vehicle), the end is an exact position at rest.
   const double Tl = traj.segment_times.back();
   const Eigen::Vector3d p0(evalDeriv(traj.coeffs_x.front(), 0, 0.0),
                            evalDeriv(traj.coeffs_y.front(), 0, 0.0),
@@ -66,17 +76,29 @@ int checkTrajectory(const Trajectory& traj, const Eigen::Vector3d& start,
   const Eigen::Vector3d pT(evalDeriv(traj.coeffs_x.back(), 0, Tl),
                            evalDeriv(traj.coeffs_y.back(), 0, Tl),
                            evalDeriv(traj.coeffs_z.back(), 0, Tl));
-  if ((p0 - start).norm() > kTol || (pT - goal).norm() > kTol) {
+  if ((p0 - start.pos).norm() > kTol || (pT - goal).norm() > kTol) {
     std::cerr << "FAIL(" << label << "): boundary positions off (start err "
-              << (p0 - start).norm() << ", goal err " << (pT - goal).norm() << ")\n";
+              << (p0 - start.pos).norm() << ", goal err " << (pT - goal).norm() << ")\n";
     ++failures;
   }
+  const Eigen::Vector3d* want[4] = {&start.pos, &start.vel, &start.acc, &start.jerk};
+  const std::vector<const Eigen::VectorXd*> first = {
+      &traj.coeffs_x.front(), &traj.coeffs_y.front(), &traj.coeffs_z.front()};
+  const std::vector<const Eigen::VectorXd*> last = {
+      &traj.coeffs_x.back(), &traj.coeffs_y.back(), &traj.coeffs_z.back()};
   for (int d = 1; d <= 3; ++d) {
-    if (std::abs(evalDeriv(traj.coeffs_x.front(), d, 0.0)) > kTol ||
-        std::abs(evalDeriv(traj.coeffs_x.back(), d, Tl)) > kTol) {
-      std::cerr << "FAIL(" << label << "): boundary derivative order " << d
-                << " not at rest\n";
-      ++failures;
+    for (int ax = 0; ax < 3; ++ax) {
+      if (std::abs(evalDeriv(*first[ax], d, 0.0) - (*want[d])(ax)) > kTol) {
+        std::cerr << "FAIL(" << label << "): start derivative order " << d << " axis " << ax
+                  << " is " << evalDeriv(*first[ax], d, 0.0) << ", wanted " << (*want[d])(ax)
+                  << "\n";
+        ++failures;
+      }
+      if (std::abs(evalDeriv(*last[ax], d, Tl)) > kTol) {
+        std::cerr << "FAIL(" << label << "): end derivative order " << d << " axis " << ax
+                  << " not at rest\n";
+        ++failures;
+      }
     }
   }
 
@@ -204,7 +226,7 @@ int main() {
               << " cost=" << cost << ")\n";
     ++failures;
   }
-  failures += checkTrajectory(traj, start, goal, regions, limits, "fixed-times");
+  failures += checkTrajectory(traj, restAt(start), goal, regions, limits, "fixed-times");
 
   // The trajectory must not be pinned to the corner waypoint: the point of the
   // corridor formulation is that the path is free within the regions, so the
@@ -227,7 +249,7 @@ int main() {
       std::cerr << "FAIL: optimizeTrajectory found no feasible allocation\n";
       ++failures;
     } else {
-      failures += checkTrajectory(opt_traj, start, goal, regions, limits, "optimized");
+      failures += checkTrajectory(opt_traj, restAt(start), goal, regions, limits, "optimized");
       if (opt_traj.total_duration > times[0] + times[1] + kTol) {
         std::cerr << "FAIL: optimized duration " << opt_traj.total_duration
                   << "s worse than the generous seed (8s)\n";
@@ -256,6 +278,64 @@ int main() {
     Trajectory t3;
     if (opt.solveQP(start, Eigen::Vector3d(2.0, 5.0, 1.0), times, regions, t3)) {
       std::cerr << "FAIL: goal outside the corridor reported feasible\n";
+      ++failures;
+    }
+  }
+
+  // ------------------------------------------------ moving start (splice) ---
+  // A replan does not begin at rest: it begins wherever the outgoing trajectory
+  // had the vehicle at the switch instant. The QP must reproduce that state
+  // exactly at t = 0 — position, velocity, acceleration and jerk — while still
+  // ending at rest inside the corridor and respecting the per-axis limits.
+  //
+  // Note how modest the start derivatives have to be. The corridor constraint
+  // bounds the Bezier CONTROL POINTS, and the low-index control points are
+  // built from exactly these derivatives scaled by the segment time: with
+  // b3 = 3Tv/7 + 3T^2 a/42 + T^3 j/210, a 4 s segment multiplies the start jerk
+  // by ~0.3. So an aggressive splice state on a long segment can push the hull
+  // out of a narrow region and make the QP infeasible even though the curve
+  // itself would have stayed inside. That is the hull's conservatism, not a
+  // physical limit, and it is a real operational effect: replanning while
+  // manoeuvring hard in a tight corridor is when this stage is most likely to
+  // refuse. Shorter segments (MAX_SEGMENT_LEN) weaken it.
+  {
+    drone_core::common::MotionState moving;
+    moving.pos = start;
+    moving.vel = Eigen::Vector3d(0.6, 0.05, 0.0);   // running down the first leg
+    moving.acc = Eigen::Vector3d(-0.2, 0.1, 0.0);   // easing off, drifting toward the corner
+    moving.jerk = Eigen::Vector3d(0.1, 0.0, 0.0);
+
+    Trajectory mt;
+    if (!opt.solveQP(moving, goal, times, regions, mt)) {
+      std::cerr << "FAIL: moving-start QP reported infeasible on the L-corridor\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(mt, moving, goal, regions, limits, "moving-start");
+    }
+
+    // The same through the outer time search, which has to seed an allocation
+    // that can both carry the initial speed and still brake to rest.
+    Trajectory mo;
+    if (!opt.optimizeTrajectory(moving, {start, corner, goal}, regions, mo)) {
+      std::cerr << "FAIL: moving-start optimizeTrajectory found no feasible allocation\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(mo, moving, goal, regions, limits, "moving-start-optimized");
+    }
+  }
+
+  // A start moving fast enough that it cannot stop inside the corridor must be
+  // refused, not silently clipped: braking from v0 within distance d needs
+  // a >= v0^2/(2d) no matter how the time is allocated, so no allocation exists.
+  // This is the one genuinely new infeasibility a moving start introduces.
+  {
+    const std::vector<ConvexRegion> stub = {boxRegion({-0.05, -0.3, 0.7}, {0.35, 0.3, 1.3})};
+    drone_core::common::MotionState fast;
+    fast.pos = start;
+    fast.vel = Eigen::Vector3d(1.0, 0.0, 0.0);  // 1 m/s into a 0.3 m box, amax 1.5
+    Trajectory ft;
+    if (opt.optimizeTrajectory(fast, {start, Eigen::Vector3d(0.3, 0.0, 1.0)}, stub, ft)) {
+      std::cerr << "FAIL: start too fast to stop in the corridor reported feasible\n";
       ++failures;
     }
   }
@@ -347,7 +427,7 @@ int main() {
         std::cerr << "FAIL: no trajectory fits the generated wall corridor\n";
         ++failures;
       } else {
-        failures += checkTrajectory(wt, resampled.front(), resampled.back(), corridor, limits,
+        failures += checkTrajectory(wt, restAt(resampled.front()), resampled.back(), corridor, limits,
                                     "end-to-end");
       }
     }
@@ -475,7 +555,7 @@ int main() {
         std::cerr << "FAIL: no trajectory fits the relaxed corridor\n";
         ++failures;
       } else {
-        failures += checkTrajectory(rt, r.front(), r.back(), c, limits, "relaxed-start");
+        failures += checkTrajectory(rt, restAt(r.front()), r.back(), c, limits, "relaxed-start");
       }
     }
   }

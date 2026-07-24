@@ -271,12 +271,17 @@ Module roles:
   - **Read from the RAW map**, not the conservative one: frontier stamping writes voxels into its
     copy, and a stamped point that did not already exist would make genuinely unobserved space read
     as observed.
-  - **Gated on `TREAT_FRONTIER_AS_OBSTACLE`.** The term is applied only when the host supplies a
-    conservative map view; a null one is the host declaring unmapped space is not a hazard here, and
-    the cost follows that rather than arguing with it. In code the condition is simply `cons`
-    non-null in `applyClearanceObjective` — the same signal that enables the cost-field override.
-    Truncation's unobserved-space stop is gated on the same thing, so the flag is a genuine master
+  - **Gated on `TREAT_FRONTIER_AS_OBSTACLE`**, carried into the core as `Config::
+    treat_unknown_as_hazard` and driving truncation's stop as well, so the flag is a genuine master
     switch: with it off, nothing anywhere in the pipeline distinguishes unknown from free.
+    **Gated on the flag itself, NOT on a conservative map view existing** — that was a real bug
+    worth not repeating. The node only builds the conservative view once a frontier cloud has
+    arrived (`TREAT_FRONTIER_AS_OBSTACLE && frontier_cloud_`), so keying off it meant a late or
+    missing `/octomap_frontier` silently switched off both guards with the flag still on — visible
+    only as `unk_cost` quietly vanishing from the `[plan]` line. Neither guard needs the frontier
+    cloud: both read the raw octree, where a cell with no node has never been observed. The node now
+    warns (throttled, naming the resolved topic and its publisher count) when the flag is on but no
+    cloud has arrived, since that state is otherwise invisible.
 
   Admissibility is preserved (the term is ≥ 0, so the integrand stays ≥ 1 and both heuristics remain
   lower bounds). **Accuracy caveat:** OMPL integrates the objective trapezoidally over states
@@ -416,18 +421,123 @@ requires it; validate any change in `USE_SIM_MODE`/SITL first. Notable behavior:
   because closed-loop control near the ground with noisy VIO causes skidding.
 - **Online hover-thrust estimation**: back-calculates hover thrust from filtered command + measured
   vertical accel, de-weighting the estimate at high vertical speed; overridable via `MPC_HOVER_THRUST`.
-- **Differential-flatness feed-forward (added on top, default OFF)**: `setReference()` accepts
+- **Differential-flatness feed-forward (added on top; `PositionControl`'s own default is OFF, but the
+  node now ships `ENABLE_FEEDFORWARD` defaulted `true`)**: `setReference()` accepts
   `vel_ff`/`acc_ff`; with feed-forward disabled the controller is byte-identical to the baseline
   (the `feedforward` unit test asserts this). Toggle live with the `ENABLE_FEEDFORWARD` parameter.
   Feed-forward is suppressed during the takeoff ramp. The accel→attitude/thrust map *is* the flatness
   output stage and already existed — that's why trajectory tracking didn't require a new controller.
 
+  **Exactly two quantities are fed forward, at two structurally different points**, and the
+  difference is the part worth remembering:
+  - `vel_ff` is added to the velocity setpoint **before** the clamp and therefore **before** the
+    velocity PID, so it does not bypass the loop — it raises the target the loop chases. The velocity
+    error becomes `(Kp_pos·e_pos + vel_ff) − vel_meas`, which is what stops the controller needing a
+    standing position error (and a wound-up integrator) just to hold speed.
+  - `acc_ff` is added to the acceleration setpoint **after** the PID, so it genuinely bypasses
+    feedback and goes straight into the attitude/thrust map. That is what tilts the vehicle into a
+    turn when the trajectory asks, rather than after error has accumulated.
+
+  **Not** fed forward: **jerk** (the trajectory has it and the QP pins it at the splice, but jerk maps
+  to angular *rate* and the node publishes `VehicleAttitudeSetpoint` with only `q_d` + `thrust_body`,
+  so there is no channel — the pinned jerk buys reference continuity, not a command) and **yaw rate**
+  (`Reference` has no such field by design; `yaw_sp_move_rate` is left at zero). Three gates must all
+  be open for any of it: `ENABLE_FEEDFORWARD`, tracker mode `kTracking` (the tracker forces it off in
+  `kDirect`/`kHoverHold`), and `!_is_taking_off`.
+
 `flatness_mapper` samples the trajectory for pos/vel/acc and derives **yaw from the velocity
 heading** (camera leads the motion), holding the last yaw only when slow *and* the heading is
-spinning. `trajectory_tracker` composes the mapper + controller and runs the **watchdog state
-machine**: `kDirect` (explicit setpoint — takeoff/manual hover), `kTracking` (follow a fresh planner
-trajectory), `kHoverHold` (failsafe: latch current position when guidance goes stale, i.e. the
-planner stalled/died). The stale fallback hovers; it does not land (PX4 rejects offboard land).
+spinning. The polynomial evaluation itself lives in `common/trajectory_eval` (`evalTrajectory` /
+`sampleMotion`), not in the mapper, because planning needs it too — a replan samples the trajectory
+it is about to replace. `trajectory_tracker` composes the mapper + controller and runs the
+**watchdog state machine**: `kDirect` (explicit setpoint — takeoff/manual hover), `kTracking`
+(follow a fresh planner trajectory), `kHoverHold` (failsafe: latch current position when guidance
+goes stale, i.e. the planner stalled/died). The stale fallback hovers; it does not land (PX4 rejects
+offboard land).
+
+**Mode precedence is strictly ordered, and `POS_SP` is NOT an override.** The branch order in
+`TrajectoryTracker::update` is: fresh trajectory → `kTracking`; else *any* installed trajectory →
+`kHoverHold`; else direct setpoint → `kDirect`. Two consequences that surprise operators:
+
+- **Changing `POS_SP` while a goal is being tracked does nothing.** The node re-reads the parameter
+  and pushes it in via `setSetpoint()` every tick, so it is accepted silently — stored, never used,
+  no warning. A fresh trajectory always wins.
+- **`POS_SP` is unreachable for as long as a trajectory is installed, even after guidance dies.**
+  The stale case falls to `kHoverHold` (latch *current* position), not to `kDirect`. The only thing
+  that restores `POS_SP` is `reset()`, i.e. a disarm or leaving offboard. (Before the splice work
+  `reset()` did not clear trajectories either, so `POS_SP` was dead for the rest of the process once
+  the first trajectory landed. It now clears them, so an interruption genuinely restores it.)
+
+So `POS_SP` is a **pre-takeoff / no-goal setpoint only**. There is no "return to setpoint" or abort
+path through it, and **there is no goal-cancel API at all**: `AutonomyCore::has_goal_` is set by
+`setGoal` and never cleared, so once a goal is published the worker replans toward it forever. If an
+in-flight abort is wanted it needs to be built — the honest options are a goal-clear that drops the
+tracker back to `kDirect`, or reusing the node's existing latched `NAV_LAND` failsafe.
+
+**Replans splice onto the outgoing trajectory; they are not rest-to-rest.** `solveQP`'s start
+boundary pins position *and* velocity/acceleration/jerk to a `common::MotionState`; only the END is
+at rest (which is what makes an un-replaced trajectory a safety stop). `AutonomyCore::spliceAnchor`
+builds that state by sampling the **outgoing trajectory** at `t0 = now + lead` — deliberately not
+from the estimator, since the reference is what the controller tracks and therefore what must be
+continuous, and feeding VIO velocity / IMU accel back in would both inject estimator noise into the
+boundary conditions and forgive the accumulated tracking error every replan. It falls back to rest
+at the measured position when there is no outgoing trajectory (first plan) or the tracker has gone
+stale into hover-hold. The committed path is re-rooted at the splice point, not the drone, so the
+corridor is grown around where the trajectory actually starts (rooting at the measured position
+would put the splice point outside region 0 under tracking error, making the start equality
+infeasible).
+
+The **lead is measured, not tuned**: a decaying max of observed `runTrajgen` wall times × 1.5,
+clamped to [`kLeadMin` 0.04 s, `kLeadMax` 0.5 s], timed around the whole call including failures.
+This works because `setTrajectory` **stages** rather than engages — the tracker holds a new
+trajectory until wall-clock reaches its `t0` and keeps evaluating the old one until then. So
+overshooting the lead costs nothing (bias it high), while overrunning it only starts the trajectory
+slightly past its own beginning and logs a line saying so. Note the corollary: a trajectory does
+**not** take effect on the tick that produced it, which is what `test_autonomy_core` and
+`test_trajectory_tracker` pin.
+
+**Two known gaps in this area — read before flying tracked trajectories:**
+
+1. **No airborne gate: a trajectory can pre-empt the takeoff ramp.** The worker plans and stages
+   while disarmed (state feed sits above the arm gate by design), and a fresh trajectory beats the
+   direct setpoint. So if a goal is live when you arm, the first `stepControl` engages `kTracking`
+   with a ground-level reference, and the open-loop ramp — which triggers on *reference* z > 0.5 —
+   fires partway into the trajectory instead of cleanly off the ground, holds the vehicle flat and
+   climbing while the reference runs away horizontally, then hands back to the PID at z > 1.0 with a
+   large accumulated error. `reset()` clearing trajectories narrows this but does not close it: the
+   worker re-stages within one `TRAJGEN_PERIOD`. **Needs an explicit "don't leave `kDirect` until
+   takeoff completed" gate.**
+2. **The plain min-snap path (`USE_CORRIDOR_QP=false`) is still rest-to-rest.** It inherits the
+   splice *position* and the lead anchor, but `MinSnapTrajectory` has no start-derivative boundary,
+   so engaging it while moving steps the velocity reference to zero — the exact stutter the corridor
+   path was fixed for. Tolerable only because that mode is the obstacle-blind one anyway. Give
+   `MinSnapTrajectory` a start-derivative boundary before relying on it.
+3. **`_lim_tilt` is dead code — there is NO tilt limit.** It is assigned in the constructor (0.43 rad,
+   ~25°) and by `setConstraints`, and then read nowhere. `_accelerationControl` builds `body_z`
+   straight from the unbounded thrust vector with no saturation. This matters most for feed-forward:
+   `acc_ff` is added to `_acc_sp` *after* the PID, so a trajectory's commanded acceleration converts
+   directly into commanded tilt with nothing bounding it. Not dangerous at present limits (`AMAX`
+   1.5 m/s² ⇒ atan(1.5/9.81) ≈ 8.7°), but the guard you appear to have does not exist.
+4. **`setConstraints()` is never called by anything** — not the tracker, the core, or the node. So
+   the limits are constructor defaults: `_lim_vel_horz` **10.0 m/s**, up 2.0, down 1.0. The comment
+   at the `vel_ff` injection says it is added before the clamp "so the total commanded velocity stays
+   within the configured limits", which is true but the configured limit is ~10× `VMAX`. The clamp is
+   not a meaningful bound on the feed-forward as wired. Fixing 3 and 4 together means plumbing
+   `VMAX`/`AMAX` into `setConstraints` from the same config the QP uses, and applying `_lim_tilt` in
+   `_accelerationControl`. **Deliberately not done** — `position_control.cpp` is the flight-tested
+   file and this should wait until after the first tracked flight.
+
+**Corridor conservatism with a moving start (expect this on the bench).** The corridor bounds the
+Bézier *control points*, and the low-index ones are built from the start derivatives scaled by
+segment time: `b3 = 3Tv/7 + 3T²a/42 + T³j/210`. A 4 s segment multiplies start jerk by ~0.3, so an
+aggressive splice state in a narrow region can push a control point outside and make the QP refuse a
+curve that would actually have stayed inside. Replanning while manoeuvring hard in a tight corridor
+is when this bites. Shorter `MAX_SEGMENT_LEN` weakens it; MINVO attacks it directly.
+
+A moving start also adds one **genuinely physical** infeasibility: braking from v0 within distance d
+needs `a >= v0²/(2d)` whatever the time allocation, so the seed-growth loop cannot rescue a committed
+prefix shorter than the stopping distance. At `VMAX` 1.0 / `AMAX` 1.5 that is 0.33 m, so it should
+not bite — but read it as "the prefix is too short to stop in", not as a tuning failure.
 
 ### autonomy_node (`ros2/autonomy_node/`)
 
@@ -439,6 +549,17 @@ applies the **yaw-drift correction** (toward PX4's yaw) and the ENU→NED/FRD co
 arrive on `/planner/goal` (geometry_msgs/PoseStamped, position only — yaw ignored); a `POS_SP`
 parameter provides the default takeoff/hover setpoint. All PX4 message types and frame conversions
 are confined to this file.
+
+**BUG (open): `state.acc` is not rotated out of the body frame.** `onSensorCombined` takes
+`SensorCombined.accelerometer_m_s2` — a **body-frame FRD** measurement — and passes it through
+`frames::pxNedToEnu`, which is a static axis swap documented for *world* vectors, then subtracts
+9.81 from z. There is no rotation by attitude, so it is only correct while the vehicle is level; at
+20° of tilt roughly 3.4 m/s² of gravity is misattributed into the horizontal axes. It has stayed
+invisible because the only consumer is the hover-thrust estimator, which uses z (nearly right at
+small tilts). Fix it by rotating with the vehicle attitude before removing gravity. Relevant to more
+than the estimator now: `state.acc` is an obvious-looking input for anything wanting a measured
+acceleration, and it is wrong. (The trajectory splice deliberately does *not* use it — see the
+control section.)
 
 **Sensor-health watchdog (node-level, distinct from the core's `kHoverHold` / `STALE_TIMEOUT`
 planner-stale→hover path).** The node stamps a per-stream last-receive time (`t_px4_odom_ /
@@ -568,7 +689,9 @@ publish nothing and cost nothing when the flag is off:
   false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is never sampled, the
   corridor snapshot is never taken, and the publish methods early-return. **Now defaulted true for
   bench validation** — turn it off for a real flight so the NUC pays nothing for it.
-- `TREAT_FRONTIER_AS_OBSTACLE` (bool, default `true`) — stamp RTAB-Map's frontier cloud
+- `TREAT_FRONTIER_AS_OBSTACLE` (bool, **currently defaulted `false`** for corridor bench tests, so
+  the decomposition is exercised against real obstacles alone; `true` is the intended flight
+  setting) — stamp RTAB-Map's frontier cloud
   (`/rtabmap/octomap_global_frontier_space`, remapped in the launch) as occupied voxels into a deep
   **copy** of each incoming octomap, fed to the core as the **conservative** map view (the raw map
   stays the optimistic search view — dual-map; a small keep-out ball around the drone stays
@@ -577,12 +700,15 @@ publish nothing and cost nothing when the flag is off:
   growth **and the search's cost objective** — but never its collision check, which stays optimistic
   (see *Two fields, two questions*). NOTE: on a fresh map almost everything is frontier — the drone
   is boxed in until it has scanned its surroundings.
-  **This is the master switch for "is unmapped space a hazard".** Everything that treats unknown
-  space as dangerous is gated on the conservative view existing, which is gated on this flag: the
-  stamped shell itself, `UNKNOWN_WEIGHT`'s cost surcharge, and `truncatePath`'s stop at
-  never-observed cells. Turn it off and the pipeline is byte-for-byte the legacy one in this
-  respect — unknown reads as ordinary free space everywhere. The gate is `conservative != nullptr`
-  in `plannerLoop` / `planOnce`, which is also null before the first frontier cloud arrives.
+  **This is the master switch for "is unmapped space a hazard".** It gates three things: the stamped
+  shell, `UNKNOWN_WEIGHT`'s cost surcharge, and `truncatePath`'s stop at never-observed cells. Turn
+  it off and the pipeline is the legacy one in this respect — unknown reads as ordinary free space
+  everywhere. The last two are gated via `Config::treat_unknown_as_hazard`, set straight from this
+  parameter, **not** via whether a conservative map view exists: that view needs a frontier cloud,
+  and those two guards do not (they read the raw octree), so tying them to it made a missing
+  `/octomap_frontier` disable them silently. The shell genuinely does need the cloud, so with the
+  flag on but no cloud the node warns and you run without the shell's gradient but with both octree
+  guards intact.
 - `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
   short of the goal (the reachable point closest to it) instead of reporting "no path"; the worker
   keeps advancing the endpoint as the map grows.

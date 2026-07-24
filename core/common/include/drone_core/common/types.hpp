@@ -19,6 +19,19 @@ struct State {
   double stamp{0.0};  // seconds
 };
 
+// Position and its first three derivatives at a single instant. This is the
+// boundary state a replanned trajectory splices onto: pinning all four at the
+// new trajectory's start leaves the reference C3 continuous across the switch,
+// which is the same continuity the corridor QP already enforces at its own
+// interior junctions. Default-constructed it is "at rest", the correct boundary
+// for the first plan of a flight and for a replan off a hover.
+struct MotionState {
+  Eigen::Vector3d pos{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d vel{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d acc{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d jerk{Eigen::Vector3d::Zero()};
+};
+
 // The reference the position controller tracks at a single instant. Velocity
 // and acceleration are differential-flatness feed-forward terms; with both at
 // zero the controller degrades gracefully to pure position tracking. There is

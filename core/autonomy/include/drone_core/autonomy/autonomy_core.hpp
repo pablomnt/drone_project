@@ -65,10 +65,22 @@ public:
     // fly there through the unknown. Read as "how many metres of detour through
     // mapped space is one metre through unmapped space worth". 0 disables it.
     //
-    // Only applied when the host supplies a conservative map view — i.e. with
-    // TREAT_FRONTIER_AS_OBSTACLE off this term is skipped entirely, since that
-    // flag is the host declaring unmapped space is not a hazard here.
-    double unknown_weight{10.0};
+    // Only applied when treat_unknown_as_hazard is set (below).
+    double unknown_weight{0.5};
+
+    // Whether unmapped space counts as a hazard at all. Drives BOTH the cost
+    // surcharge above and truncatePath's refusal to commit into never-observed
+    // cells; false restores the legacy behaviour where unknown reads as ordinary
+    // free space everywhere. Set from TREAT_FRONTIER_AS_OBSTACLE.
+    //
+    // Deliberately a flag of its own rather than inferred from whether a
+    // conservative map view exists. The two are not the same thing: the host
+    // only builds that view once a frontier cloud has arrived, so inferring from
+    // it meant a late or missing /octomap_frontier silently disabled both guards
+    // even with the flag on. Neither guard needs the frontier cloud — both read
+    // the raw octree, where a cell with no node has never been observed — so
+    // they should stay on whenever the operator asked for them.
+    bool treat_unknown_as_hazard{true};
     double trajgen_period{1.0};       // local trajectory replan period [s]
     // Corridor-QP trajectory generation (Stage 1). When true, runTrajgen
     // replaces plain min-snap with the safe-corridor pipeline: truncate the
@@ -244,12 +256,34 @@ private:
   // `conservative` handle it depends on, instead of being re-derived here from
   // which map objects happen to be distinct.
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
+                  const common::MotionState& start,
                   const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
                   const planning::MapHandle& cons_map,
                   const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj);
   void stagePending(const common::Trajectory& traj);
   void plannerLoop();
+
+  // Where a replan must begin, so that engaging it does not step the reference.
+  struct SpliceAnchor {
+    common::MotionState start;   // boundary condition handed to the optimiser
+    double t0{0.0};              // wall-clock instant the new trajectory engages
+    bool from_trajectory{false};  // false => fell back to rest at the measured position
+  };
+
+  // Resolve that anchor at planning time. The new trajectory will not engage the
+  // moment it is solved — the solve itself takes time — so it is anchored a lead
+  // time ahead and pinned to the state the OUTGOING trajectory will be in then.
+  // Deliberately sampled from the outgoing trajectory rather than from the
+  // estimator: the reference is what the controller tracks, so the reference is
+  // what has to be continuous, and feeding VIO velocity / IMU acceleration back
+  // into the planner would both inject estimator noise into the trajectory's
+  // boundary conditions and forgive the accumulated tracking error every replan.
+  // Falls back to rest at the measured position when there is no outgoing
+  // trajectory to splice onto (first plan of a flight) or when the tracker has
+  // stopped following the last one (stale -> hover-hold), since matching a curve
+  // the vehicle is no longer on would command a jump. Worker thread only.
+  SpliceAnchor spliceAnchor(const common::State& state, double t_now) const;
 
   // Configure `planner` with the shared clearance-aware objective used by BOTH
   // the monitor and improve passes, so a forced replan and an improvement
@@ -320,7 +354,9 @@ private:
   mutable std::mutex traj_mutex_;
   common::Trajectory pending_;
   bool has_pending_{false};
-  common::Trajectory last_planned_;  // retained for visualisation
+  common::Trajectory last_planned_;  // retained for visualisation and as the splice source
+  double last_planned_at_{0.0};      // when it was staged, for the staleness check
+  bool has_last_planned_{false};     // cleared on reset() — see spliceAnchor
   std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
   planning::GeometricPlanner::SearchTree last_search_tree_;  // debug viz; empty unless enabled
   std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
@@ -330,6 +366,25 @@ private:
   std::atomic<bool> running_{false};
   std::vector<std::vector<double>> cached_path_;
   double last_trajgen_{-1.0e9};
+
+  // Replan lead time (worker thread only). How far ahead of "now" a replan is
+  // anchored, so it is ready by the time it is due to engage. Measured rather
+  // than guessed: the corridor QP runs a BOBYQA search over cold OSQP solves and
+  // its cost swings with the number of regions, so a fixed number would be
+  // either wasteful or routinely wrong. Held as a decaying max of observed solve
+  // times, times a safety factor — a one-off slow solve raises it, and it falls
+  // back down if that was not representative.
+  //
+  // Overrunning the lead costs a small transient (the trajectory engages
+  // slightly past its start); overshooting it costs nothing at all, because the
+  // tracker holds a staged trajectory until its t0. So this is deliberately
+  // biased high.
+  static constexpr double kLeadSafetyFactor = 1.5;
+  static constexpr double kLeadMaxDecay = 0.9;   // per trajgen tick
+  static constexpr double kLeadMin = 0.04;       // two 50 Hz control ticks [s]
+  static constexpr double kLeadMax = 0.5;        // [s]
+  double trajgen_solve_max_{0.0};
+  double trajgen_lead_{kLeadMin};
 
   // Cached distance field and the map it was built from — the single obstacle
   // model for both collision validity and the clearance cost. See clearanceField.

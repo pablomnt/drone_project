@@ -2,14 +2,28 @@ import launch
 import launch_ros.actions
 import launch_ros.substitutions
 import launch.actions
+import launch.substitutions
 import os
 
 def generate_launch_description():
-    
+
     config_file = os.path.expandvars('$HOME/ws_paramio/src/ros2/third_party/okvis2/config/realsense_D435i.yaml')
     cpu_script_path = os.path.expandvars('$HOME/ws_paramio/src/ros2/tools/system_monitor_pkg/system_monitor_pkg/cpu_monitor.py')
 
     return launch.LaunchDescription([
+
+        # The only RViz in this stack is the one okvis's own launch file starts for
+        # its VIO mesh/trajectory view; both okvis launch XMLs gate that node on an
+        # `rviz` arg we simply never passed. Forward it so it can be turned off on
+        # the NUC, where RViz is a meaningful share of the CPU budget and the same
+        # data is already reachable over the Foxglove bridge from another machine.
+        # Defaults true so the launch behaves exactly as before unless asked:
+        #     ros2 launch autonomy_node autonomy_vision_launch.py rviz:=false
+        launch.actions.DeclareLaunchArgument(
+            'rviz',
+            default_value='true',
+            description="Start okvis's RViz view. Set false to save CPU on the NUC."
+        ),
 
         # Start the autonomy node (wraps the drone_core stack).
         # The map now comes from RTAB-Map's own ray-traced octomap (see the rtabmap
@@ -84,13 +98,20 @@ def generate_launch_description():
         # OKVIS logs through glog (the 'I0629 ...' lines: pose-init, RANSAC, large
         # reprojection error), which floods the terminal. GLOG_minloglevel=1 drops
         # its INFO chatter while keeping warnings/errors, so the planning logs stay
-        # readable. (rviz stays on — the okvis launch brings up its own rviz2 for
-        # the VIO mesh/trajectory view.)
+        # readable. This launch also owns the stack's only rviz2 (for the VIO
+        # mesh/trajectory view), gated on the `rviz` launch argument above.
+        #
+        # The command is built as a LIST of substitution fragments rather than an
+        # f-string: `rviz` is a LaunchConfiguration resolved at launch time, not a
+        # Python value, so it cannot be interpolated into a string here.
         launch.actions.ExecuteProcess(
             cmd=[
                 'bash', '-c',
-                f"GLOG_minloglevel=2 ros2 launch okvis okvis_node_subscriber.launch.xml "
-                f"config_filename:={config_file}"
+                [
+                    'GLOG_minloglevel=2 ros2 launch okvis okvis_node_subscriber.launch.xml ',
+                    f'config_filename:={config_file} ',
+                    'rviz:=', launch.substitutions.LaunchConfiguration('rviz'),
+                ]
             ],
             output='screen'
         ),

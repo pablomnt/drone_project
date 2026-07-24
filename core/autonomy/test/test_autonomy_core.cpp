@@ -51,6 +51,19 @@ int main() {
 
     check(core.planOnce(), "planOnce produced a trajectory");
 
+    // A freshly planned trajectory is anchored a lead time ahead of the solve,
+    // so it does not engage on the tick that produced it — the tracker holds it
+    // until its t0. Stepping control at the planning instant must therefore
+    // still show no tracking; this is the property that makes a generous lead
+    // free rather than a source of reference jumps.
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "staged trajectory does not engage before its t0");
+
+    // Past the lead it takes over. planOnce never updates the measured lead, so
+    // this is still the kLeadMin floor (0.04 s); 0.1 s clears it without eating
+    // into the 0.5 s stale timeout this core is configured with.
+    fake_time += 0.1;
+    core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
     auto cmd = core.stepControl(0.02);
     check(!core.inHoverHold(), "tracking after a fresh trajectory");
     check(core.hasTrajectory(), "trajectory is active");
@@ -78,15 +91,15 @@ int main() {
     double fake_time = 100.0;
     core.setClock([&fake_time]() { return fake_time; });
 
-    // Solid floor at z = 0, with the flight volume above it marked FREE. This
-    // case passes no conservative view, so truncation's unobserved-space stop is
-    // off and only the clearance walk runs — but the free cells are written
-    // anyway, because a real RTAB-Map octomap carries ray-traced free space and
-    // a map that is only an obstacle list is not a model of the live pipeline.
-    // With a conservative view supplied it would matter directly: truncation
-    // then stops at the first cell the map has no node for, and an obstacles-
-    // only map reads as "nothing here was ever observed" and commits nothing.
-    // That path is covered by the `unknown_cost` test.
+    // Solid floor at z = 0, with the flight volume above it marked FREE. The
+    // free cells are load-bearing: treat_unknown_as_hazard defaults true, so
+    // truncation stops at the first cell the map has no node for, and a map that
+    // is only an obstacle list reads as "nothing here was ever observed" and
+    // commits nothing. Note this holds even though no conservative view is
+    // passed — the guard keys off the flag, not off that view, precisely so a
+    // missing frontier cloud cannot silently disable it. A real RTAB-Map octomap
+    // carries ray-traced free space for the same reason, so writing it here is
+    // what makes this a model of the live pipeline rather than an obstacle list.
     // Stepped over integer indices, not by accumulating += 0.1 into a double:
     // the accumulated error drifts across voxel boundaries and leaves unmapped
     // gaps in what is supposed to be a solid block, which now shows up as

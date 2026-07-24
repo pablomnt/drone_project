@@ -1,5 +1,7 @@
 #include "drone_core/planning/corridor_trajectory.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <type_traits>
@@ -123,7 +125,7 @@ Csc toCsc(const Eigen::MatrixXd& A, bool upper_only) {
 
 }  // namespace
 
-bool CorridorTrajectoryOptimizer::solveQP(const Eigen::Vector3d& start,
+bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
                                           const Eigen::Vector3d& goal,
                                           const std::vector<double>& times,
                                           const std::vector<ConvexRegion>& regions,
@@ -180,13 +182,20 @@ bool CorridorTrajectoryOptimizer::solveQP(const Eigen::Vector3d& start,
 
   int row = 0;
 
-  // Start boundary: p(0) = start, v/a/jerk(0) = 0 (rest — matches the existing
-  // min-snap; inheriting the live velocity is a Stage-2 improvement).
+  // Start boundary: position and its first three derivatives pinned to the
+  // state the vehicle will be in when this trajectory takes over. On a replan
+  // that is the outgoing trajectory sampled at the switch instant, so the two
+  // curves agree to C3 there and the reference — including the flatness
+  // feed-forward the controller consumes — crosses the splice with no step. A
+  // caller with no such state (first plan of a flight, replan off a hover)
+  // passes a default-constructed MotionState and gets the old rest start.
+  const std::array<const Eigen::Vector3d*, 4> start_deriv = {&start.pos, &start.vel, &start.acc,
+                                                             &start.jerk};
   for (int d = 0; d <= 3; ++d) {
     const Eigen::RowVectorXd r0 = derivRow(d, 0.0) / std::pow(times[0], d);
     for (int ax = 0; ax < kAxes; ++ax) {
       A.block(row, idx(0, ax), 1, kCoeffs) = r0;
-      lower(row) = upper(row) = d == 0 ? start(ax) : 0.0;
+      lower(row) = upper(row) = (*start_deriv[d])(ax);
       ++row;
     }
   }
@@ -329,7 +338,7 @@ namespace {
 // plain min-snap optimiser).
 struct CorridorTimeContext {
   const CorridorTrajectoryOptimizer* solver;
-  Eigen::Vector3d start;
+  common::MotionState start;
   Eigen::Vector3d goal;
   const std::vector<ConvexRegion>* regions;
   double time_penalty;
@@ -358,8 +367,8 @@ double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& 
 }  // namespace
 
 bool CorridorTrajectoryOptimizer::optimizeTrajectory(
-    const std::vector<Eigen::Vector3d>& waypoints, const std::vector<ConvexRegion>& regions,
-    common::Trajectory& out) const {
+    const common::MotionState& start, const std::vector<Eigen::Vector3d>& waypoints,
+    const std::vector<ConvexRegion>& regions, common::Trajectory& out) const {
   if (waypoints.size() < 2 || regions.size() != waypoints.size() - 1) return false;
   const int S = static_cast<int>(regions.size());
 
@@ -373,18 +382,29 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   for (int s = 0; s < S; ++s) {
     times[s] = (waypoints[s + 1] - waypoints[s]).norm() / limits_.vmax + kSeedBuffer;
   }
+  // A moving start needs time to shed that speed on top of the traversal, and
+  // the seed above knows nothing about it — at the old rest start this term was
+  // always zero. Charge the whole braking time to the first segment: it is only
+  // a seed, and BOBYQA redistributes it. Without this a fast replan starts the
+  // search inside the infeasible region and burns growth iterations getting out.
+  times[0] += limits_.amax > 0.0 ? start.vel.cwiseAbs().maxCoeff() / limits_.amax : 0.0;
   {
     common::Trajectory probe;
     int grow = 0;
     while (grow < kMaxSeedGrowth &&
-           !solveQP(waypoints.front(), waypoints.back(), times, regions, probe)) {
+           !solveQP(start, waypoints.back(), times, regions, probe)) {
       for (double& t : times) t *= 1.5;
       ++grow;
     }
+    // Note this cannot rescue a corridor that is simply too SHORT to stop in:
+    // braking from v0 inside distance d needs a >= v0^2/(2d) whatever the time
+    // allocation, so stretching time does not help. That is a real physical
+    // refusal (the committed prefix is shorter than the stopping distance) and
+    // the caller must treat it as "no trajectory", not as a tuning failure.
     if (grow == kMaxSeedGrowth) return false;  // corridor unusable at any sane duration
   }
 
-  CorridorTimeContext ctx{this, waypoints.front(), waypoints.back(), &regions,
+  CorridorTimeContext ctx{this, start, waypoints.back(), &regions,
                           kTimePenalty, kInfeasiblePenalty};
 
   nlopt::opt optimizer(nlopt::LN_BOBYQA, S);
@@ -406,9 +426,9 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // Final solve at the chosen allocation. The search started feasible, but
   // BOBYQA returns its lowest evaluated point, which can sit just inside the
   // infeasible boundary; retry once with a modest stretch before giving up.
-  if (solveQP(waypoints.front(), waypoints.back(), times, regions, out)) return true;
+  if (solveQP(start, waypoints.back(), times, regions, out)) return true;
   for (double& t : times) t *= 1.5;
-  return solveQP(waypoints.front(), waypoints.back(), times, regions, out);
+  return solveQP(start, waypoints.back(), times, regions, out);
 }
 
 }  // namespace drone_core::planning

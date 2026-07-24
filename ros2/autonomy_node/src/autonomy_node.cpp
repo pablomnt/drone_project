@@ -181,7 +181,7 @@ public:
 private:
   void declareParameters() {
     declare_parameter<bool>("USE_SIM_MODE", false);
-    declare_parameter<bool>("ENABLE_FEEDFORWARD", false);
+    declare_parameter<bool>("ENABLE_FEEDFORWARD", true);
 
     declare_parameter("MPC_XY_P", 0.95);
     declare_parameter("MPC_Z_P", 1.0);
@@ -205,7 +205,7 @@ private:
     // tunables live in geometric_planner.hpp (PlannerConfig).
     declare_parameter<std::string>("PLANNER_TYPE", "EITstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
-    declare_parameter("CLEARANCE_WEIGHT", 2.0);
+    declare_parameter("CLEARANCE_WEIGHT", 1.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
     // Flat extra cost per metre of path routed through never-observed space.
     // CLEARANCE_WEIGHT cannot do this job: the distance field saturates at
@@ -244,7 +244,7 @@ private:
     // Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
     // so with this on the drone is boxed in until it has mapped its surroundings
     // (e.g. an initial 360deg scan) — flip it off for open-loop bench tests.
-    declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", true);
+    declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", false);
     // Best-effort goal seeking. When true (default), a goal in unreachable or
     // still-unmapped space no longer produces "no path": the planner routes to the
     // reachable point closest to the goal (the frontier edge) and the worker keeps
@@ -341,6 +341,12 @@ private:
     cfg.clearance_weight = get_parameter("CLEARANCE_WEIGHT").as_double();
     cfg.clearance_threshold = get_parameter("CLEARANCE_THRESHOLD").as_double();
     cfg.unknown_weight = get_parameter("UNKNOWN_WEIGHT").as_double();
+    // Whether unmapped space is a hazard at all — drives the cost surcharge and
+    // truncation's refusal to commit into unobserved cells. Passed as its own
+    // flag rather than left for the core to infer from the presence of a
+    // conservative map view: that view only exists once a frontier cloud has
+    // arrived, and both guards work off the raw octree without one.
+    cfg.treat_unknown_as_hazard = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
     cfg.trajgen_period = get_parameter("TRAJGEN_PERIOD").as_double();
     cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
     cfg.debug_planner_viz = get_parameter("DEBUG_PLANNER_VIZ").as_bool();
@@ -473,12 +479,28 @@ private:
     // matching the loop's live-parameter pattern; before the first frontier
     // cloud arrives only the raw map is fed.
     std::shared_ptr<octomap::OcTree> conservative;
-    if (get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool() && frontier_cloud_) {
+    const bool want_frontier = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
+    if (want_frontier && frontier_cloud_) {
       const Eigen::Vector3d& p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
       conservative = std::make_shared<octomap::OcTree>(*map);
       stampFrontierOccupied(*conservative, *frontier_cloud_,
                             octomap::point3d(p.x(), p.y(), p.z()),
                             drone_core::planning::GeometricPlanner::frontierKeepOutRadius());
+    } else if (want_frontier) {
+      // Asked for but not available: no shell is stamped, so the search gets no
+      // gradient steering it away from the frontier and the corridor's regions
+      // are bounded only by real obstacles. The octree-based guards (the cost
+      // surcharge and truncation's unobserved-space stop) still hold, so this is
+      // a degradation rather than a hole — but it is invisible from the plan
+      // log, which is why it is said out loud. Names the resolved topic and its
+      // publisher count so "wrong remap" and "RTAB-Map is not publishing it" are
+      // distinguishable.
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "TREAT_FRONTIER_AS_OBSTACLE is on but no frontier cloud has arrived on '%s' "
+          "(%zu publishers) - no frontier shell is being stamped",
+          sub_frontier_->get_topic_name(),
+          count_publishers(sub_frontier_->get_topic_name()));
     }
 
     // One-time confirmation the core is actually being fed a map (and how dense).

@@ -31,4 +31,8 @@ if(DRONE_CORE_BUILD_TESTS)
   add_executable(test_flatness_mapper test/test_flatness_mapper.cpp)
   target_link_libraries(test_flatness_mapper PRIVATE drone_core_control)
   add_test(NAME flatness_mapper COMMAND test_flatness_mapper)
+
+  add_executable(test_trajectory_tracker test/test_trajectory_tracker.cpp)
+  target_link_libraries(test_trajectory_tracker PRIVATE drone_core_control)
+  add_test(NAME trajectory_tracker COMMAND test_trajectory_tracker)
 endif()
