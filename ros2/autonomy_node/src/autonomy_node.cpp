@@ -205,8 +205,28 @@ private:
     // tunables live in geometric_planner.hpp (PlannerConfig).
     declare_parameter<std::string>("PLANNER_TYPE", "EITstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
-    declare_parameter("CLEARANCE_WEIGHT", 1.0);
+    declare_parameter("CLEARANCE_WEIGHT", 2.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
+    // Flat extra cost per metre of path routed through never-observed space.
+    // CLEARANCE_WEIGHT cannot do this job: the distance field saturates at
+    // CLEARANCE_THRESHOLD, so anything further than that from a mapped obstacle
+    // scores a proximity penalty of exactly zero — which is most of the unknown
+    // volume, plus everything outside the map's bounding box. Raise this if the
+    // planner still prefers leaving mapped space to detouring within it; set it
+    // to 0 for the old behaviour.
+    //
+    // Ignored entirely when TREAT_FRONTIER_AS_OBSTACLE is false, along with
+    // truncation's unobserved-space stop: that flag is the single switch for
+    // whether unmapped space is treated as a hazard at all.
+    //
+    // Keep this LOW. It defocuses the informed planners (BIT*/AIT*/EIT*), which
+    // sample only where ||start-x|| + ||x-goal|| <= best cost so far. Those are
+    // straight-line estimates that do not see this term, so raising the true
+    // cost without raising the estimate inflates the sampled region until it
+    // covers the whole state space and the search spreads everywhere. Measured
+    // with the goal beyond the frontier, fraction of tree nodes near the direct
+    // line: 0 -> 100%, 0.5 -> 91%, 1 -> 49%, 2 -> 17%, 10 -> 9%.
+    declare_parameter("UNKNOWN_WEIGHT", 0.5);
     declare_parameter("TRAJGEN_PERIOD", 1.0);
     // Geometry-first bring-up: with this false the planner only runs RRT* and
     // publishes the geometric path; it does not generate a trajectory or feed
@@ -320,6 +340,7 @@ private:
     cfg.replan_improve_ratio = get_parameter("REPLAN_IMPROVE_RATIO").as_double();
     cfg.clearance_weight = get_parameter("CLEARANCE_WEIGHT").as_double();
     cfg.clearance_threshold = get_parameter("CLEARANCE_THRESHOLD").as_double();
+    cfg.unknown_weight = get_parameter("UNKNOWN_WEIGHT").as_double();
     cfg.trajgen_period = get_parameter("TRAJGEN_PERIOD").as_double();
     cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
     cfg.debug_planner_viz = get_parameter("DEBUG_PLANNER_VIZ").as_bool();

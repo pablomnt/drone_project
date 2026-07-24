@@ -116,7 +116,8 @@ std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& pa
 std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservative_clearance,
                                           const std::vector<Eigen::Vector3d>& path,
                                           double margin, double escape_ramp,
-                                          double sample_step) {
+                                          double sample_step,
+                                          const CorridorUnknownFn& is_unknown) {
   if (path.size() < 2) return path;
   const Eigen::Vector3d& start = path.front();
 
@@ -133,7 +134,15 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
   // within centimetres and truncates the path to nothing. Clearance must
   // additionally be strictly positive everywhere (never inside an
   // occupied/unknown voxel), so leniency near the start never means blindness.
+  // Unobserved space is an absolute stop, checked BEFORE the clearance test and
+  // exempt from the ramp. The ramp trades margin for the ability to move at all,
+  // which is a reasonable trade against a hazard whose distance we can measure;
+  // it is not a reasonable trade against space we have never looked at. And the
+  // clearance test cannot catch this on its own — it measures distance to the
+  // stamped frontier shell, which has gaps, so a path leaving through one reads
+  // as high-clearance the whole way out. See the header.
   const auto safe = [&](const Eigen::Vector3d& q) {
+    if (is_unknown && is_unknown(q.x(), q.y(), q.z())) return false;
     const double d = conservative_clearance(q.x(), q.y(), q.z());
     if (d <= 0.0) return false;
     if (escape_ramp <= 0.0) return d >= margin;  // ramp disabled

@@ -54,6 +54,21 @@ public:
     bool best_effort_goal{true};
     double clearance_weight{4.0};     // obstacle-proximity penalty weight
     double clearance_threshold{1.0};  // clearance saturation distance / EDT maxdist [m]
+    // Flat extra cost charged per metre of path routed through space that has
+    // never been observed. This is NOT expressible as a clearance weight: the
+    // distance field saturates at clearance_threshold, so every point further
+    // than that from a mapped obstacle scores a proximity penalty of exactly
+    // zero — including the whole interior of unmapped space and everything
+    // outside the field's bounding box. Stamping the frontier buys a gradient
+    // near the shell only, and the shell has gaps, so without this term the
+    // cheapest route to a distant goal can be to leave mapped space entirely and
+    // fly there through the unknown. Read as "how many metres of detour through
+    // mapped space is one metre through unmapped space worth". 0 disables it.
+    //
+    // Only applied when the host supplies a conservative map view — i.e. with
+    // TREAT_FRONTIER_AS_OBSTACLE off this term is skipped entirely, since that
+    // flag is the host declaring unmapped space is not a hazard here.
+    double unknown_weight{10.0};
     double trajgen_period{1.0};       // local trajectory replan period [s]
     // Corridor-QP trajectory generation (Stage 1). When true, runTrajgen
     // replaces plain min-snap with the safe-corridor pipeline: truncate the
@@ -219,9 +234,19 @@ private:
   // truncation and the octree supplies the windowed obstacle points the
   // polyhedral corridor decomposition consumes; without them (or with the flag
   // off) trajgen is plain min-snap over the waypoints.
+  //
+  // is_unknown, when non-empty, makes truncation stop at the first point in
+  // never-observed space — a check the distance field cannot make, because the
+  // stamped shell it measures against has gaps. The CALLER decides whether to
+  // supply it, and supplies it only when a conservative map view exists (i.e.
+  // TREAT_FRONTIER_AS_OBSTACLE is on). Passed as the predicate rather than as a
+  // map handle so that decision is visible at the call site next to the
+  // `conservative` handle it depends on, instead of being re-derived here from
+  // which map objects happen to be distinct.
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
                   const planning::MapHandle& cons_map,
+                  const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj);
   void stagePending(const common::Trajectory& traj);
   void plannerLoop();
@@ -237,6 +262,12 @@ private:
   // the search returning paths that run tangent to the frontier and get cut to
   // almost nothing by truncation. Validity is never scored against `cons` —
   // that would make the stamped frontier impassable.
+  //
+  // `cons` being non-null is also what enables the unknown-space surcharge
+  // (unknown_weight): a null one means the host has TREAT_FRONTIER_AS_OBSTACLE
+  // off and does not want unmapped space treated as a hazard, so the cost stays
+  // out of it. This gates the cost only — truncation's stop at unobserved space
+  // is a safety property and holds regardless.
   //
   // Returns false and leaves the planner length-optimal when the search map has
   // no obstacles (clearance is then uniform and the EDT meaningless).

@@ -15,6 +15,12 @@ namespace drone_core::planning {
 // generator knowing anything about octomap.
 using CorridorClearanceFn = std::function<double(double x, double y, double z)>;
 
+// True when a world point lies in space that has never been observed. Same shape
+// as GeometricPlanner's UnknownFn, and for the same reason: the host wires it to
+// an octree lookup, a test to an analytic predicate, and neither the corridor
+// stages nor the planner need to know which.
+using CorridorUnknownFn = std::function<bool(double x, double y, double z)>;
+
 // Convex free region: the space one trajectory segment may occupy, as the
 // half-space intersection A·p <= b (one row per face, row normals unit-length
 // so b carries metric distance). General polyhedra rather than axis-aligned
@@ -115,13 +121,28 @@ std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& pa
 // everywhere). Clearance must always be strictly positive regardless, so the
 // prefix can never enter an occupied or unknown voxel.
 //
+// `is_unknown`, when supplied, is an ABSOLUTE stop: the prefix is cut before the
+// first sample lying in space that has never been observed, whatever the
+// clearance there says and regardless of the escape ramp. This is a genuine hole
+// in the clearance test rather than a refinement of it. The conservative field
+// measures distance to the stamped frontier shell, so it only reports danger
+// within its saturation distance of that shell — and the shell is not reliably
+// closed (the sensor's field of view leaves gaps, and the host deliberately
+// leaves an unstamped ball around the vehicle). A path leaving mapped space
+// through such a gap sees high clearance the whole way and is committed in full.
+// Asking the octree whether a cell exists closes that: unobserved is unobserved,
+// with no dependence on the shell's geometry, and it is correct outside the
+// map's bounding box too. Pass an empty function to disable (clearance-only
+// behaviour).
+//
 // The result is the safe prefix: the original waypoints passed, plus the last
 // safe sampled point as its endpoint. A result with fewer than 2 points means
 // nothing of the path is safely committable (the caller falls back / holds).
 std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservative_clearance,
                                           const std::vector<Eigen::Vector3d>& path,
                                           double margin, double escape_ramp = 1.0,
-                                          double sample_step = 0.05);
+                                          double sample_step = 0.05,
+                                          const CorridorUnknownFn& is_unknown = {});
 
 // Full corridor for a path: resample to the segment cap, then grow one convex
 // free region per segment via DecompUtil's ellipsoid decomposition against the

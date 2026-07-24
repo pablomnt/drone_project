@@ -78,11 +78,27 @@ int main() {
     double fake_time = 100.0;
     core.setClock([&fake_time]() { return fake_time; });
 
-    // Solid floor at z = 0 under the whole flight volume.
+    // Solid floor at z = 0, with the flight volume above it marked FREE. This
+    // case passes no conservative view, so truncation's unobserved-space stop is
+    // off and only the clearance walk runs — but the free cells are written
+    // anyway, because a real RTAB-Map octomap carries ray-traced free space and
+    // a map that is only an obstacle list is not a model of the live pipeline.
+    // With a conservative view supplied it would matter directly: truncation
+    // then stops at the first cell the map has no node for, and an obstacles-
+    // only map reads as "nothing here was ever observed" and commits nothing.
+    // That path is covered by the `unknown_cost` test.
+    // Stepped over integer indices, not by accumulating += 0.1 into a double:
+    // the accumulated error drifts across voxel boundaries and leaves unmapped
+    // gaps in what is supposed to be a solid block, which now shows up as
+    // truncation refusing to commit.
     auto octree = std::make_shared<octomap::OcTree>(0.1);
-    for (double x = -1.0; x <= 4.0; x += 0.1) {
-      for (double y = -1.0; y <= 1.0; y += 0.1) {
+    for (int ix = -10; ix <= 40; ++ix) {
+      for (int iy = -10; iy <= 10; ++iy) {
+        const double x = ix * 0.1, y = iy * 0.1;
         octree->updateNode(octomap::point3d(x, y, 0.0), true);
+        for (int iz = 1; iz <= 20; ++iz) {
+          octree->updateNode(octomap::point3d(x, y, iz * 0.1), false);
+        }
       }
     }
     core.setMap(octree);  // no conservative view: the raw map serves both roles

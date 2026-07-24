@@ -102,6 +102,11 @@ public:
   // Returns the clearance (metres to the nearest obstacle) at a world point.
   using ClearanceFn = std::function<double(double x, double y, double z)>;
 
+  // True when a world point lies in space that has never been observed. Kept
+  // separate from ClearanceFn because it answers a question a distance field
+  // structurally cannot: see setUnknownPenalty.
+  using UnknownFn = std::function<bool(double x, double y, double z)>;
+
   // planning_time is the optimisation budget per solve [s]. Every supported
   // planner is anytime — it keeps improving the solution until the budget
   // expires — so a larger value returns a more optimal path at the cost of a
@@ -139,6 +144,50 @@ public:
   // where setClearance put them; this changes only which field is sampled.
   void setCostClearance(ClearanceFn clearance);
 
+  // Charge a FLAT extra cost per metre flown through space that has never been
+  // observed. The path cost becomes
+  //   integral of ( 1 + weight * max(0, threshold - clearance) + unknown_weight )
+  // where the last term applies only where is_unknown reports true. Pass an
+  // empty function or a weight <= 0 to disable it (the default).
+  //
+  // Deliberately NOT part of the clearance field, for two reasons.
+  //
+  // A distance field cannot express this. The field saturates at its maxdist,
+  // which the host sets equal to the penalty threshold, so any point further
+  // than the threshold from a mapped obstacle scores a penalty of exactly zero.
+  // That includes the whole interior of unmapped space and everything outside
+  // the field's bounding box. Stamping the frontier as an obstacle only buys a
+  // gradient within `threshold` of the stamped shell; past it, unknown space is
+  // the cheapest airspace in the problem. Raising the clearance weight cannot
+  // fix that, because it multiplies a zero.
+  //
+  // And the charge must be flat rather than a ramp. A ramp fades out as the
+  // path gets further from the boundary, which means a route that dives deep
+  // into unmapped space eventually stops paying for it. A flat per-metre charge
+  // is paid for every metre out there, so among routes that must end in unknown
+  // space (a goal beyond the frontier) the planner prefers the one that enters
+  // late and travels least far inside — which is the behaviour wanted.
+  //
+  // This does NOT make unknown space invalid. The collision check still reads
+  // it as free, so goals beyond the mapped frontier are still accepted and
+  // best-effort still chases them; unknown space merely becomes expensive.
+  // Safety against actually flying there is truncation's job (see truncatePath).
+  //
+  // The cost-to-go heuristics stay admissible because the term is never
+  // negative, so the integrand remains >= 1 and straight-line distance is still
+  // a lower bound on true cost.
+  //
+  // Accuracy: OMPL integrates the objective trapezoidally over states
+  // interpolated at the state-validity resolution — for this space a step of
+  // roughly half a metre — so a surcharge that switches on at a boundary is
+  // smeared across the straddling segment, and the total lands within about
+  // (step * weight) of the exact charge. That is fine for steering the search,
+  // which is all this is for; it is emphatically NOT a safety mechanism, and a
+  // sliver of unobserved space thinner than the step can be missed entirely.
+  // Keeping the vehicle out of unmapped space is truncatePath's job, and that
+  // samples independently at its own resolution.
+  void setUnknownPenalty(UnknownFn is_unknown, double weight);
+
   // Select which OMPL planner planPath builds. The per-planner parameters come
   // from the PlannerConfig defaults in this header. Default is RRT*.
   void setPlannerType(PlannerType type) { planner_type_ = type; }
@@ -159,6 +208,12 @@ public:
   // an approximate (best-effort) one that stops short, +infinity if the last
   // planPath found no solution at all. Lets the host score best-effort progress
   // (a candidate reaching a smaller gap has advanced toward the goal).
+  //
+  // Always measured against the goal the *caller* passed, so it stays comparable
+  // with the host's own endpoint-to-goal distances even when the search actually
+  // ran to a projected goal (see lastGoalProjection); a path that ends at the
+  // projection is genuinely still that far from the commanded point, and the gap
+  // therefore never drops below lastGoalProjection().
   double lastGoalGap() const { return last_goal_gap_; }
 
   // How far short of the goal a solution may stop and still count as reaching it
@@ -166,11 +221,34 @@ public:
   // planner instance.
   static constexpr double goalFlexibility() { return kGoalFlexibility; }
 
+  // How far [m] the requested goal had to be moved to become a state the search
+  // can accept (see projectGoal): 0 when it was already valid, positive when it
+  // was projected out to the collision margin, +infinity when no valid point was
+  // found within kGoalProjectRadius and planPath refused to run. Refers to the
+  // most recent planPath call. Purely informational — the host logs it so an
+  // operator can see the drone will stop short of the point they commanded.
+  double lastGoalProjection() const { return last_goal_projection_; }
+
+  // The goal the most recent planPath actually handed to OMPL: the requested
+  // goal, or its projection when that was invalid. Meaningless if
+  // lastGoalProjection() is +infinity.
+  const std::array<double, 3>& lastPlanningGoal() const { return last_planning_goal_; }
+
   // Plan from start to goal (each [x, y, z]); fills result_path with waypoints.
   // Returns false if no solution is found within the planner time budget. In
-  // strict mode also returns false for an approximate solution stopping more than
-  // kGoalFlexibility from the goal; in best-effort mode (setBestEffort) such a
-  // solution is accepted and lastGoalGap() reports the residual.
+  // strict mode also returns false for a solution ending more than
+  // kGoalFlexibility from the requested goal, whether it stopped short or the
+  // goal was projected out of collision; in best-effort mode (setBestEffort) such
+  // a solution is accepted and lastGoalGap() reports the residual.
+  //
+  // A goal the collision check rejects (out of bounds, or within kCollisionMargin
+  // of an obstacle) is not handed to OMPL as-is: the planners discard invalid goal
+  // states and then abort with "no goal states are available", so a goal parked
+  // near a wall would yield no path at all rather than an approach to it. It is
+  // projected to the nearest valid point first (see projectGoal), which is exactly
+  // where a margin-respecting approach would have to stop anyway. Returns false
+  // without solving if no such point exists within kGoalProjectRadius — the goal
+  // is buried inside an obstacle and there is nothing sensible to fly toward.
   bool planPath(const std::vector<double>& start,
                 const std::vector<double>& goal,
                 std::vector<std::vector<double>>& result_path);
@@ -185,16 +263,20 @@ public:
   // against the committed one for a hysteresis-gated replan decision.
   double pathCost(const std::vector<std::vector<double>>& path) const;
 
-  // pathCost split into its two additive terms. The objective integrates
-  // (1 + w·max(0, threshold − clearance)) over arc length, so the baseline unit
-  // term integrates to the path's geometric length and the remainder is the
-  // obstacle-proximity penalty. total == pathCost(path). Purely diagnostic: lets
-  // a replan log show whether a path scores high because it is long or because it
-  // hugs obstacles. Same +infinity convention as pathCost for <2-point paths.
+  // pathCost split into its additive terms. The objective integrates
+  // (1 + w·max(0, threshold − clearance) + unknown_weight·[unknown]) over arc
+  // length, so the baseline unit term integrates to the path's geometric length
+  // and the rest splits into the obstacle-proximity penalty and the
+  // unknown-space surcharge. total == pathCost(path). Purely diagnostic: lets a
+  // replan log show whether a path scores high because it is long, because it
+  // hugs obstacles, or because it routes through unmapped space — three problems
+  // with three different fixes. `unknown` is 0 when no surcharge is configured.
+  // Same +infinity convention as pathCost for <2-point paths.
   struct CostBreakdown {
-    double length;     // arc-length term [m] (== pathCost with no clearance field)
-    double clearance;  // obstacle-proximity penalty term (total − length)
-    double total;      // length + clearance (== pathCost(path))
+    double length;     // arc-length term [m] (== pathCost with no penalties)
+    double clearance;  // obstacle-proximity penalty term
+    double unknown;    // unknown-space surcharge term (see setUnknownPenalty)
+    double total;      // length + clearance + unknown (== pathCost(path))
   };
   CostBreakdown costBreakdown(const std::vector<std::vector<double>>& path) const;
 
@@ -237,7 +319,31 @@ public:
 
 private:
   bool isStateValid(const ompl::base::State* state);
-  ompl::base::OptimizationObjectivePtr makeObjective() const;
+
+  // The whole collision model in one place, in world coordinates: true when
+  // (x, y, z) clears the margin that applies there (see kCollisionMargin /
+  // kStartMargin). isStateValid is a thin adapter over this, and projectGoal
+  // uses it directly so "valid goal" cannot drift from "valid state".
+  bool positionValid(double x, double y, double z) const;
+
+  // Nearest point to `goal` that positionValid accepts, written to `out`.
+  // Returns false when there is none within kGoalProjectRadius.
+  //
+  // The goal is first clamped inside the state-space bounds (OMPL discards
+  // out-of-bounds goal states for the same reason it discards colliding ones),
+  // then, if it still collides, a shell search walks outward in kGoalProjectStep
+  // increments over kGoalProjectDirections quasi-uniform directions and takes the
+  // first radius that yields any valid point. Ties at that radius go to the
+  // candidate nearest the start: every point on the shell is equally far from the
+  // goal, but the one on the drone's side of whatever is in the way is the one
+  // the search stands a chance of reaching, and it cannot be a point on the far
+  // side of a thin wall. Anchor start_pos_ before calling (planPath does).
+  bool projectGoal(const std::vector<double>& goal, std::array<double, 3>& out) const;
+
+  // Build the optimisation objective. include_unknown=false omits the
+  // unknown-space surcharge, which costBreakdown uses to separate that term
+  // from the obstacle-proximity one.
+  ompl::base::OptimizationObjectivePtr makeObjective(bool include_unknown = true) const;
 
   // Construct and configure the OMPL planner selected by planner_type_, applying
   // the matching PlannerConfig sub-struct. Called once per planPath.
@@ -254,9 +360,18 @@ private:
 
   // True when any clearance field is set, i.e. the planner is running in
   // clearance-aware mode rather than optimising pure path length. Either field
-  // alone is enough to put it in that mode.
+  // alone is enough to put it in that mode. The unknown penalty counts too: it
+  // shapes the cost the same way, so the cost-aware shortcut must be used
+  // rather than the plain length-only simplifier, which would happily straighten
+  // a path back through unmapped space.
   bool clearanceMode() const {
-    return static_cast<bool>(clearance_fn_) || static_cast<bool>(cost_clearance_fn_);
+    return static_cast<bool>(clearance_fn_) || static_cast<bool>(cost_clearance_fn_) ||
+           unknownPenaltyActive();
+  }
+
+  // True when the unknown-space surcharge is set and would actually charge.
+  bool unknownPenaltyActive() const {
+    return static_cast<bool>(unknown_fn_) && unknown_weight_ > 0.0;
   }
 
   // The field the cost objective samples: the cost-specific one when the host
@@ -291,6 +406,11 @@ private:
   double clearance_weight_ = 1.0;       // obstacle-proximity penalty weight
   double clearance_threshold_ = 1.0;    // clearance saturation distance [m]
 
+  // Flat per-metre surcharge for unobserved space (see setUnknownPenalty).
+  // Null / zero => no surcharge, which is the historical behaviour.
+  UnknownFn unknown_fn_;
+  double unknown_weight_ = 0.0;
+
   // Validity margins [m]. A state is free when its clearance exceeds the margin:
   // kCollisionMargin in general, the reduced kStartMargin within kStartEscapeRadius
   // of the start so a parked/lifting drone can root the search (see isStateValid).
@@ -312,8 +432,32 @@ private:
   // still has intermediate points on long runs instead of one giant segment.
   static constexpr double kMaxShortcutSegment = 4.0;
 
+  // Goal projection (see projectGoal). kGoalProjectRadius bounds how far the goal
+  // may be moved before planPath gives up: past it the request is not a point
+  // "near an obstacle" but one buried deep inside structure, with no nearby
+  // free point that could be called the same goal. Deliberately generous,
+  // because the two modes want opposite things and each already has its own
+  // guard: best-effort mode wants the closest reachable approach and the caller
+  // reads lastGoalGap() to decide what to do with it, while strict mode rejects
+  // any solution ending further than kGoalFlexibility from the *requested* goal,
+  // projection included. So this bound only has to exclude the absurd.
+  //
+  // The step is the search granularity — finer than the 0.05 m map resolution
+  // buys nothing — and the direction count sets the angular resolution (~18° at
+  // 128 directions, so ~0.16 m apart on the kCollisionMargin shell), fine enough
+  // to find a gap the vehicle could fit through in the first place. The six axis
+  // directions are searched on top of the lattice: octomap obstacles are boxes,
+  // so the shortest way out of one is usually exactly along an axis, and leaving
+  // that to a quasi-random lattice would cost up to half a lattice spacing of
+  // extra displacement on the most common geometry there is.
+  static constexpr double kGoalProjectRadius = 2.0;
+  static constexpr double kGoalProjectStep = 0.05;
+  static constexpr int kGoalProjectDirections = 128;
+
   bool best_effort_ = false;    // accept approximate solutions (see setBestEffort)
   double last_goal_gap_ = 0.0;  // residual goal distance of the last solve (see lastGoalGap)
+  double last_goal_projection_ = 0.0;         // goal displacement of the last solve
+  std::array<double, 3> last_planning_goal_{};  // goal actually given to OMPL
 
   bool record_tree_ = false;  // capture the OMPL tree each solve (debug viz only)
   SearchTree last_tree_;      // tree from the most recent planPath

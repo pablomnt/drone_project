@@ -108,7 +108,10 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
   Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
   OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (fast, map-free corridor-QP checks
   against analytic oracles — run it with `ctest -R corridor` on every planning edit),
-  `autonomy_core` (plan→track→watchdog).
+  `goal_projection` (invalid-goal → nearest-valid-state projection; analytic clearance fields and
+  0.5 s solve budgets, ~3 s total, so it also runs on every planning edit),
+  `unknown_cost` (unknown-space surcharge + truncation's hard stop; analytic predicates, ~0.5 s,
+  also on every planning edit), `autonomy_core` (plan→track→watchdog).
 - ROS packages use `ament_lint_auto` / `ament_lint_common` via `colcon test`; the python packages
   (`pc_publisher` C++ aside, `system_monitor_pkg`) carry the standard flake8/pep257/copyright triplet.
 
@@ -203,14 +206,108 @@ Module roles:
   required clearance drops to `kStartMargin` (0 m) so a parked/just-lifting drone — sitting within the
   normal margin of the mapped floor — can root the tree; obstacles are never skipped (clearance must
   still exceed 0, i.e. not inside a voxel). Anchored at the start in `planPath`, at the first waypoint
-  in `isPathValid`. `kGoalFlexibility` (0.3 m): RRT* approximate solutions that stop farther than this
-  from the goal are **rejected** (`planPath` returns false → caller sees infinite cost) rather than
-  committing to a path that ends short. All four are `static constexpr` in the class (deliberately not
+  in `isPathValid`. `kGoalFlexibility` (0.3 m): solutions ending farther than this from the
+  **requested** goal are **rejected** (`planPath` returns false → caller sees infinite cost) rather than
+  committing to a path that ends short — whether the search stopped short or the goal was projected
+  (below). All four are `static constexpr` in the class (deliberately not
   ROS params). `setClearance(fn, weight, threshold)` sets that validity field and the
   **clearance-aware cost**'s weight/threshold (obstacle-proximity integral penalty up to
   `clearance_threshold`); `isPathValid()` re-checks a committed path under the same model;
   `pathCost()` scores a waypoint list for the hysteresis gate; `minClearance()` reports a path's
   tightest clearance (diagnostic / logging).
+
+  **Goal projection — why an invalid goal is not a refusal.** The collision check applies to *every*
+  state OMPL touches, the goal included, and OMPL discards invalid goal states inside
+  `PlannerInputStates::nextGoal` and then aborts (`EIT*: No solution can be found as no goal states
+  are available`). So a goal within `kCollisionMargin` of a mapped obstacle used to produce **no path
+  at all** rather than an approach that stops at the margin, and `BEST_EFFORT_GOAL` could not rescue
+  it — best-effort accepts a search that *stopped short of a valid goal*, and here the search never
+  ran. Note this is about mapped obstacles only: unknown space reads as free in the optimistic
+  validity field, so a goal beyond the frontier was never the problem.
+  `planPath` therefore projects the goal before solving (`projectGoal`): clamp into the state-space
+  bounds, and if it still collides, walk outward in `kGoalProjectStep` (0.05 m) shells over the six
+  axis directions plus a 128-point Fibonacci lattice, taking the first radius that yields a valid
+  point and, among those, the candidate nearest the start — every point on the shell is equally far
+  from the goal, but the one on the drone's side is the one the search can reach and cannot be a point
+  through a thin wall. The axes are searched explicitly because octomap obstacles are boxes, so the
+  shortest way out is usually a face normal. `kGoalProjectRadius` (2.0 m) bounds the displacement;
+  past it `planPath` returns false without solving and `lastGoalProjection()` reports infinity, which
+  the plan log turns into `[goal (…) is inside an obstacle: no point clearing 0.5m nearby]`. The
+  radius is deliberately generous because both modes already have their own guard: strict mode
+  rejects anything ending more than `kGoalFlexibility` from the requested goal, and best-effort wants
+  the closest safe approach whatever the distance. `lastGoalGap()` is measured from the solution
+  endpoint to the **requested** goal (not OMPL's `getSolutionDifference()`, which would measure to
+  the projection), so it stays comparable with the host's own endpoint-to-goal distances in the
+  best-effort ADVANCE test. A successful projection is logged as a suffix on the tick's `[plan]`
+  line — the drone will deliberately stop short of the commanded point, which the operator has to be
+  able to see. Covered by the fast `goal_projection` test (`ctest -R goal_projection`, ~3 s), which
+  also duplicates the walled-off-goal assertions from the slow `planner` test.
+
+  **The unknown-space surcharge — `setUnknownPenalty`.** A distance field cannot make unmapped
+  space expensive, and this is structural rather than a tuning failure. The EDT saturates at its
+  `maxdist`, which the host sets equal to `CLEARANCE_THRESHOLD`, so any point further than the
+  threshold from a mapped obstacle scores a proximity penalty of **exactly zero** — that covers the
+  interior of unmapped space and everything outside the field's bounding box (where
+  `makeClearanceFn` returns the saturation distance by convention). Stamping the frontier buys a
+  gradient within `CLEARANCE_THRESHOLD` of the stamped shell and nothing beyond it, and the shell is
+  not reliably closed: the sensor's field of view leaves gaps, and `kFrontierKeepOutRadius`
+  deliberately leaves one around the vehicle. The observed failure was the planner routing
+  *backwards* out through a gap and then flying to the goal through unmapped space, because that
+  route was genuinely cheaper. Raising `CLEARANCE_WEIGHT` cannot fix it — it multiplies a zero.
+  The fix adds a third term to the objective, giving
+  `∫(1 + w·max(0, threshold − clearance) + unknown_weight·[unknown]) ds`, where `[unknown]` is a
+  **predicate on the octree** (`map->search(p) == nullptr`, i.e. no node ⇒ never observed) rather
+  than a field lookup. That is O(log n), allocation-free, has no dependence on the shell's geometry,
+  and is correct outside the map's bounding box. Three properties are deliberate:
+  - **Flat, not a ramp.** A distance-based penalty fades out as the path gets further from the
+    boundary, so a route diving deep into unmapped space eventually stops paying. A flat per-metre
+    charge is paid for every metre out there, so among routes that must end in unknown space (a goal
+    beyond the frontier) the search prefers the one entering latest and travelling least far inside.
+  - **Cost only, never validity.** Unknown space stays *enterable*: the collision check still reads
+    it as free, so `EIT*` still accepts a goal beyond the frontier and `BEST_EFFORT_GOAL` still
+    chases it. Making it invalid would wall the search into the mapped region and reintroduce the
+    "no goal states are available" failure. Keeping the vehicle out is truncation's job, not the
+    search's.
+  - **Read from the RAW map**, not the conservative one: frontier stamping writes voxels into its
+    copy, and a stamped point that did not already exist would make genuinely unobserved space read
+    as observed.
+  - **Gated on `TREAT_FRONTIER_AS_OBSTACLE`.** The term is applied only when the host supplies a
+    conservative map view; a null one is the host declaring unmapped space is not a hazard here, and
+    the cost follows that rather than arguing with it. In code the condition is simply `cons`
+    non-null in `applyClearanceObjective` — the same signal that enables the cost-field override.
+    Truncation's unobserved-space stop is gated on the same thing, so the flag is a genuine master
+    switch: with it off, nothing anywhere in the pipeline distinguishes unknown from free.
+
+  Admissibility is preserved (the term is ≥ 0, so the integrand stays ≥ 1 and both heuristics remain
+  lower bounds). **Accuracy caveat:** OMPL integrates the objective trapezoidally over states
+  interpolated at the state-validity resolution (~0.5 m for this state space), so a step-function
+  surcharge is smeared across the straddling segment and the total lands within about
+  `step × weight` of exact. Fine for steering the search; **not** a safety mechanism — a sliver of
+  unobserved space thinner than the step can be missed entirely. `CostBreakdown` gained an
+  `unknown` field so the `[plan]` line reports `len=… + clr_cost=… + unk_cost=…` (the last shown
+  only when charged), because "long", "hugs a wall" and "routes through unmapped space" need
+  different fixes. Covered by `ctest -R unknown_cost` (~0.5 s).
+
+  **Truncation stops at unobserved space (when `TREAT_FRONTIER_AS_OBSTACLE` is on).** The same
+  predicate is a hard stop in `truncatePath`, checked *before* the clearance test and **exempt from
+  the escape ramp**. The caller supplies the predicate only when a conservative view exists and
+  passes an empty one otherwise, so with the flag off truncation is exactly the clearance walk it
+  always was. It is passed down as the predicate rather than as a map handle specifically so that
+  decision sits at the call site beside the `conservative` handle it depends on, instead of being
+  re-derived inside `runTrajgen` from which map objects happen to be distinct. This is a
+  genuine hole in the clearance test rather than a refinement of it: the conservative field measures
+  distance to the stamped shell, so a path leaving mapped space through a gap in that shell reads as
+  high-clearance the whole way out and was committed in full — after which the corridor grew regions
+  out there and the QP certified them, since the obstacle list only contains occupied and stamped
+  voxels. The ramp exemption is the point: the ramp trades margin for the ability to move at all,
+  which is defensible against a hazard whose distance we can measure, and unobserved space is not
+  that. **This makes free cells load-bearing.** RTAB-Map's `Grid/RayTracing true` carves free space
+  along each ray, `toOcTree` copies free leaves with their log-odds, and free nodes survive the
+  binary octomap round-trip — so the flight volume has nodes and truncation commits normally. But a
+  map carrying *only* obstacles now reads as "nothing here has ever been observed" and commits
+  nothing; the `autonomy_core` test had to start writing free space for this reason. The empty-
+  truncation log names which test stopped it (`path leaves observed space at the drone` vs
+  `clearance below the ramped margin`), since those want opposite responses.
 
   **Two fields, two questions — `setCostClearance`.** The cost may be scored against a *different*
   field from the collision check, and under `USE_CORRIDOR_QP` + `TREAT_FRONTIER_AS_OBSTACLE` it is.
@@ -438,6 +535,34 @@ publish nothing and cost nothing when the flag is off:
   *frontier*, and is therefore the main lever on how much of the path survives truncation — at the
   cost of longer detours, and of a goal at the frontier being approached more reluctantly.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
+- `UNKNOWN_WEIGHT` (double, default `10.0`) — flat extra cost charged per metre of path routed
+  through never-observed space (see *The unknown-space surcharge*). Read it as "how many metres of
+  detour through mapped space is one metre through unmapped space worth". **`CLEARANCE_WEIGHT`
+  cannot substitute for this**: the distance field saturates at `CLEARANCE_THRESHOLD`, so unmapped
+  space beyond that scores a proximity penalty of exactly zero and the weight multiplies a zero.
+  Raise it if the planner still prefers leaving mapped space to detouring within it; `0` restores
+  the old behaviour. Affects the cost only — unknown space stays enterable, so goals beyond the
+  frontier still work. **Ignored when `TREAT_FRONTIER_AS_OBSTACLE` is false**, along with
+  truncation's unobserved-space stop: that flag is the single switch for whether unmapped space is
+  treated as a hazard at all.
+
+  **Raising this defocuses the informed planners, and badly.** BIT*/AIT*/EIT* sample only where
+  `‖start−x‖ + ‖x−goal‖ ≤ best_cost_so_far`, and both distances are straight-line estimates that
+  know nothing about this term. Inflating the true cost without inflating the estimate inflates that
+  sampling region, and once it exceeds the state-space diameter (~30 m here) the search degenerates
+  to uniform sampling — the tree spreads behind the drone with almost nothing between start and
+  goal. Measured on a mapped room with the goal 10 m beyond the frontier, as the fraction of tree
+  nodes near the straight start→goal line: weight 0 → 100%, 0.5 → 91%, 1 → 49%, 2 → 17%, 5 → 8%,
+  10 → 9%; the loss tracks `path_cost / straight_line_distance` exactly (1.00, 1.39, 1.77, 2.54,
+  4.85, 8.71). **It only bites when the goal is beyond the frontier** — with the goal inside mapped
+  space the optimal path pays no surcharge, cost stays near the straight-line distance, and the tree
+  is unchanged even at weight 10. Which is to say it bites in the normal exploration case.
+  **And it buys less than it looks like it should**: when the goal is beyond the frontier every
+  candidate route ends in unknown space and pays a similar charge, so the term is close to a
+  constant offset that shifts all costs without changing which route wins. It discriminates only
+  between routes that differ in how many *metres* of unknown they traverse (flying out and around
+  the outside of the map), which is what the `unknown_cost` test checks. Keep it low, and remember
+  the exact defence against flying into unmapped space is truncation, not this.
 - `DEBUG_PLANNER_VIZ` (bool, default `true`) — **single switch** for the debug planner
   visualisation (search tree, clearance field, corridor). Designed to be zero-cost when off: with it
   false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is never sampled, the
@@ -452,6 +577,12 @@ publish nothing and cost nothing when the flag is off:
   growth **and the search's cost objective** — but never its collision check, which stays optimistic
   (see *Two fields, two questions*). NOTE: on a fresh map almost everything is frontier — the drone
   is boxed in until it has scanned its surroundings.
+  **This is the master switch for "is unmapped space a hazard".** Everything that treats unknown
+  space as dangerous is gated on the conservative view existing, which is gated on this flag: the
+  stamped shell itself, `UNKNOWN_WEIGHT`'s cost surcharge, and `truncatePath`'s stop at
+  never-observed cells. Turn it off and the pipeline is byte-for-byte the legacy one in this
+  respect — unknown reads as ordinary free space everywhere. The gate is `conservative != nullptr`
+  in `plannerLoop` / `planOnce`, which is also null before the first frontier cloud arrives.
 - `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
   short of the goal (the reachable point closest to it) instead of reporting "no path"; the worker
   keeps advancing the endpoint as the map grows.
@@ -516,8 +647,8 @@ map, so nothing distinguishes unknown space from free space).
 | false | *(any)* | true | conservative | none — control stays on `POS_SP` | search only |
 | true | false | false | raw | plain min-snap | **no** |
 | true | false | true | conservative | plain min-snap | search only (trajectory may still cut corners between waypoints) |
-| true | true | false | raw | corridor QP | obstacles only — corridor is collision-free but unknown reads as free |
-| true | true | true | **optimistic** (raw) validity, **conservative** cost | corridor QP | **yes** — full Stage 1: optimistic search, conservative truncation + corridor |
+| true | true | false | raw | corridor QP | obstacles only — with the flag off nothing distinguishes unknown from free anywhere in the pipeline (no surcharge, no truncation stop, no stamped shell), so the corridor is collision-free against mapped obstacles but unknown space reads as free |
+| true | true | true | **optimistic** (raw) validity, **conservative** cost + unknown surcharge | corridor QP | **yes** — full Stage 1: optimistic search, conservative truncation + corridor, unobserved space priced and never committed |
 
 Notes: with `PLAN_TRAJECTORY=false` the corridor snapshot is never populated, so `/planner/corridor`
 stays empty regardless of the other flags — trajgen is where truncation and corridor growth happen.

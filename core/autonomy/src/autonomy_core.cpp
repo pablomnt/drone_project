@@ -68,6 +68,24 @@ planning::CorridorClearanceFn makeClearanceFn(std::shared_ptr<DynamicEDTOctomap>
   };
 }
 
+// "Has this point ever been observed?" as a predicate over the octree. A cell
+// with no node has never been touched by a sensor ray, which is exactly the
+// question, and search() is an O(log n) descent with no allocation. Correct
+// outside the map's bounding box too, where every query returns null.
+//
+// This exists because a distance field structurally cannot answer it: the EDT
+// saturates at its maxdist, so unknown space more than maxdist from a mapped
+// obstacle is indistinguishable from wide-open free space. The frontier-stamped
+// view narrows the gap but does not close it — the stamped shell is only as
+// complete as the sensor's coverage, and the host deliberately leaves an
+// unstamped ball around the vehicle. Asking the tree directly has no such holes.
+planning::CorridorUnknownFn makeUnknownFn(planning::MapHandle map) {
+  return [map = std::move(map)](double x, double y, double z) {
+    return map->search(octomap::point3d(static_cast<float>(x), static_cast<float>(y),
+                                        static_cast<float>(z))) == nullptr;
+  };
+}
+
 // Remaining committed path from the drone's current position. Splits the committed
 // polyline at the drone by exact projection onto each segment (closed-form point-to-
 // segment, clamped to the segment), then returns [drone_pos, wp[i+1], ..., goal]
@@ -251,7 +269,11 @@ bool AutonomyCore::planOnce() {
 
   common::Trajectory traj;
   const planning::MapHandle cons = conservative ? conservative : map;
-  if (!runTrajgen(path, now(), conservativeField(cons), cons, traj)) return false;
+  // Truncation stops at unobserved space only when a conservative view exists —
+  // see the worker's copy of this for why. The predicate reads the RAW map.
+  if (!runTrajgen(path, now(), conservativeField(cons), cons,
+                  conservative ? makeUnknownFn(map) : planning::CorridorUnknownFn{}, traj))
+    return false;
 
   stagePending(traj);
   return true;
@@ -351,6 +373,7 @@ bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal&
 bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                               const std::shared_ptr<DynamicEDTOctomap>& cons_edt,
                               const planning::MapHandle& cons_map,
+                              const planning::CorridorUnknownFn& unknown_fn,
                               common::Trajectory& traj) {
   if (path.size() < 2) return false;
 
@@ -385,8 +408,14 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     // the two stages can be tuned independently. Whatever it is set to, a
     // committed point must still have strictly positive clearance, so the
     // prefix can never reach into an occupied or unknown voxel.
+    // When the caller supplied the unknown predicate it is an absolute stop,
+    // exempt from the escape ramp: the ramp trades margin for mobility against a
+    // hazard whose distance we can measure, and unobserved space is not that.
+    // When it did not — TREAT_FRONTIER_AS_OBSTACLE off — truncation is purely
+    // the clearance walk it always was, and unmapped space reads as free.
     const auto committed =
-        planning::truncatePath(cons_fn, epath, cfg_.frontier_margin, cfg_.escape_ramp_dist);
+        planning::truncatePath(cons_fn, epath, cfg_.frontier_margin, cfg_.escape_ramp_dist,
+                               /*sample_step=*/0.05, unknown_fn);
 
     // Debug viz snapshot, published by the host. Cleared on every corridor tick
     // and refilled only once a corridor is actually built, so a failed tick
@@ -420,7 +449,24 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       // Nothing of the path is safely committable (start hemmed in by frontier
       // or obstacles). Stage nothing: the tracker rides out its current
       // trajectory and falls to the stale hover-hold if this persists.
-      DRONE_LOG_INFO("[trajgen] corridor: truncation empty -> no new trajectory");
+      //
+      // Name which of the two tests stopped it. "The path leaves observed space
+      // immediately" and "the path has too little clearance immediately" want
+      // opposite responses — map more before moving, versus lower a margin —
+      // and on a thinly mapped scene the first is much the more likely, since
+      // an unobserved cell one sample ahead of the drone is enough. Costs one
+      // predicate call, and only on the tick that already failed.
+      const char* why = "clearance below the ramped margin";
+      if (unknown_fn && epath.size() >= 2) {
+        const Eigen::Vector3d d = epath[1] - epath[0];
+        const double n = d.norm();
+        if (n > 1e-9) {
+          const Eigen::Vector3d q = epath[0] + (0.05 / n) * d;
+          if (unknown_fn(q.x(), q.y(), q.z())) why = "path leaves observed space at the drone";
+        }
+      }
+      DRONE_LOG_INFO("[trajgen] corridor: truncation empty (" << why
+                     << ") -> no new trajectory");
       return false;
     }
     snapshotCommitted(committed);
@@ -644,6 +690,28 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
       planner.setCostClearance(makeClearanceFn(cons_edt, cfg_.clearance_threshold));
     }
   }
+
+  // Charge for routing through unobserved space — but only when the host has
+  // supplied a conservative view at all, i.e. TREAT_FRONTIER_AS_OBSTACLE is on.
+  // A null `cons` is the host saying "unmapped space is not a hazard here", and
+  // the search's cost should not argue with that: with the flag off the intended
+  // mode is the legacy one where unknown reads as ordinary free space.
+  //
+  // Note this gates the COST only. truncatePath's stop at unobserved space is
+  // deliberately NOT gated — it is a safety property rather than a preference,
+  // and it reads the octree directly, so it holds whatever the flag says.
+  //
+  // The predicate reads the SEARCH map, not the conservative one, because
+  // frontier stamping writes voxels into its copy and any stamped point that did
+  // not already exist becomes a known cell there — which would make a sliver of
+  // genuinely unobserved space read as observed. The raw map is the honest
+  // record of what the sensors have seen.
+  //
+  // This never touches validity, so unknown space stays enterable and a goal
+  // beyond the frontier is still accepted — it just stops being free.
+  if (cons) {
+    planner.setUnknownPenalty(makeUnknownFn(map), cfg_.unknown_weight);
+  }
   return true;
 }
 
@@ -757,11 +825,15 @@ void AutonomyCore::plannerLoop() {
       const auto committed = planner.costBreakdown(cached_path_);
       const double committed_clr = planner.minClearance(cached_path_);
 
-      // Stream a cost as "total (len=L + clr_cost=C)" so each replan line shows
-      // whether the score is driven by path length or by obstacle proximity.
+      // Stream a cost as "total (len=L + clr_cost=C + unk_cost=U)". The unknown
+      // term is shown only when it is being charged, so the common line stays
+      // as it was — but when a route does leave mapped space, the number that
+      // explains the score is right there rather than hidden inside clr_cost.
       auto fmtCost = [](const planning::GeometricPlanner::CostBreakdown& cb) {
         std::ostringstream os;
-        os << cb.total << " (len=" << cb.length << " + clr_cost=" << cb.clearance << ")";
+        os << cb.total << " (len=" << cb.length << " + clr_cost=" << cb.clearance;
+        if (cb.unknown > 0.0) os << " + unk_cost=" << cb.unknown;
+        os << ")";
         return os.str();
       };
 
@@ -787,6 +859,27 @@ void AutonomyCore::plannerLoop() {
           last_search_tree_ = planner.searchTree();
         }
 
+        // A goal the collision check rejects is planned to at the nearest valid
+        // point instead (see GeometricPlanner::projectGoal), so the drone will
+        // deliberately stop short of what was commanded. Carried as a suffix on
+        // this tick's plan line rather than a line of its own: it is a property of
+        // the solve, and the searches are already rate-limited to the monitor /
+        // improve cadences. Silent in the common case where the goal was valid.
+        std::string goal_note;
+        if (std::isinf(planner.lastGoalProjection())) {
+          goal_note = " [goal (" + std::to_string(goal_vec[0]) + ", " +
+                      std::to_string(goal_vec[1]) + ", " + std::to_string(goal_vec[2]) +
+                      ") is inside an obstacle: no point clearing " +
+                      std::to_string(planner.collisionMargin()) + "m nearby]";
+        } else if (planner.lastGoalProjection() > 0.0) {
+          const auto& pg = planner.lastPlanningGoal();
+          std::ostringstream os;
+          os << " [goal projected " << planner.lastGoalProjection() << "m to clear "
+             << planner.collisionMargin() << "m -> (" << pg[0] << ", " << pg[1] << ", "
+             << pg[2] << ")]";
+          goal_note = os.str();
+        }
+
         if (path_invalid) {
           // Forced replan — adopt unconditionally (safety outranks optimality).
           if (solved) {
@@ -796,15 +889,15 @@ void AutonomyCore::plannerLoop() {
               DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed BLOCKED (clr="
                              << committed_clr << "m < " << planner.collisionMargin()
                              << "m) -> REPLAN cost=" << fmtCost(cand) << " clr="
-                             << planner.minClearance(candidate) << "m");
+                             << planner.minClearance(candidate) << "m" << goal_note);
             else
               DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR no committed path -> PLAN cost="
                              << fmtCost(cand) << " clr="
-                             << planner.minClearance(candidate) << "m");
+                             << planner.minClearance(candidate) << "m" << goal_note);
           } else {
             DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed "
                            << (had_path ? "BLOCKED" : "absent")
-                           << " -> REPLAN FAILED (no path to goal), holding");
+                           << " -> REPLAN FAILED (no path to goal), holding" << goal_note);
           }
         } else {
           // Improve — switch only past the hysteresis margin. RRT* is randomised,
@@ -835,18 +928,18 @@ void AutonomyCore::plannerLoop() {
             adopt(candidate);
             DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE best-effort ADVANCE gap "
                            << committed_gap << "m -> " << cand_gap << "m (goal) cost=" << fmtCost(cand) << " clr="
-                           << planner.minClearance(candidate) << "m");
+                           << planner.minClearance(candidate) << "m" << goal_note);
           } else if (solved && cand_gap <= committed_gap + kGoalProgress && cand.total <= threshold) {
             adopt(candidate);
             DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
                            << " (committed=" << fmtCost(committed) << ") -> ADOPT cost=" << fmtCost(cand) << " clr="
-                           << planner.minClearance(candidate) << "m");
+                           << planner.minClearance(candidate) << "m" << goal_note);
           } else {
             DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
                            << " clr=" << committed_clr << "m gap=" << committed_gap << "m candidate cost="
                            << (solved ? fmtCost(cand) : std::string("inf")) << " gap="
                            << (solved ? std::to_string(cand_gap) : std::string("inf"))
-                           << "m -> keep");
+                           << "m -> keep" << goal_note);
           }
         }
       } else {
@@ -868,7 +961,18 @@ void AutonomyCore::plannerLoop() {
         path.front() = {state.pos.x(), state.pos.y(), state.pos.z()};
         common::Trajectory traj;
         const planning::MapHandle cons = conservative ? conservative : map;
-        if (runTrajgen(path, now(), conservativeField(cons), cons, traj)) {
+        // Truncation stops at unobserved space only when a conservative view
+        // exists, i.e. TREAT_FRONTIER_AS_OBSTACLE is on. A null `conservative`
+        // is the host declaring unmapped space is not a hazard here, and with
+        // that flag off the intended mode is the legacy one throughout: nothing
+        // distinguishes unknown from free, in the cost or in truncation. The
+        // predicate reads the RAW map, never the stamped copy — frontier
+        // stamping writes voxels into that copy, and a stamped point that did
+        // not already exist would make genuinely unobserved space read as
+        // observed.
+        if (runTrajgen(path, now(), conservativeField(cons), cons,
+                       conservative ? makeUnknownFn(map) : planning::CorridorUnknownFn{},
+                       traj)) {
           stagePending(traj);
           last_trajgen_ = t;
         }

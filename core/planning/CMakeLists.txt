@@ -49,4 +49,16 @@ if(DRONE_CORE_BUILD_TESTS)
   add_executable(test_corridor test/test_corridor.cpp)
   target_link_libraries(test_corridor PRIVATE drone_core_planning)
   add_test(NAME corridor COMMAND test_corridor)
+
+  # Goal projection (invalid goal -> nearest valid state). Short solve budgets
+  # and analytic clearance fields, so it also runs on every planning edit.
+  add_executable(test_goal_projection test/test_goal_projection.cpp)
+  target_link_libraries(test_goal_projection PRIVATE drone_core_planning)
+  add_test(NAME goal_projection COMMAND test_goal_projection)
+
+  # Unknown-space surcharge (cost) + truncation's hard stop. Analytic fields and
+  # predicates, so it also runs on every planning edit.
+  add_executable(test_unknown_cost test/test_unknown_cost.cpp)
+  target_link_libraries(test_unknown_cost PRIVATE drone_core_planning)
+  add_test(NAME unknown_cost COMMAND test_unknown_cost)
 endif()
