@@ -183,6 +183,17 @@ void AutonomyCore::setSetpoint(const Eigen::Vector3d& pos, double yaw) {
   has_direct_setpoint_ = true;
 }
 
+void AutonomyCore::firePreset(const std::vector<Eigen::Vector3d>& waypoints) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
+  preset_waypoints_ = waypoints;
+  preset_pending_ = true;
+  // A preset square is an explicit override of planning: drop any active goal so
+  // the worker does not resume replanning toward it after the preset finishes and
+  // yank the vehicle off the POS_SP hold it just returned to. There is no separate
+  // goal-cancel path, so this is where a live goal gets cleared.
+  has_goal_ = false;
+}
+
 void AutonomyCore::applyConfig(const Config& config) {
   std::lock_guard<std::mutex> lock(io_mutex_);
   pending_config_ = config;
@@ -191,6 +202,14 @@ void AutonomyCore::applyConfig(const Config& config) {
 
 void AutonomyCore::reset() {
   tracker_.reset();
+  // Any in-flight preset is abandoned on a re-engage (disarm / leaving offboard):
+  // the tracker just dropped its trajectories, so keeping the keep-alive alive
+  // would re-stamp freshness on nothing. preset_pending_ is under io_mutex_.
+  preset_active_.store(false);
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    preset_pending_ = false;
+  }
   // The tracker just dropped its trajectories, so there is nothing left to
   // splice onto. Clearing this makes the next replan anchor at rest on the
   // measured position, which is what a fresh engage needs.
@@ -239,6 +258,22 @@ common::Command AutonomyCore::stepControl(double dt) {
     if (has_pending_) {
       tracker_.setTrajectory(pending_, t);
       has_pending_ = false;
+    }
+  }
+
+  // A preset one-shot is solved once and never replanned, so nothing re-stamps
+  // its freshness on the trajgen cadence the way normal planning does. Keep it
+  // fresh here for its whole duration so it holds kTracking instead of falling to
+  // hover-hold at stale_timeout (the trajectory plays in absolute time, so this
+  // only defers the planner-death failsafe, which does not apply to a deliberate
+  // one-shot). Once it has run its course, release the trajectory so control
+  // drops back to the direct setpoint (POS_SP) rather than latching a hover.
+  if (preset_active_.load()) {
+    if (t < preset_end_.load()) {
+      tracker_.keepFresh(t);
+    } else {
+      tracker_.clearTrajectory();
+      preset_active_.store(false);
     }
   }
 
@@ -648,6 +683,71 @@ void AutonomyCore::stagePending(const common::Trajectory& traj) {
   has_pending_ = true;
 }
 
+void AutonomyCore::runPreset(const common::State& state, const planning::MapHandle& map,
+                             const planning::MapHandle& conservative,
+                             const std::vector<Eigen::Vector3d>& waypoints) {
+  if (waypoints.size() < 2) {
+    DRONE_LOG_INFO("[preset] ignored: need at least two waypoints, got " << waypoints.size());
+    return;
+  }
+  // The corridor pipeline needs a map to truncate and grow regions against. With
+  // none, drop the request rather than silently doing nothing — the vehicle stays
+  // on POS_SP.
+  if (!map) {
+    DRONE_LOG_INFO("[preset] ignored: no map yet — the corridor pipeline needs one");
+    return;
+  }
+
+  DRONE_LOG_INFO("[preset] firing one-shot trajectory through " << waypoints.size()
+                 << " waypoints");
+
+  // Anchor at rest on the current state. firePreset dropped any goal and the
+  // vehicle is holding POS_SP, so spliceAnchor finds no still-tracked outgoing
+  // trajectory and falls back to rest at the measured position — exactly the
+  // clean rest-to-rest start this test wants. Re-root the first waypoint onto the
+  // anchor like any committed path.
+  const double t_gen = now();
+  const SpliceAnchor anchor = spliceAnchor(state, t_gen);
+  std::vector<std::vector<double>> path;
+  path.reserve(waypoints.size());
+  for (const auto& w : waypoints) path.push_back({w.x(), w.y(), w.z()});
+  path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
+
+  // Republish the preset as the geometric path so it shows on /planner/geometric_path.
+  {
+    std::lock_guard<std::mutex> lock(traj_mutex_);
+    last_geometric_path_ = path;
+  }
+
+  const planning::MapHandle cons = conservative ? conservative : map;
+  common::Trajectory traj;
+  const bool ok = runTrajgen(path, anchor.t0, anchor.start, conservativeField(cons), cons,
+                             cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+                                                          : planning::CorridorUnknownFn{},
+                             traj);
+  if (!ok) {
+    // runTrajgen has already logged which stage failed and why. Stage nothing;
+    // the vehicle keeps holding POS_SP. preset_active_ stays false, so control is
+    // never handed to a trajectory that was not built.
+    DRONE_LOG_INFO("[preset] trajectory generation FAILED — staying on POS_SP");
+    return;
+  }
+
+  double path_len = 0.0;
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    path_len += std::hypot(std::hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]),
+                           path[i][2] - path[i - 1][2]);
+  }
+
+  stagePending(traj);
+  // Hold the one-shot for its whole duration, then release (see stepControl). The
+  // trajectory plays in absolute time from traj.t0, so its end is t0 + duration.
+  preset_end_.store(traj.t0 + traj.total_duration);
+  preset_active_.store(true);
+  DRONE_LOG_INFO("[preset] trajectory staged: " << path_len << " m / "
+                 << traj.total_duration << " s — holding kTracking until it completes");
+}
+
 AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state,
                                                       double t_now) const {
   SpliceAnchor anchor;
@@ -801,6 +901,8 @@ void AutonomyCore::plannerLoop() {
     common::Goal goal;
     bool has_goal = false;
     bool new_goal = false;
+    bool preset_pending = false;
+    std::vector<Eigen::Vector3d> preset_waypoints;
     {
       std::lock_guard<std::mutex> lock(io_mutex_);
       state = state_;
@@ -810,6 +912,9 @@ void AutonomyCore::plannerLoop() {
       has_goal = has_goal_;
       new_goal = new_goal_;
       new_goal_ = false;
+      preset_pending = preset_pending_;
+      preset_pending_ = false;
+      if (preset_pending) preset_waypoints = preset_waypoints_;
     }
 
     // A new goal invalidates the committed path regardless of its collision
@@ -819,7 +924,17 @@ void AutonomyCore::plannerLoop() {
     // the new goal.
     if (new_goal) cached_path_.clear();
 
-    if (has_goal && map) {
+    // One-shot preset trajectory: bypass the geometric search entirely and solve
+    // the corridor-QP trajectory once through the given waypoints, then hold it
+    // (kept fresh by stepControl) until it completes. Handled before — and to the
+    // exclusion of — normal planning: firePreset dropped any goal, and while the
+    // preset is playing the planner must not fight it.
+    if (preset_pending) {
+      runPreset(state, map, conservative, preset_waypoints);
+      // Fall through to the idle branch below only if nothing else runs this tick.
+    }
+
+    if (!preset_active_.load() && has_goal && map) {
       ++run;
       const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
       const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
@@ -1072,7 +1187,7 @@ void AutonomyCore::plannerLoop() {
         }
       }
       idle = Idle::kNone;  // planning again; a later stall re-reports immediately
-    } else {
+    } else if (!preset_active_.load()) {
       const Idle reason = !has_goal ? Idle::kNoGoal : Idle::kNoMap;
       if (reason != idle || t - last_idle_log >= kIdleLogPeriod) {
         if (reason == Idle::kNoGoal) {

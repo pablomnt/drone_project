@@ -166,6 +166,20 @@ public:
   // trajectory (from setGoal) takes precedence over it.
   void setSetpoint(const Eigen::Vector3d& pos, double yaw);
 
+  // Fire a one-shot preset trajectory through `waypoints` (world/ENU), bypassing
+  // the geometric planner entirely. The worker builds the corridor-QP trajectory
+  // ONCE against the current map, splice-anchored at rest on the current state,
+  // and stages it; it is then kept fresh for its whole duration (the control step
+  // re-stamps it, since it is deliberately never replanned) and released back to
+  // the direct setpoint when it completes. `waypoints.front()` is re-rooted onto
+  // the splice anchor like any committed path, so pass the intended start
+  // (typically the current position) as the first point. Used to test trajectory
+  // generation + the differential-flatness controller in isolation from planning
+  // (e.g. a fixed square). Also drops any active goal, so the worker does not
+  // resume planning toward it once the preset finishes. Requires a map (the
+  // corridor pipeline needs one); with none the request is logged and dropped.
+  void firePreset(const std::vector<Eigen::Vector3d>& waypoints);
+
   // Live reconfiguration of the controller gains, hover thrust and feed-forward
   // flag. Applied on the control thread at the next step.
   void applyConfig(const Config& config);
@@ -262,6 +276,14 @@ private:
                   const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj);
   void stagePending(const common::Trajectory& traj);
+  // Build and stage a one-shot preset trajectory through `waypoints` (see
+  // firePreset), splice-anchored at rest on the current state, and arm the
+  // keep-alive (preset_active_/preset_end_) that stepControl uses to hold it for
+  // its full duration. No-op with an empty map or fewer than two waypoints.
+  // Worker thread only.
+  void runPreset(const common::State& state, const planning::MapHandle& map,
+                 const planning::MapHandle& conservative,
+                 const std::vector<Eigen::Vector3d>& waypoints);
   void plannerLoop();
 
   // Where a replan must begin, so that engaging it does not step the reference.
@@ -348,6 +370,15 @@ private:
   Eigen::Vector3d direct_pos_{Eigen::Vector3d::Zero()};
   double direct_yaw_{0.0};
   bool has_direct_setpoint_{false};
+  // One-shot preset trajectory (see firePreset). preset_waypoints_/preset_pending_
+  // are set under io_mutex_ by firePreset and consumed by the worker; preset_active_
+  // and preset_end_ are set by the worker once a preset trajectory is staged and
+  // read by the control thread (stepControl) to keep it fresh until preset_end_
+  // (world clock) and then release control back to the direct setpoint.
+  std::vector<Eigen::Vector3d> preset_waypoints_;
+  bool preset_pending_{false};
+  std::atomic<bool> preset_active_{false};
+  std::atomic<double> preset_end_{0.0};
   Config pending_config_;
   bool config_dirty_{false};
 

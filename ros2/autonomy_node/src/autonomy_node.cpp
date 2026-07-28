@@ -12,6 +12,7 @@
 #include <cmath>
 #include <memory>
 #include <string>
+#include <atomic>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -47,6 +48,13 @@ using namespace std::chrono_literals;
 namespace {
 constexpr double kControlDt = 0.02;       // 50 Hz
 constexpr double kDefaultYaw = M_PI_2;    // ENU heading for direct/hover setpoints
+
+// PRESET_WAYPOINTS one-shot square (trajectory-generation + DFB controller test,
+// bypassing the planner). A 2 m-wide square centred on the drone's XY at the flip,
+// flown at a fixed altitude, then control is released back to POS_SP.
+constexpr double kPresetSquareHalf = 1.0;     // half-width [m] -> 2 m square
+constexpr double kPresetAltitude = 1.5;       // fixed ENU altitude for the square [m]
+constexpr double kPresetMinAirborneZ = 0.8;   // reject a preset fired below this [m]
 
 // RTAB-Map publishes its octomap as a ColorOcTree (it stores voxel colour for
 // visualisation), but the core's map model — and DynamicEDTOctomap — needs a
@@ -233,6 +241,13 @@ private:
     // the controller, which keeps following POS_SP. Flip to true to enable the
     // min-snap trajectory + tracking stage.
     declare_parameter("PLAN_TRAJECTORY", true);
+    // One-shot preset square for isolating trajectory generation + the DFB
+    // controller from the planner. Flip false->true (airborne, hovering on POS_SP)
+    // to fly a 2 m square centred on the current XY at kPresetAltitude; the node
+    // then sets it straight back to false — it is a momentary trigger, not a mode.
+    // The square is solved once (corridor QP) and flown rest-to-rest, after which
+    // control returns to POS_SP (pointed at the square's centre). See onParameterChange.
+    declare_parameter("PRESET_WAYPOINTS", false);
     // Single switch for the planner debug visualisation: publishes the RRT*
     // search tree (/planner/search_tree) and the EDT clearance field
     // (/planner/clearance_field). Off by default so regular flights pay nothing;
@@ -369,7 +384,16 @@ private:
     return cfg;
   }
 
-  rcl_interfaces::msg::SetParametersResult onParameterChange(const std::vector<rclcpp::Parameter>&) {
+  rcl_interfaces::msg::SetParametersResult onParameterChange(
+      const std::vector<rclcpp::Parameter>& params) {
+    // A false->true edge on PRESET_WAYPOINTS is a momentary fire request. Only
+    // latch a flag here (on the executor thread); the actual capture-and-fire runs
+    // in the control tick, where a fresh state estimate is in hand and we know the
+    // vehicle is armed, offboard and airborne. The tick sets the parameter back to
+    // false once consumed.
+    for (const auto& p : params) {
+      if (p.get_name() == "PRESET_WAYPOINTS" && p.as_bool()) preset_fire_requested_ = true;
+    }
     // The control loop reads parameters live, so just push a refreshed config.
     if (core_) core_->applyConfig(configFromParameters());
     rcl_interfaces::msg::SetParametersResult result;
@@ -519,6 +543,54 @@ private:
     RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f, %.2f)", goal.pos.x(), goal.pos.y(), goal.pos.z());
   }
 
+  // Build and fire the one-shot preset square, centred on the drone's current XY
+  // at kPresetAltitude. Called from the control tick with a fresh `state`. The
+  // parameter is reverted to false regardless of outcome (momentary trigger).
+  //
+  // In flight (controller_running_) it rejects a ground fire — that would pre-empt
+  // the takeoff ramp — and points POS_SP at the square's centre so control lands
+  // cleanly back on it when the square completes. On the bench (not controlling)
+  // neither applies: the fire is allowed on the ground for a generation-only test,
+  // and POS_SP is left untouched since there is no hand-back.
+  void firePresetSquare(const drone_core::common::State& state) {
+    // Momentary trigger: revert the parameter whatever happens below.
+    set_parameter(rclcpp::Parameter("PRESET_WAYPOINTS", false));
+
+    const bool flying = controller_running_;
+    if (flying && state.pos.z() < kPresetMinAirborneZ) {
+      RCLCPP_WARN(get_logger(),
+                  "PRESET_WAYPOINTS ignored: airborne test but z=%.2f < %.2f m. Take off to a hover "
+                  "on POS_SP first, then flip it.",
+                  state.pos.z(), kPresetMinAirborneZ);
+      return;
+    }
+
+    const double cx = state.pos.x();
+    const double cy = state.pos.y();
+    const double h = kPresetSquareHalf;
+    const double z = kPresetAltitude;
+    // Centre first, round the four corners once, back to centre — ends where it
+    // started (rest-to-rest), visits each corner once (clean for the corridor QP).
+    const std::vector<Eigen::Vector3d> square = {
+        {cx, cy, z},         {cx + h, cy + h, z}, {cx - h, cy + h, z},
+        {cx - h, cy - h, z}, {cx + h, cy - h, z}, {cx, cy, z}};
+
+    if (flying) {
+      // Point POS_SP at the square's centre so the kDirect hand-back at completion
+      // is continuous (no reposition). Skipped on the bench: no hand-back happens
+      // there, so don't silently move the operator's POS_SP.
+      set_parameter(rclcpp::Parameter("POS_SP", std::vector<double>{cx, cy, z}));
+    }
+    has_goal_ = false;  // stop drawing any old goal marker
+
+    core_->firePreset(square);
+    RCLCPP_INFO(get_logger(),
+                "PRESET_WAYPOINTS fired: 2 m square centred (%.2f, %.2f) at %.2f m [%s].",
+                cx, cy, z,
+                flying ? "in flight; POS_SP moved to centre, returns to POS_SP when done"
+                       : "bench: generation only, not flying");
+  }
+
   // --- Control loop --------------------------------------------------------
 
   // A single stream is healthy when it has produced a sample within `timeout`
@@ -588,6 +660,18 @@ private:
       state.stamp = now_s;
       yaw_used = state.yaw;
       core_->setState(state);
+    }
+
+    // Consume a pending PRESET_WAYPOINTS fire (momentary trigger). Deliberately
+    // ABOVE the warmup and arm/offboard gates below, and gated only on a fresh
+    // position: on the battery-off bench (VIO-only, flight controller unpowered)
+    // those gates never open, but the point there is to validate trajectory
+    // generation without flying. The airborne guard inside applies only while
+    // actively controlling, so a bench fire on the ground is allowed. A bench-fired
+    // trajectory is harmless — stepControl only runs armed+offboard, and reset() on
+    // the real engage clears it.
+    if (position_fresh && preset_fire_requested_.exchange(false)) {
+      firePresetSquare(state);
     }
 
     // Pre-takeoff gate: refuse to engage until every required stream is healthy AND
@@ -1136,6 +1220,10 @@ private:
 
   Eigen::Vector3d goal_pos_{Eigen::Vector3d::Zero()};
   bool has_goal_{false};
+
+  // Set on a false->true edge of PRESET_WAYPOINTS (executor thread), consumed in
+  // the control tick. Atomic because the two run on different threads.
+  std::atomic<bool> preset_fire_requested_{false};
 };
 
 int main(int argc, char** argv) {

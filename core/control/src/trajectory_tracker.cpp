@@ -48,6 +48,13 @@ void TrajectoryTracker::setTrajectory(const common::Trajectory& traj, double arr
   last_arrival_ = arrival_time;
 }
 
+void TrajectoryTracker::clearTrajectory() {
+  traj_ = common::Trajectory{};
+  next_ = common::Trajectory{};
+  has_traj_ = false;
+  has_next_ = false;
+}
+
 common::Command TrajectoryTracker::update(const common::State& state, double now, double dt) {
   controller_.setState(state.pos, state.vel, state.yaw);
   controller_.setCurrentAcceleration(state.acc);
