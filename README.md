@@ -356,3 +356,47 @@ and uses Foxglove (`foxglove_bridge`, port 8765) for remote visualization. Befor
 trajectory, verify map-frame consistency: the octomap/RTAB-Map "map" frame must share an origin with
 the controller's VIO-rooted ENU (the TF tree is patched by the `body→camera_link` static transform
 folded into `autonomy_vision_launch.py`).
+
+## Commands used in flight
+
+Day-to-day operator commands, in roughly the order you use them. Run from the workspace root
+(`~/ws_paramio`) with the workspace sourced (`source install/setup.bash`); the NUC is driven over
+SSH/tmux from the laptop.
+
+**Connect to the drone (NUC):**
+```bash
+ssh dron@172.20.10.3
+```
+
+**Bring up the full stack** (camera/VIO/mapping + control + Foxglove):
+```bash
+ros2 launch autonomy_node autonomy_vision_launch.py              # with RViz
+ros2 launch autonomy_node autonomy_vision_launch.py rviz:=false  # headless (no RViz)
+```
+
+**Set the takeoff / hover setpoint** (`POS_SP`, ENU metres). Pre-takeoff / no-goal only — a live goal
+overrides it and it is unreachable while any trajectory is installed (see the control notes):
+```bash
+ros2 param set /autonomy_node POS_SP "[0.0, 0.0, 1.3]"
+```
+
+**Send a navigation goal** (`/planner/goal`, position only — yaw is ignored):
+```bash
+ros2 topic pub --once /planner/goal geometry_msgs/msg/PoseStamped \
+    "{header: {frame_id: map}, pose: {position: {x: 1.0, y: 1.0, z: 1.3}}}"
+```
+
+**Record a flight.** Curated, low-CPU topic set (controller telemetry, VIO, PX4 I/O, committed plan,
+octomap, and the `/okvis/cam0_matches/compressed` "what the drone sees" view). Start it by hand when
+you decide to capture; bags land in `~/flight_logs/` (override with `FLIGHT_LOG_DIR`). The scripts
+auto-pick mcap storage if installed and fall back to sqlite3 otherwise:
+```bash
+./src/ros2/autonomy_node/scripts/record_flight.sh   # always-on flight recorder — Ctrl-C to stop
+./src/ros2/autonomy_node/scripts/record_debug.sh    # heavy tier: planner viz + camera + depth (debugging only)
+```
+
+**Review afterwards.** Playback is storage-agnostic — the same command works for sqlite3 or mcap bags:
+```bash
+ros2 bag info ~/flight_logs/rosbag2_<timestamp>
+ros2 bag play ~/flight_logs/rosbag2_<timestamp>
+```
