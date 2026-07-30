@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <atomic>
@@ -610,6 +611,33 @@ private:
            streamHealthy(t_vio_odom_, now, timeout);
   }
 
+  // Names every required stream that is currently unhealthy, with its topic and
+  // how long it has been silent (or "never received"). Without this the timeout
+  // report says only that *something* went quiet, and the three streams point at
+  // completely different faults: px4_odom/sensor_combined at the uXRCE-DDS link or
+  // the flight controller, vio_odom at OKVIS losing tracking. Returns "none" when
+  // everything is healthy, so the string is safe to log unconditionally.
+  std::string staleStreamReport(double now, double timeout) const {
+    std::string out;
+    const auto add = [&](const char* name, const char* topic, double t) {
+      if (streamHealthy(t, now, timeout)) return;
+      if (!out.empty()) out += ", ";
+      char buf[128];
+      if (t <= 0.0) {
+        std::snprintf(buf, sizeof(buf), "%s [%s]: never received", name, topic);
+      } else {
+        std::snprintf(buf, sizeof(buf), "%s [%s]: silent %.2fs", name, topic, now - t);
+      }
+      out += buf;
+    };
+    add("px4_odom", "/fmu/out/vehicle_odometry", t_px4_odom_);
+    if (!use_sim_mode_) {
+      add("sensor_combined", "/fmu/out/sensor_combined", t_sensor_);
+      add("vio_odom", "/okvis/okvis_odometry", t_vio_odom_);
+    }
+    return out.empty() ? "none" : out;
+  }
+
   void controlLoop() {
     use_sim_mode_ = get_parameter("USE_SIM_MODE").as_bool();
 
@@ -675,6 +703,25 @@ private:
       firePresetSquare(state);
     }
 
+    // Announce the warmup completing, exactly once per streak (rising edge of
+    // warmed_up). The throttled hold warning below simply stops printing when the
+    // gate opens, and silence is indistinguishable from a dead control loop — so
+    // the operator gets a positive "you may arm now" instead of an absence. Rearmed
+    // whenever health lapses (or an interruption resets the streak), so a re-engage
+    // announces again.
+    if (!warmed_up) {
+      warmup_announced_ = false;
+    } else if (!warmup_announced_) {
+      warmup_announced_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "Estimator streams px4=%d sensor=%d vio=%d. All healthy for %.1f/%.1fs, "
+                  "warmup complete. READY TO FLY (arm + offboard to engage).",
+                  streamHealthy(t_px4_odom_, now_s, sensor_timeout),
+                  streamHealthy(t_sensor_, now_s, sensor_timeout),
+                  streamHealthy(t_vio_odom_, now_s, sensor_timeout),
+                  now_s - all_healthy_since_, sensor_warmup);
+    }
+
     // Pre-takeoff gate: refuse to engage until every required stream is healthy AND
     // has been healthy continuously for SENSOR_WARMUP. This blocks ONLY the engage
     // transition -- once flying (controller_running_) staleness is owned by the
@@ -732,8 +779,8 @@ private:
     // below) so the engage transition itself never trips it.
     if (controller_running_ && !streams_healthy) {
       RCLCPP_ERROR(get_logger(),
-                   "SENSOR TIMEOUT (> %.2fs): estimator stream stale in flight -> commanding LAND",
-                   sensor_timeout);
+                   "SENSOR TIMEOUT (> %.2fs) in flight -> commanding LAND. Stale: %s",
+                   sensor_timeout, staleStreamReport(now_s, sensor_timeout).c_str());
       land();
       failsafe_landing_ = true;
       return;
@@ -1218,6 +1265,9 @@ private:
   // (fresh within SENSOR_TIMEOUT). Negative == not currently all-healthy. Drives
   // the pre-takeoff warmup gate; reset on any interruption.
   double all_healthy_since_{-1.0};
+  // Edge latch so the "warmup complete / READY TO FLY" line prints once per healthy
+  // streak instead of at 50 Hz. Cleared whenever the warmup gate closes again.
+  bool warmup_announced_{false};
 
   Eigen::Vector3d goal_pos_{Eigen::Vector3d::Zero()};
   bool has_goal_{false};

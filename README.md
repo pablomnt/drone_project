@@ -397,6 +397,37 @@ auto-pick mcap storage if installed and fall back to sqlite3 otherwise:
 ./src/ros2/autonomy_node/scripts/record_debug.sh    # heavy tier: planner viz + camera + depth (debugging only)
 ```
 
+The same two tiers by hand, when you want the topic list visible and editable on the spot (drop
+`--storage mcap` if the mcap plugin isn't installed; sqlite3 is the default and playback auto-detects
+either). **Standard set** — what `record_flight.sh` records:
+```bash
+cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
+  /debug/telemetry /okvis/cam0_matches/compressed /okvis/okvis_odometry /okvis/okvis_path \
+  /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_attitude_setpoint_v1 \
+  /fmu/out/vehicle_status /smooth_trajectory /planner/geometric_path /planner/goal_marker \
+  /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
+```
+
+**Estimator-debug set** — the standard set plus every stream the node's sensor-health watchdog
+actually times, so a `SENSOR TIMEOUT (> 0.50s) … Stale: <stream>` auto-land can be reconstructed
+afterwards: which stream stopped, when, and whether the others kept flowing.
+```bash
+cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
+  /debug/telemetry /okvis/cam0_matches/compressed /okvis/okvis_odometry /okvis/okvis_path \
+  /fmu/out/sensor_combined /fmu/out/vehicle_odometry /fmu/out/vehicle_status_v1 \
+  /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_attitude_setpoint_v1 \
+  /fmu/out/vehicle_status /smooth_trajectory /planner/geometric_path /planner/goal_marker \
+  /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
+```
+
+Two things to know about the extra topics. `/fmu/out/sensor_combined` is the raw IMU stream at a few
+hundred Hz — by far the heaviest thing in either list, so use this tier when you are chasing a
+timeout, not as the always-on recorder on the NUC. And `/fmu/out/vehicle_status_v1` is the topic the
+node actually subscribes to (PX4 v1.17); the standard set's `/fmu/out/vehicle_status` is the legacy
+name and can land in the bag with zero messages — if `ros2 bag info` shows that, record the `_v1`
+topic instead (or add the `qos_overrides.yaml` flag noted in `record_flight.sh`, since a best-effort
+QoS mismatch produces the same empty result).
+
 **Review afterwards.** Playback is storage-agnostic — the same command works for sqlite3 or mcap bags:
 ```bash
 ros2 bag info ~/flight_logs/rosbag2_<timestamp>

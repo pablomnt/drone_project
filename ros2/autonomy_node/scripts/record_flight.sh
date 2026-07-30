@@ -35,6 +35,7 @@ TOPICS=(
   /debug/telemetry                        # 50 Hz controller log: state, setpoints, PID terms
   /okvis/cam0_matches/compressed          # what the drone sees: VIO feature-match overlay (JPEG)
   /okvis/okvis_odometry                   # VIO pose estimate
+  /okvis/okvis_path                       # VIO trajectory so far (Marker line strip)
   /fmu/in/offboard_control_mode           # what we command PX4
   /fmu/in/vehicle_command                 #   "
   /fmu/in/vehicle_attitude_setpoint_v1    #   "
