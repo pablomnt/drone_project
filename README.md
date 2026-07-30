@@ -387,7 +387,9 @@ ros2 topic pub --once /planner/goal geometry_msgs/msg/PoseStamped \
 ```
 
 **Record a flight.** Curated, low-CPU topic set (controller telemetry, VIO, PX4 I/O, committed plan,
-octomap, and the `/okvis/cam0_matches/compressed` "what the drone sees" view). Start it by hand when
+octomap, the `/okvis/cam0_matches/compressed` "what the drone sees" view, and `/rosout` — the console
+log of every ROS node, including the core's own planner/trajgen lines, which `main()` bridges from the
+core's `std::cerr` into ROS logging). Start it by hand when
 you decide to capture; bags land in `~/flight_logs/` (override with `FLIGHT_LOG_DIR`). The scripts
 auto-pick mcap storage if installed and fall back to sqlite3 otherwise:
 ```bash
@@ -400,3 +402,22 @@ auto-pick mcap storage if installed and fall back to sqlite3 otherwise:
 ros2 bag info ~/flight_logs/rosbag2_<timestamp>
 ros2 bag play ~/flight_logs/rosbag2_<timestamp>
 ```
+
+**Read the console log back** (`/rosout`: every ROS node plus the core's `[plan]`/`[trajgen]` lines).
+Reads the bag directly — no playback needed:
+```bash
+./src/ros2/autonomy_node/scripts/show_log.py ~/flight_logs/rosbag2_<timestamp>
+```
+Interactively instead, with severity/node filters: `ros2 bag play <bag>` in one terminal and
+`ros2 run rqt_console rqt_console` in another.
+
+**Watch the camera / plot the controller.** The camera is recorded already-compressed, so nothing has
+to be decompressed — `rqt_image_view` decodes it directly. Play the bag, then in a second terminal:
+```bash
+ros2 run rqt_image_view rqt_image_view    # pick /okvis/cam0_matches/compressed
+```
+For position / velocity / acceleration / PID plots, PlotJuggler reads the bag file directly (no
+playback): `ros2 run plotjuggler plotjuggler`, then Data → Load File and drag `pos/x` + `pos_sp/x`
+(etc.) from `/debug/telemetry` onto a plot. Foxglove Studio can also open the `.mcap` directly and
+show camera, plots and log on one timeline. Note `/debug/telemetry` only publishes while **armed and
+in offboard**, so it is empty in a bench recording.

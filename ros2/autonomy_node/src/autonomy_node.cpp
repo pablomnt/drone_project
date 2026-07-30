@@ -42,6 +42,7 @@
 
 #include "drone_core/autonomy/autonomy_core.hpp"
 #include "drone_core/common/frames.hpp"
+#include "drone_core/common/logging.hpp"
 
 using namespace std::chrono_literals;
 
@@ -1228,6 +1229,22 @@ private:
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
+
+  // Bridge the ROS-free core's diagnostics into ROS logging so the planner /
+  // trajgen / preset lines reach /rosout (and thus the flight recording),
+  // instead of only the terminal. RCLCPP still prints to stderr, so the console
+  // is unchanged; this only adds the /rosout path. Set once, before the node (and
+  // its core worker thread) is constructed. To decouple from ROS again, delete
+  // this block — the core reverts to its std::cerr default on its own.
+  drone_core::setLogSink([](drone_core::LogLevel level, const std::string& msg) {
+    static const rclcpp::Logger logger = rclcpp::get_logger("drone_core");
+    if (level == drone_core::LogLevel::Error) {
+      RCLCPP_ERROR(logger, "%s", msg.c_str());
+    } else {
+      RCLCPP_INFO(logger, "%s", msg.c_str());
+    }
+  });
+
   rclcpp::spin(std::make_shared<AutonomyNode>());
   rclcpp::shutdown();
   return 0;
