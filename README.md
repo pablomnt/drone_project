@@ -189,6 +189,22 @@ not receiving". Launch files live in `launch/`:
 `body→camera_link` static TF), `autonomy_launch.py` (xterm-per-process variant) and
 `autonomy_sim_launch.py` (SITL: `USE_SIM_MODE:=true`, `MicroXRCEAgent udp4`).
 
+**Threading.** The node runs a `MultiThreadedExecutor` over two *mutually exclusive* callback groups:
+a **fast** group holding the 20 ms control tick and every estimator stream that feeds it (PX4
+odometry, VIO, `sensor_combined`, vehicle status, joystick, goals), and a **slow** group holding the
+octomap and frontier callbacks and the 500 ms visualisation timer. The map callback blocks for
+150–520 ms on every update — it deserializes the tree, deep-copies it for the conservative view,
+stamps the frontier and walks every leaf — and on the previous single-threaded executor that work sat
+directly in front of the control tick. A flight on 2026-07-31 stalled the loop 39 times in 137 s, once
+per map update; two of those stalls exceeded the 0.5 s `SENSOR_TIMEOUT`, so the tick that followed saw
+all three estimator streams stale at the same instant and the watchdog auto-landed the aircraft, even
+though every stream had been publishing normally the whole time. Replaying that same bag after the
+split gives zero stalls over 0.06 s. Because both groups are mutually exclusive, state that stays
+inside one group needs no locking; only the few members read across the two (the drone position that
+centres the frontier keep-out, and the goal marker fields) are guarded, by `cross_mutex_`. If you add
+a callback, put anything that can block longer than a tick in the slow group — see `CLAUDE.md` for
+the full rules.
+
 **Sensor-health watchdog.** The node guards the three estimator streams it depends on — PX4 odometry,
 IMU (`sensor_combined`) and VIO — by timestamp, deeming each *healthy* only while its last sample is
 within `SENSOR_TIMEOUT` (0.5 s). Two gates use this. **Before takeoff** the controller refuses to
@@ -198,8 +214,16 @@ had *ever* been received). **In flight**, if any required stream goes stale it c
 (PX4 AUTO.LAND) and latches — re-commanding every tick until PX4 confirms the mode, since a single
 `VehicleCommand` can be dropped — and re-arms only after touchdown/disarm. That is a real landing,
 distinct from the core's `kHoverHold` (which only hovers): `NAV_LAND` is a mode switch that works from
-offboard, whereas the *core's* offboard-attitude stream has no land primitive. Both `SENSOR_TIMEOUT`
-and `SENSOR_WARMUP` are live-reconfigurable params.
+offboard, whereas the *core's* offboard-attitude stream has no land primitive. The timeout error names
+every stream that went quiet, with its topic and how long it has been silent, and the pre-takeoff gate
+announces `READY TO FLY` once the warmup completes so the operator gets a positive signal rather than
+the hold warnings merely stopping. Both `SENSOR_TIMEOUT` and `SENSOR_WARMUP` are live-reconfigurable
+params.
+
+One caveat to read the log with: the watchdog cannot tell a dead sensor from a control loop that did
+not get to run — both leave the same stale timestamps. If it reports several streams stale at once,
+by nearly the same amount, suspect a stall in the node rather than the sensors; independent streams
+from different processes do not die in the same millisecond.
 
 ### `drone_interfaces/`
 

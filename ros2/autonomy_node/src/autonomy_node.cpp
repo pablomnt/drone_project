@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <atomic>
 #include <vector>
@@ -135,19 +136,46 @@ public:
     param_callback_ = add_on_set_parameters_callback(
         std::bind(&AutonomyNode::onParameterChange, this, std::placeholders::_1));
 
+    // Two mutually-exclusive callback groups, run by a MultiThreadedExecutor (see
+    // main). The FAST group carries the 50 Hz control tick and every estimator
+    // stream that feeds it; the SLOW group carries map ingest and debug
+    // visualisation, which block for 150-500 ms per octomap update. On the former
+    // single-threaded executor that map work sat in front of the control tick, so
+    // no odometry callback ran while it went on: the tick that followed saw all
+    // three estimator streams stale at the same instant and auto-landed the drone,
+    // while every one of them had in fact been publishing normally throughout.
+    //
+    // Both groups are MutuallyExclusive rather than Reentrant on purpose. A group
+    // never runs two of its own callbacks at once, so state reached only from the
+    // fast group (the estimator samples, the watchdog timestamps, all the control
+    // latches) keeps exactly the single-threaded semantics it had before and needs
+    // no locking at all. Only the handful of members genuinely read across the two
+    // groups is guarded -- see cross_mutex_.
+    cb_fast_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    cb_slow_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+    rclcpp::SubscriptionOptions fast_opts;
+    fast_opts.callback_group = cb_fast_;
+    rclcpp::SubscriptionOptions slow_opts;
+    slow_opts.callback_group = cb_slow_;
+
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
     auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
 
     sub_joy_ = create_subscription<sensor_msgs::msg::Joy>(
-        "/joy", 10, std::bind(&AutonomyNode::onJoy, this, std::placeholders::_1));
+        "/joy", 10, std::bind(&AutonomyNode::onJoy, this, std::placeholders::_1), fast_opts);
     sub_px4_odom_ = create_subscription<px4_msgs::msg::VehicleOdometry>(
-        "/fmu/out/vehicle_odometry", qos, std::bind(&AutonomyNode::onPx4Odom, this, std::placeholders::_1));
+        "/fmu/out/vehicle_odometry", qos, std::bind(&AutonomyNode::onPx4Odom, this, std::placeholders::_1),
+        fast_opts);
     sub_sensor_ = create_subscription<px4_msgs::msg::SensorCombined>(
-        "/fmu/out/sensor_combined", qos, std::bind(&AutonomyNode::onSensorCombined, this, std::placeholders::_1));
+        "/fmu/out/sensor_combined", qos, std::bind(&AutonomyNode::onSensorCombined, this, std::placeholders::_1),
+        fast_opts);
     sub_status_ = create_subscription<px4_msgs::msg::VehicleStatus>(
-        "/fmu/out/vehicle_status_v1", qos, std::bind(&AutonomyNode::onStatus, this, std::placeholders::_1));
+        "/fmu/out/vehicle_status_v1", qos, std::bind(&AutonomyNode::onStatus, this, std::placeholders::_1),
+        fast_opts);
     sub_vio_ = create_subscription<nav_msgs::msg::Odometry>(
-        "/okvis/okvis_odometry", 10, std::bind(&AutonomyNode::onVioOdom, this, std::placeholders::_1));
+        "/okvis/okvis_odometry", 10, std::bind(&AutonomyNode::onVioOdom, this, std::placeholders::_1),
+        fast_opts);
     // RTAB-Map publishes the assembled octomap only on map-graph updates (motion-gated)
     // but latches it TRANSIENT_LOCAL. A VOLATILE subscriber never receives that retained
     // sample, so on a static scene map_ would stay null and the planner would starve.
@@ -155,15 +183,17 @@ public:
     // updates. (Also compatible with octomap_server's latched publisher.)
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     sub_map_ = create_subscription<octomap_msgs::msg::Octomap>(
-        "/octomap_binary", map_qos, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1));
+        "/octomap_binary", map_qos, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1),
+        slow_opts);
     // Frontier (known-free/unknown boundary) as a PointCloud2, latched like the
     // octomap and published on the same motion-gated map updates. Cached and
     // burned into each incoming octomap as occupied voxels (see onOctomap) when
     // TREAT_FRONTIER_AS_OBSTACLE is on, so the planner won't route into unknown space.
     sub_frontier_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        "/octomap_frontier", map_qos, std::bind(&AutonomyNode::onFrontier, this, std::placeholders::_1));
+        "/octomap_frontier", map_qos, std::bind(&AutonomyNode::onFrontier, this, std::placeholders::_1),
+        slow_opts);
     sub_goal_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/planner/goal", 10, std::bind(&AutonomyNode::onGoal, this, std::placeholders::_1));
+        "/planner/goal", 10, std::bind(&AutonomyNode::onGoal, this, std::placeholders::_1), fast_opts);
 
     pub_attitude_ = create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>(
         "/fmu/in/vehicle_attitude_setpoint_v1", 10);
@@ -178,8 +208,8 @@ public:
     pub_occupancy_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/occupancy_map", 10);
     pub_corridor_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/corridor", 10);
 
-    control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this));
-    viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this));
+    control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this), cb_fast_);
+    viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this), cb_slow_);
 
     RCLCPP_INFO(get_logger(), "Autonomy node started.");
   }
@@ -443,14 +473,28 @@ private:
     const Eigen::Vector3d vel_ned(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
     const Eigen::Quaterniond q(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
 
-    px4_pos_enu_ = drone_core::frames::pxNedToEnu(pos_ned);
+    // Only the POSITION is guarded: it is the one member of this callback that the
+    // slow group reads (onOctomap, as the frontier keep-out centre). Everything
+    // else here is written and read entirely within the fast group, which is
+    // mutually exclusive, so it needs no lock. The fast group's own reads of
+    // px4_pos_enu_ (in controlLoop) are likewise unguarded — they cannot run
+    // concurrently with this writer, and a reader racing another reader is fine.
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      px4_pos_enu_ = drone_core::frames::pxNedToEnu(pos_ned);
+    }
     px4_vel_enu_ = drone_core::frames::pxNedToEnu(vel_ned);
     yaw_px4_enu_ = drone_core::frames::pxAttitudeToEnuYaw(q);
     t_px4_odom_ = get_clock()->now().seconds();
   }
 
   void onVioOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    vio_pos_enu_ = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    {
+      // Guarded for the same reason as px4_pos_enu_ in onPx4Odom above.
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      vio_pos_enu_ =
+          Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    }
     const Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                                msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
     const Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
@@ -468,7 +512,8 @@ private:
 
   void onFrontier(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     // Just cache the latest frontier cloud; it is applied when the next octomap
-    // arrives (onOctomap). Single-threaded executor, so no lock needed.
+    // arrives (onOctomap). Both callbacks are in the slow group, which is mutually
+    // exclusive, so they never run concurrently and no lock is needed.
     frontier_cloud_ = msg;
   }
 
@@ -507,7 +552,15 @@ private:
     std::shared_ptr<octomap::OcTree> conservative;
     const bool want_frontier = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
     if (want_frontier && frontier_cloud_) {
-      const Eigen::Vector3d& p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
+      // Snapshot the drone position under the lock rather than referencing it: this
+      // is the slow group reading a member the fast group's odometry callbacks
+      // write, and the copy below takes long enough that a reference could be
+      // rewritten underneath us mid-use.
+      Eigen::Vector3d p;
+      {
+        std::lock_guard<std::mutex> lock(cross_mutex_);
+        p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
+      }
       conservative = std::make_shared<octomap::OcTree>(*map);
       stampFrontierOccupied(*conservative, *frontier_cloud_,
                             octomap::point3d(p.x(), p.y(), p.z()),
@@ -540,8 +593,13 @@ private:
     drone_core::common::Goal goal;
     goal.pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
     core_->setGoal(goal);
-    goal_pos_ = goal.pos;
-    has_goal_ = true;
+    {
+      // Marker state only: written here and in firePresetSquare (fast group), read
+      // by publishGoalMarker on the viz timer (slow group).
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      goal_pos_ = goal.pos;
+      has_goal_ = true;
+    }
     RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f, %.2f)", goal.pos.x(), goal.pos.y(), goal.pos.z());
   }
 
@@ -583,7 +641,10 @@ private:
       // there, so don't silently move the operator's POS_SP.
       set_parameter(rclcpp::Parameter("POS_SP", std::vector<double>{cx, cy, z}));
     }
-    has_goal_ = false;  // stop drawing any old goal marker
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      has_goal_ = false;  // stop drawing any old goal marker
+    }
 
     core_->firePreset(square);
     RCLCPP_INFO(get_logger(),
@@ -885,7 +946,15 @@ private:
   // regardless of display type (unlike the raw /planner/goal PoseStamped, which
   // RViz draws as an orientation arrow).
   void publishGoalMarker() {
-    if (!has_goal_) return;
+    // Snapshot both under one lock so the flag and the position it describes cannot
+    // disagree (a goal cleared between the two reads would otherwise draw a marker
+    // at a stale position).
+    Eigen::Vector3d goal_pos;
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      if (!has_goal_) return;
+      goal_pos = goal_pos_;
+    }
     visualization_msgs::msg::Marker m;
     m.header.frame_id = "map";
     m.header.stamp = now();
@@ -893,9 +962,9 @@ private:
     m.id = 0;
     m.type = visualization_msgs::msg::Marker::SPHERE;
     m.action = visualization_msgs::msg::Marker::ADD;
-    m.pose.position.x = goal_pos_.x();
-    m.pose.position.y = goal_pos_.y();
-    m.pose.position.z = goal_pos_.z();
+    m.pose.position.x = goal_pos.x();
+    m.pose.position.y = goal_pos.y();
+    m.pose.position.z = goal_pos.z();
     m.pose.orientation.w = 1.0;
     m.scale.x = m.scale.y = m.scale.z = 0.3;  // sphere diameter [m]
     m.color.r = 1.0f; m.color.g = 0.1f; m.color.b = 0.1f; m.color.a = 1.0f;
@@ -1209,6 +1278,18 @@ private:
   std::unique_ptr<drone_core::autonomy::AutonomyCore> core_;
   OnSetParametersCallbackHandle::SharedPtr param_callback_;
 
+  // Fast group: control tick + estimator streams. Slow group: map ingest + viz.
+  // See the constructor for why the split exists and what it does to locking.
+  rclcpp::CallbackGroup::SharedPtr cb_fast_;
+  rclcpp::CallbackGroup::SharedPtr cb_slow_;
+
+  // Guards ONLY the members read across the two callback groups: px4_pos_enu_ /
+  // vio_pos_enu_ (fast writes, onOctomap reads) and goal_pos_ / has_goal_ (fast
+  // writes, publishGoalMarker reads). Deliberately not a general node lock —
+  // everything else stays inside one group and needs no synchronisation. Never
+  // held across anything slow, so it cannot delay the control tick.
+  std::mutex cross_mutex_;
+
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_joy_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr sub_px4_odom_;
   rclcpp::Subscription<px4_msgs::msg::SensorCombined>::SharedPtr sub_sensor_;
@@ -1221,6 +1302,8 @@ private:
   // Latest frontier cloud (octomap_global_frontier_space), applied to each
   // incoming octomap in onOctomap. Null until the first frontier arrives.
   sensor_msgs::msg::PointCloud2::SharedPtr frontier_cloud_;
+  // Written by onOctomap, read by warnIfNoMap on the viz timer — both slow group,
+  // so unguarded like frontier_cloud_ above.
   bool got_octomap_{false};  // has onOctomap ever fired? (see warnIfNoMap)
 
   rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
@@ -1238,7 +1321,11 @@ private:
   rclcpp::TimerBase::SharedPtr control_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;
 
-  bool use_sim_mode_{false};
+  // Refreshed every control tick (fast group) and read by onOctomap (slow group)
+  // to pick which position source centres the frontier keep-out, so it crosses the
+  // groups. Atomic rather than under cross_mutex_ because it is a single bool with
+  // no invariant tying it to anything else.
+  std::atomic<bool> use_sim_mode_{false};
   px4_msgs::msg::VehicleStatus vehicle_status_;
   std::vector<int> last_buttons_;
 
@@ -1295,7 +1382,16 @@ int main(int argc, char** argv) {
     }
   });
 
-  rclcpp::spin(std::make_shared<AutonomyNode>());
+  // Multi-threaded so the map ingest and the debug visualisation cannot stand in
+  // front of the 50 Hz control tick (see the callback groups in the constructor).
+  // Three threads is the most that can ever be busy: the fast group, the slow
+  // group, and the node's default group, which here holds only the parameter
+  // services. Both work groups are mutually exclusive, so neither re-enters itself
+  // and extra threads would only sit idle.
+  auto node = std::make_shared<AutonomyNode>();
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

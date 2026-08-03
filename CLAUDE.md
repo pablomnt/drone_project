@@ -550,6 +550,58 @@ arrive on `/planner/goal` (geometry_msgs/PoseStamped, position only — yaw igno
 parameter provides the default takeoff/hover setpoint. All PX4 message types and frame conversions
 are confined to this file.
 
+**Threading model — two callback groups on a `MultiThreadedExecutor`. Respect it when adding
+callbacks.** `main` spins a `MultiThreadedExecutor` with 3 threads, and every subscription and timer
+is explicitly assigned to one of two **mutually exclusive** groups:
+
+- **`cb_fast_`** — the 20 ms control timer and every estimator stream feeding it: `onPx4Odom`,
+  `onVioOdom`, `onSensorCombined`, `onStatus`, `onJoy`, `onGoal`.
+- **`cb_slow_`** — everything that can block for longer than a tick: `onOctomap`, `onFrontier`, and
+  the 500 ms viz timer.
+- The node's **default group** is left holding only the parameter services, which is the third thread.
+
+This exists because of a real mid-flight auto-land on 2026-07-31. On the previous single-threaded
+`rclcpp::spin`, `onOctomap` (deserialize the tree, deep-copy it for the conservative view, stamp the
+frontier, then walk every leaf in `publishOccupancyMap`) blocked the one executor thread for
+150–520 ms on **every** map update. Measured from that flight's bag: 39 loop stalls in 137 s, one per
+octomap message, two of them over 0.5 s. No odometry callback could run during a stall, so the first
+tick afterwards saw all three estimator streams stale *at the same instant* and the in-flight
+watchdog landed the aircraft — while all three were in fact publishing normally throughout
+(`/okvis/okvis_odometry` had **zero** gaps > 0.15 s across the whole flight). The same stalls were
+also straddling PX4's own 500 ms offboard-loss threshold. After the split, replaying that bag gives
+**0** stalls above 0.06 s across 2823 ticks while 20 octomap callbacks (1.2 M nodes each) complete.
+
+**Locking rules that follow from the split — read before touching node state:**
+
+- Both groups are `MutuallyExclusive`, **not** `Reentrant`, deliberately. A group never runs two of
+  its own callbacks concurrently, so state reached only from *within one group* keeps exactly the
+  old single-threaded semantics and needs **no** synchronisation. That covers nearly everything:
+  the estimator samples, the `t_*` watchdog timestamps, `vehicle_status_`, `last_buttons_`, and all
+  the control latches (`controller_running_`, `failsafe_landing_`, `all_healthy_since_`,
+  `warmup_announced_`, `was_armed_`, `was_offboard_`) are fast-only; `frontier_cloud_` and
+  `got_octomap_` are slow-only.
+- **`cross_mutex_`** guards *only* what genuinely crosses the two groups: `px4_pos_enu_` /
+  `vio_pos_enu_` (written by the odom callbacks, read by `onOctomap` as the frontier keep-out centre)
+  and `goal_pos_` / `has_goal_` (written by `onGoal` and `firePresetSquare`, read by
+  `publishGoalMarker`). It is never held across anything slow, so it cannot delay the tick. Do not
+  grow it into a general node lock.
+- `use_sim_mode_` is `std::atomic<bool>` (written every tick, read by `onOctomap`); a lone bool with
+  no invariant tying it to anything else.
+- `AutonomyCore` is already fully internally locked (`io_mutex_` / `traj_mutex_`, both short-held)
+  and was already being called from the planner worker thread, so `setMap` from the slow group
+  alongside `setState`/`stepControl` from the fast group is safe as-is.
+- **Never take a reference to a cross-group member** — snapshot it by value under the lock.
+  `onOctomap` used to hold a `const Eigen::Vector3d&` to the drone position across the whole map
+  rebuild; that is now a copy, because the reference would be rewritten underneath it.
+- **Adding a callback:** decide its group first. Anything that can block longer than one 20 ms tick
+  belongs in `cb_slow_`. If it then touches fast-group state, either guard that state or move the
+  work — do not quietly promote `cross_mutex_` into a lock the control tick waits on.
+- **Known residual coupling:** the viz getters (`clearanceSamples()`, `geometricPath()`,
+  `searchTree()`, `corridorSnapshot()`) each take `traj_mutex_` to return a copy, and `stepControl`
+  takes the same mutex. So heavy viz converts a direct block into lock contention on the control
+  tick — far smaller (a vector memcpy, not an octree rebuild), but non-zero. `DEBUG_PLANNER_VIZ`
+  off makes it disappear entirely.
+
 **BUG (open): `state.acc` is not rotated out of the body frame.** `onSensorCombined` takes
 `SensorCombined.accelerometer_m_s2` — a **body-frame FRD** measurement — and passes it through
 `frames::pxNedToEnu`, which is a static axis swap documented for *world* vectors, then subtracts
@@ -580,6 +632,18 @@ subsumes them. Two guards use this:
   `NAVIGATION_STATE_AUTO_LAND` (a single VehicleCommand can be dropped, and NAV_LAND itself drops us
   out of offboard — hence the latch block sits *above* the armed/offboard gate). The latch clears only
   on the **disarm edge** (touchdown), never on leaving offboard, so it cannot un-latch mid-descent.
+  The error names every unhealthy stream with its topic and how long it has been silent (or that it
+  never arrived), via `staleStreamReport()`, computed only on the failing tick.
+
+**Open caveat on the in-flight watchdog: it cannot distinguish "the sensors died" from "I did not get
+to run."** Both look identical to it — a set of `t_*` timestamps that stopped advancing. The
+2026-07-31 auto-land was entirely the second case (see the threading model above), and the giveaway
+in the log was that all three streams reported staleness within 20 ms of each other and right at the
+threshold, which independent sensors on two different processes never do. The callback-group split
+removes the known source of such stalls, but not the failure mode: any other stall on the fast group
+would land the aircraft the same way. The fix, not yet implemented, is to measure the tick's own
+period and report a **loop stall** rather than a sensor timeout when the tick itself was late by more
+than `SENSOR_TIMEOUT`, and/or to require the staleness to survive a second consecutive tick.
 
 `SENSOR_TIMEOUT` and `SENSOR_WARMUP` are live-reconfigurable node params.
 
