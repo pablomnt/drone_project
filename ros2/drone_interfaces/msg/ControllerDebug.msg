@@ -2,7 +2,7 @@ geometry_msgs/Point pos
 float64 yaw
 float64 yaw_px4
 geometry_msgs/Vector3 vel
-geometry_msgs/Vector3 acc
+float64 thrust_accel        # thrust per unit mass along body up [m/s^2]; 9.81 = hover
 geometry_msgs/Point pos_sp
 geometry_msgs/Vector3 vel_sp
 geometry_msgs/Vector3 acc_sp

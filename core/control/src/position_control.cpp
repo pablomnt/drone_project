@@ -52,8 +52,8 @@ void PositionControl::setState(const Eigen::Vector3d& pos, const Eigen::Vector3d
   _yaw = yaw;
 }
 
-void PositionControl::setCurrentAcceleration(const Eigen::Vector3d& acc) {
-  _acc = acc;
+void PositionControl::setThrustAccel(double thrust_accel) {
+  _thrust_accel = thrust_accel;
 }
 
 void PositionControl::setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp) {
@@ -274,9 +274,12 @@ void PositionControl::_updateHoverThrust(double dt) {
   _filtered_thrust_cmd += alpha * (_thrust_sp - _filtered_thrust_cmd);
 
   // Invert the idealised vertical dynamics a_z = g (T / T_hover - 1) to back out
-  // the hover thrust. _acc.z() is already gravity-compensated (0 at hover).
-  const double measured_az = _acc.z();
-  double inst_hover_thrust = (_filtered_thrust_cmd * 9.81) / (measured_az + 9.81);
+  // the hover thrust. That model assumes thrust acts along body z, and
+  // _thrust_accel measures the specific force along exactly that axis, so the
+  // two assumptions match and the result is correct at any tilt — which is why
+  // no attitude rotation belongs here. _thrust_accel is (a_z + g) directly, so
+  // the gravity term the old form added back has cancelled out of the algebra.
+  double inst_hover_thrust = (_filtered_thrust_cmd * 9.81) / _thrust_accel;
   inst_hover_thrust = std::clamp(inst_hover_thrust, 0.2, 0.5);
 
   // Trust the IMU less while climbing or descending fast, where unmodelled

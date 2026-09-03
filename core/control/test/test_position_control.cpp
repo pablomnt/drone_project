@@ -19,7 +19,7 @@ int main() {
 
   // Vehicle airborne and asked to hold a point 30 cm above.
   controller.setState(Eigen::Vector3d(0.0, 0.0, 1.0), Eigen::Vector3d::Zero(), 0.0);
-  controller.setCurrentAcceleration(Eigen::Vector3d::Zero());
+  controller.setThrustAccel(9.81);  // hover: thrust exactly cancels gravity
   controller.reset();
   controller.setSetpoint(Eigen::Vector3d(0.0, 0.0, 1.3), 0.0);
 

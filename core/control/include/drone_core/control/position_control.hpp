@@ -29,7 +29,11 @@ public:
 
   // Loop inputs.
   void setState(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double yaw);
-  void setCurrentAcceleration(const Eigen::Vector3d& acc);
+
+  // Measured thrust per unit mass along the vehicle's up axis (9.81 in hover),
+  // NOT the vehicle's acceleration and NOT a world-frame quantity — see the
+  // note on common::State::thrust_accel. Feeds the hover-thrust estimator only.
+  void setThrustAccel(double thrust_accel);
   void setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp);
 
   // Set the full tracking reference, including velocity and acceleration
@@ -92,7 +96,7 @@ private:
   // Estimated state.
   Eigen::Vector3d _pos;
   Eigen::Vector3d _vel;
-  Eigen::Vector3d _acc;
+  double _thrust_accel{9.81};  // defaults to hover so a missed setter reads as neutral
   double _yaw;
 
   // Commanded setpoint.

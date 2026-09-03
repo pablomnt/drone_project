@@ -602,16 +602,49 @@ also straddling PX4's own 500 ms offboard-loss threshold. After the split, repla
   tick — far smaller (a vector memcpy, not an octree rebuild), but non-zero. `DEBUG_PLANNER_VIZ`
   off makes it disappear entirely.
 
-**BUG (open): `state.acc` is not rotated out of the body frame.** `onSensorCombined` takes
-`SensorCombined.accelerometer_m_s2` — a **body-frame FRD** measurement — and passes it through
-`frames::pxNedToEnu`, which is a static axis swap documented for *world* vectors, then subtracts
-9.81 from z. There is no rotation by attitude, so it is only correct while the vehicle is level; at
-20° of tilt roughly 3.4 m/s² of gravity is misattributed into the horizontal axes. It has stayed
-invisible because the only consumer is the hover-thrust estimator, which uses z (nearly right at
-small tilts). Fix it by rotating with the vehicle attitude before removing gravity. Relevant to more
-than the estimator now: `state.acc` is an obvious-looking input for anything wanting a measured
-acceleration, and it is wrong. (The trajectory splice deliberately does *not* use it — see the
-control section.)
+**`State::thrust_accel` is a thrust measurement, not an acceleration — and must NOT be rotated.**
+This corrects an earlier note in this file that called it a frame bug and prescribed rotating it by
+attitude; that prescription was wrong and would have made the hover-thrust estimator *worse*.
+
+`onSensorCombined` reads `SensorCombined.accelerometer_m_s2`, which is specific force in the **FRD
+body frame**, and stores `-accelerometer_m_s2[2]` — thrust per unit mass along the vehicle's own up
+axis, **9.81 in hover**, not 0. No frame conversion is applied, deliberately. (It used to run through
+`frames::pxNedToEnu`, an axis relabel defined for *world* vectors; on a body vector that was a
+category error whose z component happened to come out right.)
+
+Why no rotation belongs here, and why this is now correct by construction rather than by luck:
+
+- **A quadrotor's accelerometer only ever measures thrust.** Gravity is not felt, and lateral
+  acceleration is produced by *tilting*, which keeps thrust along body z. So in coordinated flight
+  the reading is `(0, 0, -c)` at any attitude, with `c` = thrust/mass. The two horizontal components
+  carry nothing but drag and vibration — they sit near zero however hard the vehicle accelerates
+  sideways. They are no longer stored at all.
+- **The estimator's model wants exactly this.** `_updateHoverThrust` inverts `a_z = g(T/T_hover - 1)`,
+  which assumes thrust acts along body z. The sensor makes the same assumption, so the pairing is
+  exact at any tilt: `inst_hover = T·9.81 / c` recovers `T_hover` with no tilt term. Rotate the
+  measurement into the world instead and the estimate picks up a `1/cosθ` error — +1.5% at 10°,
+  +6.4% at 20°. The old note's "fix" was that error.
+- **It is a scalar on purpose.** A world-frame acceleration cannot be passed here by mistake; the
+  type makes the distinction unrepresentable rather than relying on a comment being read.
+
+`ControllerDebug` publishes it as `float64 thrust_accel` (it was a `Vector3 acc`), so Foxglove
+layouts plotting `acc.x/y/z` need repointing.
+
+**If a genuine world-frame acceleration is ever wanted** (a state estimator, accel feedback, a
+disturbance observer), do *not* reach for this field. Take `VehicleLocalPosition.ax/ay/az`, which is
+EKF-filtered, gravity-free and already NED-world — so `pxNedToEnu` is legitimately correct on it —
+and add it as a **separate** field. Do not route the hover-thrust estimator through it: it is a
+derivative of an EKF velocity state driven largely by the same accelerometer, and the EKF's own
+accel-z bias state overlaps physically with hover thrust, so the two would chase each other.
+
+**Noise:** `sensor_combined` is PX4's rawest IMU topic and is bridged with **no rate limit**, while
+the control loop samples it at 50 Hz — so vibration aliases into slow wander. There is no filter on
+it today. If `ControllerDebug.hover_thrust` is seen wandering in a flight log, the fix is a low-pass
+in `onSensorCombined` (at message rate, *before* the decimation — filtering in the control loop
+cannot undo aliasing). PX4's own `vehicle_acceleration` is exactly this signal with a 2-pole
+low-pass at `IMU_ACCEL_CUTOFF`, but it is **not** in `uxrce_dds_client/dds_topics.yaml`, which is
+consumed at firmware build time — so using it needs a rebuild and reflash. (The trajectory splice
+deliberately uses none of this — see the control section.)
 
 **Sensor-health watchdog (node-level, distinct from the core's `kHoverHold` / `STALE_TIMEOUT`
 planner-stale→hover path).** The node stamps a per-stream last-receive time (`t_px4_odom_ /

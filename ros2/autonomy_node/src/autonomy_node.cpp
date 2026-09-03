@@ -284,7 +284,7 @@ private:
     // search tree (/planner/search_tree) and the EDT clearance field
     // (/planner/clearance_field). Off by default so regular flights pay nothing;
     // flip true for a debugging/tuning run (live-reconfigurable).
-    declare_parameter("DEBUG_PLANNER_VIZ", true);
+    declare_parameter("DEBUG_PLANNER_VIZ", false);
     // Treat frontier voxels (the known-free/unknown boundary from RTAB-Map's
     // octomap_global_frontier_space) as obstacles, so the planner refuses to
     // route through unmapped space and only flies through explored-free space.
@@ -504,9 +504,14 @@ private:
   }
 
   void onSensorCombined(const px4_msgs::msg::SensorCombined::SharedPtr msg) {
-    Eigen::Vector3d acc_ned(msg->accelerometer_m_s2[0], msg->accelerometer_m_s2[1], msg->accelerometer_m_s2[2]);
-    acc_enu_ = drone_core::frames::pxNedToEnu(acc_ned);
-    acc_enu_.z() -= 9.81;  // remove gravity to recover dynamic acceleration
+    // accelerometer_m_s2 is specific force in the FRD *body* frame, so no frame
+    // conversion applies here. pxNedToEnu is an axis relabel defined for world
+    // vectors; feeding it a body vector was only ever right by coincidence.
+    // Body z points down and thrust pushes up, hence the negation. The result is
+    // thrust per unit mass along the vehicle's own up axis (9.81 in hover), which
+    // is the whole of what a quadrotor's accelerometer can report — see the note
+    // on drone_core::common::State::thrust_accel.
+    thrust_accel_ = -msg->accelerometer_m_s2[2];
     t_sensor_ = get_clock()->now().seconds();
   }
 
@@ -746,7 +751,7 @@ private:
         state.vel = vio_vel_enu_;
         state.yaw = yaw_vio_enu_;
       }
-      state.acc = acc_enu_;
+      state.thrust_accel = thrust_accel_;
       state.stamp = now_s;
       yaw_used = state.yaw;
       core_->setState(state);
@@ -889,7 +894,7 @@ private:
     d.yaw = state.yaw;
     d.yaw_px4 = yaw_px4_enu_;
     d.vel.x = state.vel.x(); d.vel.y = state.vel.y(); d.vel.z = state.vel.z();
-    d.acc.x = state.acc.x(); d.acc.y = state.acc.y(); d.acc.z = state.acc.z();
+    d.thrust_accel = state.thrust_accel;
     const Eigen::Vector3d psp = c.getPositionSetpoint();
     d.pos_sp.x = psp.x(); d.pos_sp.y = psp.y(); d.pos_sp.z = psp.z();
     const Eigen::Vector3d vsp = c.getVelocitySetpoint();
@@ -1333,7 +1338,8 @@ private:
   Eigen::Vector3d px4_vel_enu_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d vio_pos_enu_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d vio_vel_enu_{Eigen::Vector3d::Zero()};
-  Eigen::Vector3d acc_enu_{Eigen::Vector3d::Zero()};
+  // Thrust per unit mass along body up [m/s^2]; 9.81 = hover. NOT an acceleration.
+  double thrust_accel_{9.81};
   double yaw_px4_enu_{0.0};
   double yaw_vio_enu_{0.0};
 

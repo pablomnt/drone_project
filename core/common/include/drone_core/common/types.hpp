@@ -11,10 +11,22 @@ namespace drone_core::common {
 // so nothing below ever has to think about handedness.
 
 // Estimated vehicle state, as delivered by VIO (or PX4 odometry in simulation).
+//
+// NOTE on thrust_accel: it is deliberately NOT the vehicle's acceleration, and
+// deliberately NOT in the ENU frame the rest of this struct uses. It is the
+// specific force the IMU measures along the vehicle's own up axis, i.e. thrust
+// per unit mass, and it reads 9.81 in hover rather than 0. A quadrotor's
+// accelerometer only ever sees thrust (gravity is not felt, and lateral
+// acceleration comes from tilting, which keeps the thrust along body z), so a
+// scalar along that axis is the whole of what the sensor has to say. It is a
+// scalar rather than a vector precisely so that a world-frame acceleration
+// cannot be passed here by mistake: the two are not interchangeable, and the
+// only consumer (the hover-thrust estimator) needs this one. See the control
+// section of CLAUDE.md for why no attitude rotation belongs on it.
 struct State {
   Eigen::Vector3d pos{Eigen::Vector3d::Zero()};
   Eigen::Vector3d vel{Eigen::Vector3d::Zero()};
-  Eigen::Vector3d acc{Eigen::Vector3d::Zero()};  // gravity already removed
+  double thrust_accel{9.81};  // thrust per unit mass along body up [m/s^2]; 9.81 = hover
   double yaw{0.0};
   double stamp{0.0};  // seconds
 };

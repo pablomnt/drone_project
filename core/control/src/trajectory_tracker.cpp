@@ -57,7 +57,7 @@ void TrajectoryTracker::clearTrajectory() {
 
 common::Command TrajectoryTracker::update(const common::State& state, double now, double dt) {
   controller_.setState(state.pos, state.vel, state.yaw);
-  controller_.setCurrentAcceleration(state.acc);
+  controller_.setThrustAccel(state.thrust_accel);
 
   // Promote a staged trajectory once its start instant has arrived. The planner
   // matched position, velocity, acceleration and jerk to the outgoing reference

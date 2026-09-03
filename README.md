@@ -55,6 +55,17 @@ Shared plain types (`State`, `Reference`, `Command`, `Trajectory`, `Goal`, `MapH
 they are finally unit-testable. `logging.hpp` provides `DRONE_LOG_*` macros that replace ROS logging
 inside the core.
 
+Everything in these types is world-frame ENU with one deliberate exception, called out because it
+looks like a violation: **`State::thrust_accel`**. It is a scalar, it is in the *body* frame, and it
+reads **9.81 in hover rather than 0** — because it is not an acceleration. It is thrust per unit mass
+along the vehicle's own up axis, which is the only thing a quadrotor's accelerometer can actually
+report: gravity is not felt, and lateral acceleration comes from tilting, which keeps thrust along
+body z. Its sole consumer is the hover-thrust estimator, whose model assumes thrust acts along body
+z — the same assumption the sensor makes, which is why rotating it into the world would *introduce*
+an error rather than remove one. It is a scalar precisely so a world-frame acceleration cannot be
+passed in by mistake. If you need a genuine measured acceleration, do not use this field; take
+`VehicleLocalPosition.ax/ay/az` and add it as a separate one.
+
 ### `planning/`
 
 - `GeometricPlanner` — a **runtime-selectable** OMPL planner over an SE(3) octree (X/Y ±15 m,
@@ -143,8 +154,10 @@ flight; do not touch the gains or control math unless a task specifically requir
   0.5 m arrives it ramps thrust open-loop (flat attitude) until liftoff, then hands to the PID,
   because closed-loop control near the ground with noisy VIO causes skidding.
 - **Online hover-thrust estimation**: back-calculates hover thrust from the filtered command and
-  measured vertical acceleration, de-weighting the estimate at high vertical speed; overridable via
-  `MPC_HOVER_THRUST`.
+  `State::thrust_accel` (measured thrust per unit mass along body up — *not* a vertical
+  acceleration, see `common/`), de-weighting the estimate at high vertical speed; overridable via
+  `MPC_HOVER_THRUST`. This is the only consumer of a measured IMU quantity anywhere in the
+  controller.
 - **Differential-flatness feed-forward** (added on top, default OFF): `setReference()` accepts
   `vel_ff`/`acc_ff`; with feed-forward disabled the controller is byte-identical to the baseline (a
   unit test asserts this), and it is suppressed during the takeoff ramp. The accel→attitude/thrust
@@ -446,7 +459,12 @@ cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
 
 Two things to know about the extra topics. `/fmu/out/sensor_combined` is the raw IMU stream at a few
 hundred Hz — by far the heaviest thing in either list, so use this tier when you are chasing a
-timeout, not as the always-on recorder on the NUC. And `/fmu/out/vehicle_status_v1` is the topic the
+timeout, not as the always-on recorder on the NUC. (It is bridged with **no rate limit**, unlike
+every other topic in PX4's `dds_topics.yaml`, and carries no vibration filtering — so it looks very
+noisy and that is expected. The control loop samples it at 50 Hz with no low-pass, which aliases
+vibration into slow wander; if `hover_thrust` in `ControllerDebug` is seen drifting, that is the
+cause and the fix is a filter in `onSensorCombined`, at message rate rather than in the control
+loop.) And `/fmu/out/vehicle_status_v1` is the topic the
 node actually subscribes to (PX4 v1.17); the standard set's `/fmu/out/vehicle_status` is the legacy
 name and can land in the bag with zero messages — if `ros2 bag info` shows that, record the `_v1`
 topic instead (or add the `qos_overrides.yaml` flag noted in `record_flight.sh`, since a best-effort
