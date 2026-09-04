@@ -455,6 +455,32 @@ it is about to replace. `trajectory_tracker` composes the mapper + controller an
 goes stale, i.e. the planner stalled/died). The stale fallback hovers; it does not land (PX4 rejects
 offboard land).
 
+**How vehicle state reaches the controller — two setters, deliberately named apart.** The node
+assembles one `common::State` (pos, vel, yaw, `thrust_accel`, `stamp`) and hands the whole struct to
+`AutonomyCore::setVehicleState()`, which stores it under `io_mutex_`. The core is the only thing
+holding a full snapshot: the planner worker reads it for the splice anchor and the geometric start,
+and `stepControl` passes it down to `TrajectoryTracker::update`. The tracker is where it gets
+**unpacked**, into two structurally different setters on `PositionControl`:
+
+- `setState(pos, vel, yaw)` — the feedback quantities, re-supplied every tick because the PID closes
+  on them.
+- `setThrustAccel(thrust_accel)` — the hover-thrust calibration, a separate setter because it is a
+  slowly-varying scale factor for the thrust map, not part of the feedback state, and so does not
+  have to move in lockstep with pose.
+
+The core method is `setVehicleState`, **not** `setState`, purely to keep those two apart:
+`PositionControl::setState` is an unrelated method at the bottom of the stack, and when both were
+spelled `setState` a call site read as though the node were talking straight to the controller. If
+you are following state through the stack, the sequence is
+`autonomy_node` → `AutonomyCore::setVehicleState` → `state_` → `TrajectoryTracker::update` →
+`PositionControl::{setState,setThrustAccel}`.
+
+`State::stamp` is **written and never read.** The node fills it with the tick time, and nothing in
+`core/` consumes it — every time-dependent decision (trajectory promotion at `t0`, the stale-guidance
+timeout) uses the `now` argument passed alongside the state, not the state's own timestamp. It is
+harmless, and it is the natural hook if you ever want to reject a stale snapshot or measure
+estimator latency, but do not read its presence as evidence that either check exists.
+
 **Mode precedence is strictly ordered, and `POS_SP` is NOT an override.** The branch order in
 `TrajectoryTracker::update` is: fresh trajectory → `kTracking`; else *any* installed trajectory →
 `kHoverHold`; else direct setpoint → `kDirect`. Two consequences that surprise operators:
@@ -589,7 +615,7 @@ also straddling PX4's own 500 ms offboard-loss threshold. After the split, repla
   no invariant tying it to anything else.
 - `AutonomyCore` is already fully internally locked (`io_mutex_` / `traj_mutex_`, both short-held)
   and was already being called from the planner worker thread, so `setMap` from the slow group
-  alongside `setState`/`stepControl` from the fast group is safe as-is.
+  alongside `setVehicleState`/`stepControl` from the fast group is safe as-is.
 - **Never take a reference to a cross-group member** — snapshot it by value under the lock.
   `onOctomap` used to hold a `const Eigen::Vector3d&` to the drone position across the whole map
   rebuild; that is now a copy, because the reference would be rewritten underneath it.
@@ -681,7 +707,7 @@ than `SENSOR_TIMEOUT`, and/or to require the staleness to survive a second conse
 `SENSOR_TIMEOUT` and `SENSOR_WARMUP` are live-reconfigurable node params.
 
 **State feed is independent of arm/offboard** (fixes an earlier bug where plans rooted at the map
-origin on the disarmed bench). The ENU `State` assembly + `core_->setState()` sit **above** the
+origin on the disarmed bench). The ENU `State` assembly + `core_->setVehicleState()` sit **above** the
 `armed && offboard` gate, so the core — and thus the planner worker, which reads `state_` for its
 `start` — always has the drone's live position, armed or not. The feed is gated on the **position
 source** being fresh (`streamHealthy(t_vio_odom_)` in normal mode, `t_px4_odom_` in sim) rather than

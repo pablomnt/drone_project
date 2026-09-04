@@ -171,6 +171,17 @@ spinning. `trajectory_tracker` composes the mapper + controller and runs the wat
 trajectory), and `kHoverHold` (failsafe — latch the current position when guidance goes stale). The
 stale fallback hovers; it does not land, because PX4 rejects offboard land commands.
 
+**How vehicle state reaches the controller.** The node assembles one `common::State` and hands the
+whole struct to `AutonomyCore::setVehicleState()`, which stores it under a lock; the planner worker
+reads it for its start state, and `stepControl()` passes it to `TrajectoryTracker::update()`. The
+tracker is what unpacks it into the controller's two setters: `PositionControl::setState(pos, vel,
+yaw)` for the feedback quantities the PID closes on, and `setThrustAccel()` for the hover-thrust
+calibration, which is a slowly-varying scale factor rather than feedback and so gets its own door.
+The core method is named `setVehicleState` rather than `setState` specifically so it does not read
+like a call to the controller's unrelated `setState` one layer down. Note that `State::stamp` is
+currently written by the node and read by nothing — everything time-dependent uses the `now`
+argument passed alongside the state.
+
 ## The ROS side (`ros2/`)
 
 ### `autonomy_node/`

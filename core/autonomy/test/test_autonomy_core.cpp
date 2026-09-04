@@ -42,7 +42,7 @@ int main() {
 
     auto octree = std::make_shared<octomap::OcTree>(0.1);
     core.setMap(octree);
-    core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
     core.reset();
 
     common::Goal goal;
@@ -63,7 +63,7 @@ int main() {
     // this is still the kLeadMin floor (0.04 s); 0.1 s clears it without eating
     // into the 0.5 s stale timeout this core is configured with.
     fake_time += 0.1;
-    core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
     auto cmd = core.stepControl(0.02);
     check(!core.inHoverHold(), "tracking after a fresh trajectory");
     check(core.hasTrajectory(), "trajectory is active");
@@ -72,7 +72,7 @@ int main() {
 
     // Let guidance go stale: time advances, no new trajectory arrives.
     fake_time += 5.0;
-    core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
     core.stepControl(0.02);
     check(core.inHoverHold(), "watchdog fell back to hover-hold when guidance went stale");
   }
@@ -115,7 +115,7 @@ int main() {
       }
     }
     core.setMap(octree);  // no conservative view: the raw map serves both roles
-    core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
     core.reset();
 
     common::Goal goal;
@@ -142,7 +142,7 @@ int main() {
 
     auto octree = std::make_shared<octomap::OcTree>(0.1);
     core.setMap(octree);
-    core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
     core.reset();
 
     common::Goal goal;
@@ -157,7 +157,7 @@ int main() {
     bool got_trajectory = false;
     for (int i = 0; i < 60 && !got_trajectory; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      core.setState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+      core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
       cmd = core.stepControl(0.02);
       got_trajectory = core.hasTrajectory();
     }

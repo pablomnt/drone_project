@@ -146,7 +146,14 @@ public:
   void setClock(std::function<double()> clock);
 
   // Inputs (thread-safe).
-  void setState(const common::State& state);
+
+  // Feed the vehicle's latest estimated state (pose, velocity, yaw, thrust
+  // calibration). Deliberately NOT named setState: PositionControl has its own
+  // unrelated setState(pos, vel, yaw) at the bottom of the stack, and the two
+  // reading as the same call obscured which layer a call site was talking to.
+  // This one stores the whole snapshot; TrajectoryTracker::update is what
+  // unpacks it down into the controller's narrower setters.
+  void setVehicleState(const common::State& state);
   // Feed the occupancy map(s) — the dual-map view of the corridor pipeline.
   // `map` is the raw (optimistic) map: unknown space reads as free, so the
   // geometric search can chase a goal beyond the mapped frontier (informed

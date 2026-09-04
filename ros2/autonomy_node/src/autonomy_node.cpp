@@ -754,7 +754,7 @@ private:
       state.thrust_accel = thrust_accel_;
       state.stamp = now_s;
       yaw_used = state.yaw;
-      core_->setState(state);
+      core_->setVehicleState(state);
     }
 
     // Consume a pending PRESET_WAYPOINTS fire (momentary trigger). Deliberately

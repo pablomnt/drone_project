@@ -148,7 +148,7 @@ void AutonomyCore::setClock(std::function<double()> clock) {
   clock_ = std::move(clock);
 }
 
-void AutonomyCore::setState(const common::State& state) {
+void AutonomyCore::setVehicleState(const common::State& state) {
   std::lock_guard<std::mutex> lock(io_mutex_);
   state_ = state;
 }
