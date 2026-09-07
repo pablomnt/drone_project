@@ -131,6 +131,7 @@ AutonomyCore::AutonomyCore(const Config& config)
     : cfg_(config), clock_(steadyNowSeconds) {
   tracker_.setPositionGains(cfg_.pos_p);
   tracker_.setVelocityGains(cfg_.vel_p, cfg_.vel_i, cfg_.vel_d);
+  tracker_.setDerivativeTau(cfg_.vel_d_tau);
   tracker_.setHoverThrust(cfg_.hover_thrust);
   tracker_.enableFeedforward(cfg_.enable_feedforward);
   tracker_.setStaleTimeout(cfg_.stale_timeout);
@@ -240,10 +241,21 @@ common::Command AutonomyCore::stepControl(double dt) {
   }
 
   if (config_dirty) {
+    // Capture this BEFORE cfg_ is overwritten: hover thrust is the one field in
+    // this block that is not merely a gain but also live estimator state, so
+    // re-pushing an unchanged value is not a no-op — it wipes a converged
+    // estimate. The node's onParameterChange pushes the WHOLE config on any
+    // parameter write, so without this guard, setting POS_SP (or anything else)
+    // reset the learned hover thrust to MPC_HOVER_THRUST on the next tick and the
+    // estimator had to re-converge over its 2.5 s time constant every time.
+    // Comparing keeps MPC_HOVER_THRUST working as a deliberate operator override
+    // while leaving the estimator alone the rest of the time.
+    const bool hover_thrust_changed = (cfg_.hover_thrust != config.hover_thrust);
     cfg_ = config;
     tracker_.setPositionGains(cfg_.pos_p);
     tracker_.setVelocityGains(cfg_.vel_p, cfg_.vel_i, cfg_.vel_d);
-    tracker_.setHoverThrust(cfg_.hover_thrust);
+    tracker_.setDerivativeTau(cfg_.vel_d_tau);
+    if (hover_thrust_changed) tracker_.setHoverThrust(cfg_.hover_thrust);
     tracker_.enableFeedforward(cfg_.enable_feedforward);
     tracker_.setStaleTimeout(cfg_.stale_timeout);
   }

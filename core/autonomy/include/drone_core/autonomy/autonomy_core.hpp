@@ -34,6 +34,7 @@ public:
     Eigen::Vector3d vel_p{1.8, 1.8, 2.0};
     Eigen::Vector3d vel_i{0.4, 0.4, 0.5};
     Eigen::Vector3d vel_d{0.2, 0.2, 0.2};
+    double vel_d_tau{0.04};  // low-pass time constant on the D term [s]
     double hover_thrust{0.35};
     bool enable_feedforward{false};
     double stale_timeout{1.5};        // hover-hold fallback threshold [s]

@@ -225,12 +225,17 @@ private:
 
     declare_parameter("MPC_XY_P", 0.95);
     declare_parameter("MPC_Z_P", 1.0);
-    declare_parameter("MPC_XY_VEL_P", 1.8);
+    declare_parameter("MPC_XY_VEL_P", 3.0);
     declare_parameter("MPC_XY_VEL_I", 0.4);
     declare_parameter("MPC_XY_VEL_D", 0.2);
-    declare_parameter("MPC_Z_VEL_P", 2.0);
+    declare_parameter("MPC_Z_VEL_P", 4.0);
     declare_parameter("MPC_Z_VEL_I", 0.5);
     declare_parameter("MPC_Z_VEL_D", 0.2);
+    // Low-pass time constant on the D term [s]. The raw derivative is refreshed
+    // only when a new VIO/odom sample lands (~25 Hz), so this is what keeps the
+    // term smooth between measurements. Roughly one measurement period; raise it
+    // for less noise, lower it for less phase lag.
+    declare_parameter("MPC_VEL_D_TAU", 0.04);
     declare_parameter("MPC_HOVER_THRUST", 0.35);
 
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
@@ -372,6 +377,7 @@ private:
     const double xy_vd = get_parameter("MPC_XY_VEL_D").as_double();
     const double z_vd = get_parameter("MPC_Z_VEL_D").as_double();
     cfg.vel_d = Eigen::Vector3d(xy_vd, xy_vd, z_vd);
+    cfg.vel_d_tau = get_parameter("MPC_VEL_D_TAU").as_double();
 
     cfg.hover_thrust = get_parameter("MPC_HOVER_THRUST").as_double();
     cfg.enable_feedforward = get_parameter("ENABLE_FEEDFORWARD").as_bool();
@@ -752,7 +758,15 @@ private:
         state.yaw = yaw_vio_enu_;
       }
       state.thrust_accel = thrust_accel_;
-      state.stamp = now_s;
+      // When the POSITION SAMPLE was taken, NOT the tick time. The estimate is
+      // re-sent every tick whether or not a new sample arrived, so this is the only
+      // thing that lets the D term tell a fresh measurement from a held one — see
+      // PositionControl::setStateStamp. Writing now_s here silently defeats that:
+      // the stamp advances every tick, so every tick looks fresh and the held ticks
+      // difference a velocity against itself, which is the zero-out this fixed.
+      // These are arrival times (set in the odom callbacks) rather than the sensor's
+      // own header stamp, so they stay in one clock domain across sim and flight.
+      state.stamp = use_sim_mode_ ? t_px4_odom_ : t_vio_odom_;
       yaw_used = state.yaw;
       core_->setVehicleState(state);
     }

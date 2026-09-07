@@ -14,6 +14,10 @@ void TrajectoryTracker::setHoverThrust(double hover_thrust) {
   controller_.setHoverThrust(hover_thrust);
 }
 
+void TrajectoryTracker::setDerivativeTau(double tau) {
+  controller_.setDerivativeTau(tau);
+}
+
 void TrajectoryTracker::enableFeedforward(bool enabled) {
   feedforward_ = enabled;
 }
@@ -58,6 +62,9 @@ void TrajectoryTracker::clearTrajectory() {
 common::Command TrajectoryTracker::update(const common::State& state, double now, double dt) {
   controller_.setState(state.pos, state.vel, state.yaw);
   controller_.setThrustAccel(state.thrust_accel);
+  // Lets the D term difference on the estimator's clock instead of the control
+  // clock — see PositionControl::setStateStamp.
+  controller_.setStateStamp(state.stamp);
 
   // Promote a staged trajectory once its start instant has arrived. The planner
   // matched position, velocity, acceleration and jerk to the outgoing reference

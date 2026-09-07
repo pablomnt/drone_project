@@ -42,6 +42,47 @@ int main() {
     }
   }
 
+  // The D term must survive a measurement slower than the control loop. The host
+  // re-sends the newest estimate every tick, so at 25 Hz VIO against a 50 Hz loop
+  // _vel only changes on alternate ticks. Differencing per control tick used to
+  // give exactly 0 on the held ticks and double the true rate on the others -- a
+  // train of impulses rather than a derivative. Feeding the sample timestamp must
+  // instead yield the true, constant dv/dt on every tick.
+  {
+    PositionControl d;
+    d.setVelocityGains(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                       Eigen::Vector3d(0.0, 0.0, 1.0));  // isolate D on z, Kd = 1
+    d.setDerivativeTau(0.0);                             // filter off: check the raw path
+    d.reset();
+
+    // Climbing with a constant true acceleration of 1 m/s^2, sampled at 25 Hz.
+    double stamp = 0.0;
+    double vz = 0.0;
+    for (int k = 0; k < 10; ++k) {
+      if (k % 2 == 0) {
+        vz += 1.0 * 0.04;
+        stamp += 0.04;
+      }
+      d.setState(Eigen::Vector3d(0.0, 0.0, 2.0), Eigen::Vector3d(0.0, 0.0, vz), 0.0);
+      d.setStateStamp(stamp);
+      d.setSetpoint(Eigen::Vector3d(0.0, 0.0, 2.0), 0.0);
+      d.update(0.02);
+
+      // Skip the first two ticks: the first sample after a reset has no
+      // predecessor to difference against, by design.
+      if (k < 2) continue;
+
+      // Derivative on measurement is negated, so a positive dv/dt reads negative.
+      const double d_z = d.getVelocityDTerm().z();
+      if (std::abs(d_z + 1.0) > 1e-9) {
+        std::cerr << "FAIL: D term on tick " << k << " is " << d_z
+                  << ", expected -1.0 (held-sample tick reading zero?)\n";
+        ++failures;
+        break;
+      }
+    }
+  }
+
   if (failures == 0) {
     std::cout << "position_control: all checks passed\n";
     return 0;

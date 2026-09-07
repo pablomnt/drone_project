@@ -455,6 +455,32 @@ it is about to replace. `trajectory_tracker` composes the mapper + controller an
 goes stale, i.e. the planner stalled/died). The stale fallback hovers; it does not land (PX4 rejects
 offboard land).
 
+**The D term differentiates the MEASUREMENT, on the estimator's clock.** `_vel` is a zero-order
+hold: the node re-sends the newest VIO sample every 20 ms tick whether or not a new one arrived, so
+differencing per control tick gave exactly `0.0` on held ticks and, on the ticks a sample did land,
+the whole accumulated change divided by the *control* period rather than the true (longer)
+measurement interval. At ~25 Hz VIO against the 50 Hz loop that is a train of double-height impulses
+on alternate ticks — damping delivered half the time and overstated when it arrived. Two changes fix
+it, and they are independent:
+
+- **Differencing on the estimator's clock.** `PositionControl::setStateStamp()` takes
+  `common::State::stamp` (previously written by the node and read by nothing — this is what it was
+  for), fed by `TrajectoryTracker::update`. The raw derivative is recomputed only when that stamp
+  advances, divided by the real interval — so a **varying** sample rate is handled correctly by
+  construction, which matters because OKVIS here wanders between roughly 12 and 30 Hz. Intervals
+  shorter than `kMinMeasInterval` (5 ms) are ignored as message-queue artefacts, since the stamp is
+  an arrival time: two samples dequeued back-to-back would otherwise divide a full period of motion
+  by microseconds. A separate low-pass, `MPC_VEL_D_TAU` (default 0.04 s ≈ one
+  sample period), runs every tick so the term stays smooth and current between measurements instead
+  of stepping or dropping out. Larger tau = smoother but more phase lag, which costs real damping.
+  A host that never calls `setStateStamp` (the unit tests) falls back to per-tick differencing.
+- **Derivative on measurement, not error.** `d(vel_sp − vel)/dt` with the setpoint half dropped is
+  `−d(vel)/dt`, hence the minus sign on `_vel_d_term`. Identical in steady state; what it removes is
+  the one-tick kick that a stepped `POS_SP` used to inject through the setpoint's own derivative.
+
+`test_position_control` pins the fixed behaviour: 25 Hz samples into a 50 Hz loop must give the true
+constant `dv/dt` on every tick, not an alternating impulse train.
+
 **How vehicle state reaches the controller — two setters, deliberately named apart.** The node
 assembles one `common::State` (pos, vel, yaw, `thrust_accel`, `stamp`) and hands the whole struct to
 `AutonomyCore::setVehicleState()`, which stores it under `io_mutex_`. The core is the only thing
@@ -475,11 +501,12 @@ you are following state through the stack, the sequence is
 `autonomy_node` → `AutonomyCore::setVehicleState` → `state_` → `TrajectoryTracker::update` →
 `PositionControl::{setState,setThrustAccel}`.
 
-`State::stamp` is **written and never read.** The node fills it with the tick time, and nothing in
-`core/` consumes it — every time-dependent decision (trajectory promotion at `t0`, the stale-guidance
-timeout) uses the `now` argument passed alongside the state, not the state's own timestamp. It is
-harmless, and it is the natural hook if you ever want to reject a stale snapshot or measure
-estimator latency, but do not read its presence as evidence that either check exists.
+`State::stamp` carries **when the position sample was taken** (the odom callback's arrival time,
+`t_vio_odom_` or `t_px4_odom_`), *not* the control-tick time — writing the tick time there silently
+defeats its one consumer, the D term's measurement clock (see below), because every tick then looks
+like a fresh sample. It is **not** a freshness guard — trajectory promotion at `t0` and the stale-guidance timeout both use the
+`now` argument passed alongside the state, not the state's own timestamp — so do not read its
+presence as evidence that a staleness check exists.
 
 **Mode precedence is strictly ordered, and `POS_SP` is NOT an override.** The branch order in
 `TrajectoryTracker::update` is: fresh trajectory → `kTracking`; else *any* installed trajectory →

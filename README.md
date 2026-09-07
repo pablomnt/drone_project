@@ -178,9 +178,17 @@ tracker is what unpacks it into the controller's two setters: `PositionControl::
 yaw)` for the feedback quantities the PID closes on, and `setThrustAccel()` for the hover-thrust
 calibration, which is a slowly-varying scale factor rather than feedback and so gets its own door.
 The core method is named `setVehicleState` rather than `setState` specifically so it does not read
-like a call to the controller's unrelated `setState` one layer down. Note that `State::stamp` is
-currently written by the node and read by nothing — everything time-dependent uses the `now`
-argument passed alongside the state.
+like a call to the controller's unrelated `setState` one layer down. `State::stamp` is the time the
+position sample was taken (not the tick time) and feeds the D term's measurement clock (below);
+nothing else reads it, and it is not a freshness guard.
+
+The velocity **D term differentiates the measurement on the estimator's clock, not the control
+clock.** `_vel` is a zero-order hold — the node re-sends the newest VIO sample every 20 ms whether or
+not a new one arrived — so differencing per tick yielded zero on held ticks and double the true rate
+on the others. The raw derivative is now recomputed only when `State::stamp` advances, divided by the
+real measurement interval — so a varying sample rate needs no assumption about the rate — and a
+low-pass (`MPC_VEL_D_TAU`) runs every tick to keep the term smooth in between. Differentiating the measurement rather than the error also drops the setpoint's own
+derivative, which removes the kick a stepped `POS_SP` used to inject.
 
 ## The ROS side (`ros2/`)
 

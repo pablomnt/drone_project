@@ -27,6 +27,14 @@ public:
   void setHoverThrust(double hover_thrust);
   void setThrustLearningRate(double learning_rate);
 
+  // Time constant of the low-pass on the D term [s]. The raw derivative is
+  // recomputed only when a new state measurement arrives (see setStateStamp),
+  // so this filter is what turns that stepwise signal back into something
+  // smooth enough to feed the acceleration setpoint every tick. Larger =
+  // smoother but more phase lag, which costs real damping; keep it near one
+  // measurement period.
+  void setDerivativeTau(double tau);
+
   // Loop inputs.
   void setState(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double yaw);
 
@@ -34,6 +42,14 @@ public:
   // NOT the vehicle's acceleration and NOT a world-frame quantity — see the
   // note on common::State::thrust_accel. Feeds the hover-thrust estimator only.
   void setThrustAccel(double thrust_accel);
+
+  // Timestamp [s] of the pos/vel sample last passed to setState. The estimate
+  // is a zero-order hold — the host re-sends the newest sample every control
+  // tick whether or not a new one arrived — so the D term needs to know when
+  // the measurement genuinely advanced, and by how much, rather than assuming
+  // one control period. Optional: a host that never calls this makes the
+  // derivative fall back to per-tick differencing.
+  void setStateStamp(double stamp);
   void setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp);
 
   // Set the full tracking reference, including velocity and acceleration
@@ -115,10 +131,21 @@ private:
   Eigen::Quaterniond _attitude_sp;
   double _thrust_sp;
 
-  // Integrator and derivative memory.
+  // Integrator memory.
   Eigen::Vector3d _vel_int;
-  Eigen::Vector3d _prev_vel_error;
   bool _first_update = true;
+
+  // Derivative-on-measurement memory. The derivative is taken on _vel rather
+  // than on the velocity error: the two are identical in steady state, but
+  // differentiating the error also differentiates the setpoint, which injects a
+  // one-tick kick every time the setpoint steps. Dropping that half is why
+  // _vel_d_term carries a minus sign.
+  double _state_stamp{-1.0};       // newest stamp handed in; <0 = host supplies none
+  double _prev_state_stamp{-1.0};  // stamp the raw derivative was last taken at
+  Eigen::Vector3d _prev_vel_meas{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d _vel_deriv_raw{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d _vel_deriv_filt{Eigen::Vector3d::Zero()};
+  double _deriv_tau;
 
   Eigen::Vector3d _vel_p_term;
   Eigen::Vector3d _vel_d_term;

@@ -3,6 +3,13 @@
 #include <algorithm>
 #include <cmath>
 
+namespace {
+// Shortest state-sample interval treated as a genuine new measurement [s].
+// Position sources here run at tens of Hz, so anything faster than 200 Hz is a
+// message-queue artefact rather than a real sample.
+constexpr double kMinMeasInterval = 0.005;
+}  // namespace
+
 namespace drone_core::control {
 
 PositionControl::PositionControl() {
@@ -13,7 +20,6 @@ PositionControl::PositionControl() {
   _gain_vel_i.setZero();
   _gain_vel_d.setZero();
   _vel_int.setZero();
-  _prev_vel_error.setZero();
 
   _vel_p_term.setZero();
   _vel_d_term.setZero();
@@ -27,6 +33,10 @@ PositionControl::PositionControl() {
   _reset_hover_filter = true;
   _hover_thrust_convergence_time = 2.5;  // time constant for the hover-thrust learning rate [s]
   _learning_rate = 0.02;
+  // One VIO sample period (~25 Hz) is a defensible starting point: enough to
+  // smooth the stepwise raw derivative without burying the loop in phase lag.
+  // Tune via MPC_VEL_D_TAU.
+  _deriv_tau = 0.04;
 }
 
 void PositionControl::setPositionGains(const Eigen::Vector3d& P) { _gain_pos_p = P; }
@@ -54,6 +64,14 @@ void PositionControl::setState(const Eigen::Vector3d& pos, const Eigen::Vector3d
 
 void PositionControl::setThrustAccel(double thrust_accel) {
   _thrust_accel = thrust_accel;
+}
+
+void PositionControl::setStateStamp(double stamp) {
+  _state_stamp = stamp;
+}
+
+void PositionControl::setDerivativeTau(double tau) {
+  _deriv_tau = std::max(tau, 0.0);
 }
 
 void PositionControl::setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp) {
@@ -138,6 +156,13 @@ void PositionControl::reset() {
   _acc_sp.setZero();
   _first_update = true;
 
+  // Drop the derivative history: after a reset the next measurement is not
+  // continuous with the last one, so differencing across the gap is meaningless.
+  _prev_state_stamp = -1.0;
+  _prev_vel_meas.setZero();
+  _vel_deriv_raw.setZero();
+  _vel_deriv_filt.setZero();
+
   // Tell the hover-thrust estimator a new flight regime is starting.
   _reset_hover_filter = true;
   _takeoff_ramp_thrust = 0.15;
@@ -179,20 +204,61 @@ void PositionControl::_velocityControl(double dt) {
   // artificial spike, and convert the hover-thrust convergence time into the
   // per-step learning rate.
   if (_first_update) {
-    _prev_vel_error = vel_error;
+    _prev_vel_meas = _vel;
     _learning_rate = dt / _hover_thrust_convergence_time;
     _first_update = false;
   }
 
-  const Eigen::Vector3d vel_derivative = (vel_error - _prev_vel_error) / dt;
-  _prev_vel_error = vel_error;
+  // Derivative on the MEASUREMENT, taken on the estimator's clock rather than
+  // the control clock. _vel is a zero-order hold: the host re-sends the newest
+  // VIO sample every control tick whether or not a new one arrived, so
+  // differencing per tick produced exactly 0.0 on held ticks and, on the ticks
+  // a sample did land, the whole accumulated change divided by the control
+  // period instead of the true (longer) measurement interval. At 25 Hz VIO
+  // against a 50 Hz loop that is a train of double-height impulses on alternate
+  // ticks, not a derivative — it delivered damping half the time and overstated
+  // it when it did.
+  if (_state_stamp < 0.0) {
+    // No timestamps from this host (unit tests, or a host that never calls
+    // setStateStamp): fall back to per-tick differencing, which is correct when
+    // the estimate really does update every tick.
+    _vel_deriv_raw = (_vel - _prev_vel_meas) / dt;
+    _prev_vel_meas = _vel;
+  } else if (_state_stamp > _prev_state_stamp) {
+    if (_prev_state_stamp < 0.0) {
+      // First sample after a reset: the sentinel is not a time, so there is
+      // nothing to difference against yet. Just seed and wait.
+      _prev_vel_meas = _vel;
+      _prev_state_stamp = _state_stamp;
+    } else {
+      const double meas_dt = _state_stamp - _prev_state_stamp;
+      // Ignore implausibly short intervals. The stamp is a message ARRIVAL time,
+      // so two samples delivered back-to-back out of a queue can land a
+      // fraction of a millisecond apart while representing a full sample period
+      // of motion; dividing by that inflates the derivative enormously. Leave
+      // the previous sample untouched so the next update differences across the
+      // real span rather than losing it.
+      if (meas_dt >= kMinMeasInterval) {
+        _vel_deriv_raw = (_vel - _prev_vel_meas) / meas_dt;
+        _prev_vel_meas = _vel;
+        _prev_state_stamp = _state_stamp;
+      }
+    }
+  }
+
+  // The low-pass runs every control tick regardless of whether the raw value
+  // was refreshed, so the D term stays smooth and current between measurements
+  // instead of stepping or dropping to zero.
+  const double deriv_alpha = (_deriv_tau > 0.0) ? (dt / (_deriv_tau + dt)) : 1.0;
+  _vel_deriv_filt += deriv_alpha * (_vel_deriv_raw - _vel_deriv_filt);
 
   _vel_p_term = vel_error.cwiseProduct(_gain_vel_p);
-  _vel_d_term = vel_derivative.cwiseProduct(_gain_vel_d);
+  // Negated: d(vel_sp - vel)/dt with the setpoint half dropped is -d(vel)/dt.
+  _vel_d_term = -_vel_deriv_filt.cwiseProduct(_gain_vel_d);
 
   _vel_int += vel_error.cwiseProduct(_gain_vel_i) * dt;
 
-  const double int_limit = 5.0;
+  const double int_limit = 0.4;  // limit the integrator to avoid windup
   _vel_int = _vel_int.cwiseMin(int_limit).cwiseMax(-int_limit);
 
   _acc_sp = _vel_p_term + _vel_int + _vel_d_term;
