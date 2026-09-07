@@ -225,10 +225,10 @@ private:
 
     declare_parameter("MPC_XY_P", 0.95);
     declare_parameter("MPC_Z_P", 1.0);
-    declare_parameter("MPC_XY_VEL_P", 3.0);
+    declare_parameter("MPC_XY_VEL_P", 2.8);
     declare_parameter("MPC_XY_VEL_I", 0.4);
     declare_parameter("MPC_XY_VEL_D", 0.2);
-    declare_parameter("MPC_Z_VEL_P", 4.0);
+    declare_parameter("MPC_Z_VEL_P", 2.6);
     declare_parameter("MPC_Z_VEL_I", 0.5);
     declare_parameter("MPC_Z_VEL_D", 0.2);
     // Low-pass time constant on the D term [s]. The raw derivative is refreshed

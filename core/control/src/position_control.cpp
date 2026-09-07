@@ -121,11 +121,11 @@ void PositionControl::update(double dt) {
 
     // Ramp thrust until the vehicle starts climbing, then ease off.
     if (_takeoff_phase == 1 && _vel.z() < 0.6) {
-      _takeoff_ramp_thrust += (0.2 * dt);
+      _takeoff_ramp_thrust += (0.05 * dt);
     } else {
       _takeoff_phase = 2;
-      if (_vel.z() > 0.4) {
-        _takeoff_ramp_thrust -= (0.1 * dt);
+      if (_vel.z() > 0.4*100) {
+        _takeoff_ramp_thrust -= (0.05 * dt);
       }
     }
 
