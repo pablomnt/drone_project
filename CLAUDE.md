@@ -549,7 +549,7 @@ slightly past its own beginning and logs a line saying so. Note the corollary: a
 **not** take effect on the tick that produced it, which is what `test_autonomy_core` and
 `test_trajectory_tracker` pin.
 
-**Two known gaps in this area — read before flying tracked trajectories:**
+**Four known gaps in this area — read before flying tracked trajectories:**
 
 1. **No airborne gate: a trajectory can pre-empt the takeoff ramp.** The worker plans and stages
    while disarmed (state feed sits above the arm gate by design), and a fresh trajectory beats the
@@ -558,8 +558,33 @@ slightly past its own beginning and logs a line saying so. Note the corollary: a
    fires partway into the trajectory instead of cleanly off the ground, holds the vehicle flat and
    climbing while the reference runs away horizontally, then hands back to the PID at z > 1.0 with a
    large accumulated error. `reset()` clearing trajectories narrows this but does not close it: the
-   worker re-stages within one `TRAJGEN_PERIOD`. **Needs an explicit "don't leave `kDirect` until
-   takeoff completed" gate.**
+   worker re-stages within one `TRAJGEN_PERIOD`.
+
+   **Still open. The fix is a gate, not a tweak to any of the three parts** — each is individually
+   correct and load-bearing. The disarmed state feed is what stops plans rooting at the map origin;
+   trajectory-beats-setpoint is what makes tracking work at all; and the ramp keys on the reference
+   because off the ground on `POS_SP` that is exactly right (the setpoint is already above 0.5 m and
+   the ramp fires at rest). What is missing is a latch in `TrajectoryTracker` that holds `kDirect`
+   from engage until takeoff has actually completed, and only then allows the trajectory branch.
+
+   **Watch the exact condition — the obvious one is wrong.** "Takeoff done" is *not*
+   `!_is_taking_off`: that flag is false at engage too, because the ramp has not started yet, so a
+   latch waiting on it alone opens on the very first tick and reproduces the bug exactly. The state
+   machine is `_takeoff_primed` (set by a ground `reset()`, consumed when the ramp fires) then
+   `_is_taking_off` (true for the ramp's duration). So the gate must hold until the ramp has both
+   **started and finished** — primed consumed *and* `_is_taking_off` back to false. Both are private
+   in `PositionControl` with no accessor, so the fix needs one added; deriving it from measured
+   altitude instead re-implements that state badly and gets the engage tick wrong the same way.
+   Until it exists, the operational rule is: **do not have a goal live when you arm.**
+
+   **The `PRESET_WAYPOINTS` path is NOT affected, and the reason is worth keeping.** A preset fired
+   on the bench also stages a trajectory from the ground, but `core_->reset()` on the engage
+   transition (`autonomy_node.cpp`, the `!controller_running_` branch) runs *before* `stepControl` is
+   reached on that tick and clears `preset_pending_` / `preset_active_` along with the tracker's
+   trajectories. Unlike a goal — which persists in `has_goal_` and makes the worker re-stage within
+   one `TRAJGEN_PERIOD` — a preset is a one-shot with no re-trigger, so once cleared it stays
+   cleared. That asymmetry is the whole difference: the goal path re-arms itself, the preset path
+   does not.
 2. **The plain min-snap path (`USE_CORRIDOR_QP=false`) is still rest-to-rest.** It inherits the
    splice *position* and the lead anchor, but `MinSnapTrajectory` has no start-derivative boundary,
    so engaging it while moving steps the velocity reference to zero — the exact stutter the corridor
@@ -784,10 +809,39 @@ publish nothing and cost nothing when the flag is off:
   `PLAN_TRAJECTORY` + `USE_CORRIDOR_QP` + `DEBUG_PLANNER_VIZ`.
 
 **Planning-related node parameters** (all live-reconfigurable via `onParameterChange`):
+
+> **The defaults quoted in this list are NOT what the node currently comes up with, and several of
+> these parameters are not in use at all right now.** Two separate things are going on. First, the
+> list has drifted from the code — `RRT_MONITOR_PERIOD`, `RRT_IMPROVE_PERIOD`, `RRT_SOLVE_TIME`,
+> `PLANNER_TYPE` and `UNKNOWN_WEIGHT` all quote values the `declare_parameter` calls no longer use.
+> Second, the node is currently configured for `PRESET_WAYPOINTS` bring-up with
+> `PLAN_TRAJECTORY=false`, so the planning branch does not execute and the search-tuning knobs above
+> are dormant whatever they are set to. Treat
+> `ros2/autonomy_node/src/autonomy_node.cpp` as authoritative for what a value actually is, and
+> `README.md` (*Runtime parameters*) for the current table. **Reconciling these numbers and actually
+> tuning the planner is deferred** — it is worth doing once the trajectory-generation and tracking
+> stages have been validated on the preset, since tuning a search whose output nothing consumes
+> proves nothing. The *descriptions* below stay accurate; it is only the quoted defaults that are
+> stale.
 - `PLAN_TRAJECTORY` (bool, default `true`) — the geometry-first phase gate. False stops the worker
   after the geometric search (path published for viz, control stays on `POS_SP`); true runs trajgen
   and hands trajectories to the tracker. **Now defaulted true for Stage 1 bench validation** — set it
   false to go back to pure geometric planning.
+- `PRESET_WAYPOINTS` (bool, default `false`) — **momentary trigger, not a mode.** A `false->true`
+  edge fires one preset trajectory through waypoints hardcoded in `firePresetSquare`
+  (`autonomy_node.cpp`) — as it stands a 2 m square centred on the drone's XY at 1.5 m — and the node
+  sets the parameter straight back to `false` itself. Isolates trajectory generation + the DFB
+  controller from the planner: the geometric search is bypassed entirely, the corridor QP is solved
+  **once** against the current map, and the result is held (re-stamped by `stepControl`, since it is
+  deliberately never replanned) until it completes, after which control drops back to `POS_SP`.
+  Firing also **clears any active goal** — this is the only goal-cancel path that exists.
+  **Independent of `PLAN_TRAJECTORY`**: `runPreset` sits at the top level of the worker loop while
+  the `plan_trajectory` check is nested inside the normal planning branch, so the preset works with
+  the flag off — and running it off is the safer bench setting, since the worker then cannot stage a
+  competing trajectory at all. Needs a map (`[preset] ignored: no map yet` otherwise). Rejects a fire
+  below 0.8 m while actively controlling, so take off to a hover on `POS_SP` first; a fire on the
+  disarmed bench is allowed on purpose (generation-only test) and is cleared by `reset()` at the next
+  engage. There is no in-flight abort — leaving offboard is the abort.
 - `RRT_MONITOR_PERIOD` (double, default `0.5` s) — path validity re-check cadence.
 - `RRT_IMPROVE_PERIOD` (double, default `5.0` s) — clearance-aware improvement search cadence.
 - `RRT_SOLVE_TIME` (double, default `5.0` s) — planner optimisation budget per solve (all planners

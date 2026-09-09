@@ -166,10 +166,8 @@ flight; do not touch the gains or control math unless a task specifically requir
 
 `flatness_mapper` samples the trajectory for pos/vel/acc and derives yaw from the velocity heading
 (so the forward camera leads the motion), holding the last yaw only when slow *and* the heading is
-spinning. `trajectory_tracker` composes the mapper + controller and runs the watchdog state machine:
-`kDirect` (explicit setpoint — takeoff/manual hover), `kTracking` (follow a fresh planner
-trajectory), and `kHoverHold` (failsafe — latch the current position when guidance goes stale). The
-stale fallback hovers; it does not land, because PX4 rejects offboard land commands.
+spinning. `trajectory_tracker` composes the mapper + controller and runs the watchdog state machine
+described in the next section.
 
 **How vehicle state reaches the controller.** The node assembles one `common::State` and hands the
 whole struct to `AutonomyCore::setVehicleState()`, which stores it under a lock; the planner worker
@@ -189,6 +187,61 @@ on the others. The raw derivative is now recomputed only when `State::stamp` adv
 real measurement interval — so a varying sample rate needs no assumption about the rate — and a
 low-pass (`MPC_VEL_D_TAU`) runs every tick to keep the term smooth in between. Differentiating the measurement rather than the error also drops the setpoint's own
 derivative, which removes the kick a stepped `POS_SP` used to inject.
+
+### Control modes (`TrajectoryTracker`)
+
+The drone is always in exactly one of three control modes. They live in the `Mode` enum in
+`core/control/trajectory_tracker.hpp` and are chosen fresh on every 50 Hz tick inside
+`TrajectoryTracker::update` (`core/control/src/trajectory_tracker.cpp`). Nothing outside the tracker
+sets the mode — there is no command to enter one. The tracker looks at what guidance it currently
+holds and picks, and the operator's influence is entirely indirect: publish a goal, or fire a preset,
+and the mode follows.
+
+The three modes, in the order they are tested:
+
+1. **`kTracking` — a fresh trajectory exists, so follow it.** This is the only mode that flies a
+   trajectory, and the only one where differential-flatness feed-forward is active; the other two
+   explicitly disable it. "Fresh" means a trajectory is installed and the last one *arrived* within
+   `STALE_TIMEOUT` seconds. Freshness is stamped when the trajectory is handed over, not when it
+   starts playing, so a planner that has died trips the timeout even if the trajectory it last
+   produced is still perfectly valid and still running.
+2. **`kHoverHold` — a trajectory is installed but guidance has gone stale, so latch the current
+   position and hover.** This is the failsafe for the planner stalling or dying. It captures the
+   position and yaw once on entry and holds them; it does **not** land, because PX4 rejects an
+   offboard land command. This is also the mode the tracker starts in after `reset()`, and the
+   fallback when nothing has been commanded at all.
+3. **`kDirect` — no trajectory at all, so follow a single explicit position setpoint.** That
+   setpoint is `POS_SP`, the ROS parameter, pushed in by the node every tick. It is the mode used for
+   takeoff and for manual hover.
+
+The ordering is the part worth internalising, because it is strict and it surprises people: a
+trajectory outranks the direct setpoint **even when that trajectory is dead**. A stale trajectory
+falls to `kHoverHold`, not back to `kDirect`. So `POS_SP` is a pre-takeoff and no-goal setpoint only
+— there is no "return to setpoint" path through it, and changing it while anything is installed does
+nothing at all. The only things that restore `kDirect` are `reset()` (a disarm or leaving offboard)
+and an explicit `clearTrajectory()`.
+
+Two things about `kDirect` matter for the `PRESET_WAYPOINTS` test in particular.
+
+**First, `POS_SP` stops having any effect the moment the preset's trajectory is staged.** The node
+keeps reading the parameter and pushing it into the tracker on every tick, and the tracker keeps
+storing it — silently, with no warning — while `kTracking` ignores it. This is why
+`firePresetSquare` writes `POS_SP` *at fire time*, before the trajectory exists, rather than when the
+preset finishes: at completion it would be too late to matter on the tick it is needed. Moving
+`POS_SP` mid-preset accomplishes nothing; the value that counts is the one set at the flip.
+
+**Second, returning to `kDirect` when the preset finishes is deliberate, not automatic.** A preset is
+solved once and never replanned, so nothing re-stamps its freshness the way normal planning does —
+left alone it would go stale within `STALE_TIMEOUT` and, by the precedence above, land in
+`kHoverHold`, latching wherever the vehicle happened to be. So `AutonomyCore::stepControl` does two
+things explicitly: it keeps the preset fresh for its whole duration so it holds `kTracking` to the
+end, and then calls `clearTrajectory()` at `preset_end_` so control drops to `kDirect` on `POS_SP`
+instead of latching a hover. That explicit clear is the entire reason the vehicle returns to its
+setpoint rather than parking in place.
+
+A third point is worth noting for reading the results: feed-forward runs **only** during the preset
+itself. The hover before and after is plain PID on a fixed setpoint, so the preset window is the only
+part of the flight where trajectory generation and the flatness feed-forward are actually under test.
 
 ## The ROS side (`ros2/`)
 
@@ -290,6 +343,94 @@ RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (ray-traced 3D oc
                                    │
                                   PX4 (via MicroXRCEAgent, serial /dev/ttyUSB0 or UDP for SITL)
 ```
+
+## Runtime parameters
+
+Every parameter below is declared by `autonomy_node` and is **live-reconfigurable** — the control
+loop re-reads them each tick and `onParameterChange` pushes a refreshed config into the core, so
+`ros2 param set /autonomy_node <NAME> <VALUE>` takes effect immediately. There are no launch-file
+overrides and no YAML parameter file: the defaults in the table are the `declare_parameter` calls in
+`ros2/autonomy_node/src/autonomy_node.cpp`, and that file is the only place to change what the drone
+comes up with.
+
+Three defaults are currently set for **`PRESET_WAYPOINTS` bring-up** rather than for planner-driven
+flight; they are marked ⚑ and listed again at the end of this section.
+
+### Mode and control
+
+| Parameter | Type / default | What it does |
+|---|---|---|
+| `USE_SIM_MODE` | bool, `false` | Take state from PX4 odometry instead of VIO, and require only that stream to be healthy. For SITL. |
+| `ENABLE_FEEDFORWARD` | bool, `true` | Differential-flatness feed-forward (`vel_ff` before the velocity PID, `acc_ff` after it). Active only in `kTracking`, and suppressed during the takeoff ramp. False makes the controller byte-identical to the flight-tested baseline. |
+| `POS_SP` | double[3], `[0, 0, 1.5]` ⚑ | Takeoff / manual-hover setpoint in ENU metres. Used **only** in `kDirect` — ignored while any trajectory is installed. |
+| `MPC_XY_P` / `MPC_Z_P` | double, `0.95` / `1.0` | Position-loop proportional gains (outer cascade). Flight-tuned. |
+| `MPC_XY_VEL_P/I/D` | double, `2.8` / `0.4` / `0.2` | Horizontal velocity-loop PID gains. Flight-tuned. |
+| `MPC_Z_VEL_P/I/D` | double, `2.6` / `0.5` / `0.2` | Vertical velocity-loop PID gains. Flight-tuned. |
+| `MPC_VEL_D_TAU` | double, `0.04` s | Low-pass time constant on the D term. The raw derivative refreshes only when a new VIO sample lands (~25 Hz), so this keeps the term smooth between measurements. Roughly one sample period; raise for less noise, lower for less phase lag. |
+| `MPC_HOVER_THRUST` | double, `0.35` | Seed for the online hover-thrust estimator (normalised 0–1). |
+
+### Safety and timeouts
+
+| Parameter | Type / default | What it does |
+|---|---|---|
+| `STALE_TIMEOUT` | double, `2.0` s | How long after a trajectory's *arrival* the tracker keeps tracking it before falling to `kHoverHold`. Guards against a dead planner, not a stale map. |
+| `SENSOR_TIMEOUT` | double, `0.5` s | A stream counts as healthy if it produced a sample within this window. Drives both guards below. |
+| `SENSOR_WARMUP` | double, `5.0` s | Continuous stream health required before the controller will *engage*. Any lapse resets the streak, so every takeoff re-proves it. |
+
+Two guards use these. Before takeoff, the controller refuses to engage until every required stream
+has been healthy for `SENSOR_WARMUP`, and the node prints a positive "you may arm" on the rising edge
+rather than just falling silent. In flight, any required stream going stale commands `NAV_LAND` and
+latches it until PX4 confirms `AUTO.LAND`. Note the in-flight watchdog cannot distinguish "the
+sensors died" from "the control loop did not get to run" — see the caveat in `CLAUDE.md`.
+
+### Planning
+
+| Parameter | Type / default | What it does |
+|---|---|---|
+| `PLAN_TRAJECTORY` | bool, `false` ⚑ | Master gate on trajectory generation from the **planner**. False stops the worker after the geometric search (path still published for viz) and control stays on `POS_SP`. Does **not** gate `PRESET_WAYPOINTS`. |
+| `PRESET_WAYPOINTS` | bool, `false` | **Momentary trigger, not a mode.** A `false→true` edge fires one preset trajectory through waypoints hardcoded in `firePresetSquare` — currently a 2 m square centred on the drone's XY at 1.5 m — then the node resets it to false. Bypasses the geometric planner, solves the corridor QP once, holds it to completion, then returns control to `POS_SP`. Also clears any active goal (the only goal-cancel path there is). Needs a map; refuses a fire below 0.8 m while flying. |
+| `PLANNER_TYPE` | string, `"EITstar"` | Which OMPL planner to build: `RRTstar`, `BITstar`, `ABITstar`, `AITstar`, `EITstar`. Per-planner internals are **not** parameters — they live in `PlannerConfig` in `geometric_planner.hpp`. |
+| `RRT_MONITOR_PERIOD` | double, `1.0` s | How often the worker re-checks the committed path for collisions. |
+| `RRT_IMPROVE_PERIOD` | double, `10.0` s | How often it attempts an improvement search on an already-valid path. |
+| `RRT_SOLVE_TIME` | double, `1.0` s | Optimisation budget per solve. All the planners are anytime, so this is a direct quality/latency dial. |
+| `REPLAN_IMPROVE_RATIO` | double, `0.85` | Hysteresis gate: adopt an improvement only if its cost ≤ ratio × the committed path's **remaining** cost from the drone's current position. Prevents replan chatter. |
+| `BEST_EFFORT_GOAL` | bool, `true` | Accept a path that stops short of an unreachable goal (closest reachable point) instead of reporting failure, and keep advancing the endpoint as the map grows. |
+| `TRAJGEN_PERIOD` | double, `1.0` s | Trajectory-generation cadence; each run re-anchors onto the outgoing trajectory. |
+
+### Cost shaping
+
+| Parameter | Type / default | What it does |
+|---|---|---|
+| `CLEARANCE_WEIGHT` | double, `1.0` | Weight on the obstacle-proximity penalty. Raising it pushes the search off walls — and, when frontier stamping is on, off the frontier too, which is the main lever on how much of a path survives truncation. Costs longer detours. |
+| `CLEARANCE_THRESHOLD` | double, `1.0` m | Distance at which the proximity penalty saturates; also the EDT's `maxdist`. |
+| `UNKNOWN_WEIGHT` | double, `0.5` | Flat extra cost per metre routed through never-observed space. Read as "how many metres of detour through mapped space is one metre through unmapped space worth". **Keep it low** — it defocuses the informed planners badly, because their sampling ellipse is built from straight-line estimates that cannot see this term. Ignored entirely when `TREAT_FRONTIER_AS_OBSTACLE` is false. |
+
+### Corridor and limits
+
+| Parameter | Type / default | What it does |
+|---|---|---|
+| `USE_CORRIDOR_QP` | bool, `true` | Use the corridor-constrained QP instead of plain min-snap. False is the legacy, obstacle-blind path. |
+| `TREAT_FRONTIER_AS_OBSTACLE` | bool, `false` | **The single switch for "is unmapped space a hazard".** Gates the stamped frontier shell, `UNKNOWN_WEIGHT`'s surcharge, and truncation's stop at unobserved cells. On a fresh map almost everything is frontier, so with this on the drone is boxed in until it has scanned around itself — leave it off for bench and preset work, on for real exploration. |
+| `VMAX` / `AMAX` / `JMAX` | double, `1.0` / `1.5` / `3.0` | Per-axis velocity, acceleration and jerk limits enforced by the QP. Box bounds, so the true norm can reach √3× in the corner case. |
+| `FRONTIER_MARGIN` | double, `0.5` m | Clearance the committed *path prefix* keeps from unknown space during truncation. |
+| `ESCAPE_RAMP_DIST` | double, `1.0` m | Distance over which truncation's clearance requirement ramps from zero at the drone up to the full margin, so a vehicle in a tight spot can still commit a path. Also where the corridor's first-region relaxation ends. Deliberately independent of the margin. `≤ 0` disables both. |
+| `CORRIDOR_MARGIN` | double, `0.4` m | Clearance the corridor *regions* keep from obstacles. A strictly harder test than the planner's own check — it must hold over a whole 3D volume, not just a centreline. **This is the clearance you actually fly with**, so weigh it against the airframe's half-width. First suspect when a decomposition fails. |
+| `MAX_SEGMENT_LEN` | double, `2.0` m | Corridor resample cap; one convex region per piece. Lowering it is the lever against convex over-conservatism, but costs QP size — and needs `CORRIDOR_BBOX` pinned or you lose in region width what you gain in length. |
+| `CORRIDOR_BBOX` | double[3], `[1, 2, 2]` | Minimum usable half-extents of the region-growth window, in the **segment-aligned** frame (0 = along-track, 1/2 = lateral) — a floor, not a literal size. Exists to decouple window size from `MAX_SEGMENT_LEN`. All zeros restores purely derived behaviour. |
+
+### Debug
+
+| Parameter | Type / default | What it does |
+|---|---|---|
+| `DEBUG_PLANNER_VIZ` | bool, `true` ⚑ | Single switch for the debug visualisation: search tree, EDT clearance field, and the corridor stages on `/planner/corridor`. Zero-cost when off (nothing is extracted, sampled or published). Turn it off for a real flight so the NUC pays nothing. |
+
+### ⚑ Currently set for the preset test
+
+| Parameter | Test value | Flight value | Why |
+|---|---|---|---|
+| `PLAN_TRAJECTORY` | `false` | `true` | The preset does not need it, and with it off the worker cannot stage a competing trajectory at all — which also keeps the takeoff ramp clear of the no-airborne-gate issue in `CLAUDE.md`. |
+| `DEBUG_PLANNER_VIZ` | `true` | `false` | `/planner/corridor` is what separates a margin collapse from a failed validation from a QP infeasibility when a preset refuses to generate. |
+| `POS_SP` z | `1.5` | `1.3` | Matches the preset's altitude, so firing from this hover adds no altitude step to the first segment and the hand-back is at the same height. |
 
 ## Frames & TF (OKVIS ↔ RTAB-Map)
 
@@ -431,10 +572,23 @@ ros2 launch autonomy_node autonomy_vision_launch.py rviz:=false  # headless (no 
 ```
 
 **Set the takeoff / hover setpoint** (`POS_SP`, ENU metres). Pre-takeoff / no-goal only — a live goal
-overrides it and it is unreachable while any trajectory is installed (see the control notes):
+overrides it and it is unreachable while any trajectory is installed (see *Control modes*):
 ```bash
-ros2 param set /autonomy_node POS_SP "[0.0, 0.0, 1.3]"
+ros2 param set /autonomy_node POS_SP "[0.0, 0.0, 1.5]"
 ```
+
+**Fire the preset trajectory** (`PRESET_WAYPOINTS`) — the trajectory-generation and feed-forward test,
+with the planner bypassed entirely. Take off and settle into a stable hover on `POS_SP` above 0.8 m
+first, and confirm the node has logged `First octomap received` (the corridor pipeline needs a map or
+the fire is dropped). The parameter is a momentary trigger and resets itself, so set it again to fly
+the square again:
+```bash
+ros2 param set /autonomy_node PRESET_WAYPOINTS true
+```
+Watch for `PRESET_WAYPOINTS fired: 6 waypoints from (…)` from the node, then either `[preset]
+trajectory staged: L m / T s` or `[preset] trajectory generation FAILED — staying on POS_SP` from the
+core. On failure nothing is staged and the vehicle keeps hovering — there is no fallback to an
+unchecked polynomial. Leaving offboard is the abort; there is no in-flight cancel.
 
 **Send a navigation goal** (`/planner/goal`, position only — yaw is ignored):
 ```bash

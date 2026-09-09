@@ -52,11 +52,10 @@ namespace {
 constexpr double kControlDt = 0.02;       // 50 Hz
 constexpr double kDefaultYaw = M_PI_2;    // ENU heading for direct/hover setpoints
 
-// PRESET_WAYPOINTS one-shot square (trajectory-generation + DFB controller test,
-// bypassing the planner). A 2 m-wide square centred on the drone's XY at the flip,
-// flown at a fixed altitude, then control is released back to POS_SP.
-constexpr double kPresetSquareHalf = 1.0;     // half-width [m] -> 2 m square
-constexpr double kPresetAltitude = 1.5;       // fixed ENU altitude for the square [m]
+// PRESET_WAYPOINTS one-shot preset (trajectory-generation + DFB controller test,
+// bypassing the planner). The waypoints themselves are written out literally in
+// firePresetSquare — edit the shape there, not here. Control is released back to
+// POS_SP once the preset completes.
 constexpr double kPresetMinAirborneZ = 0.8;   // reject a preset fired below this [m]
 
 // RTAB-Map publishes its octomap as a ColorOcTree (it stores voxel colour for
@@ -238,7 +237,10 @@ private:
     declare_parameter("MPC_VEL_D_TAU", 0.04);
     declare_parameter("MPC_HOVER_THRUST", 0.35);
 
-    declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
+    // Takeoff / hover setpoint. Held at 1.5 m to match the preset's altitude, so a
+    // PRESET_WAYPOINTS fire from this hover adds no altitude step to its first
+    // segment and the hand-back at completion is at the same height.
+    declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.5});
     declare_parameter("STALE_TIMEOUT", 2.0);
     declare_parameter("SENSOR_TIMEOUT", 0.5);
     declare_parameter("SENSOR_WARMUP", 5.0);
@@ -277,19 +279,32 @@ private:
     // publishes the geometric path; it does not generate a trajectory or feed
     // the controller, which keeps following POS_SP. Flip to true to enable the
     // min-snap trajectory + tracking stage.
-    declare_parameter("PLAN_TRAJECTORY", true);
-    // One-shot preset square for isolating trajectory generation + the DFB
+    //
+    // Held FALSE for the PRESET_WAYPOINTS bring-up. The preset does not need it
+    // (runPreset sits at the top level of the worker loop, while this flag is
+    // checked inside the normal planning branch), and with it off the worker
+    // cannot stage a competing trajectory at all — which also keeps the takeoff
+    // ramp clear of the no-airborne-gate issue documented in CLAUDE.md. Set it
+    // back to true for planner-driven flights.
+    declare_parameter("PLAN_TRAJECTORY", false);
+    // One-shot preset waypoints for isolating trajectory generation + the DFB
     // controller from the planner. Flip false->true (airborne, hovering on POS_SP)
-    // to fly a 2 m square centred on the current XY at kPresetAltitude; the node
-    // then sets it straight back to false — it is a momentary trigger, not a mode.
+    // to fly the shape hardcoded in firePresetSquare — as it stands a 2 m square
+    // centred on the current XY at 1.5 m; the node then sets it straight back to
+    // false — it is a momentary trigger, not a mode.
     // The square is solved once (corridor QP) and flown rest-to-rest, after which
     // control returns to POS_SP (pointed at the square's centre). See onParameterChange.
     declare_parameter("PRESET_WAYPOINTS", false);
     // Single switch for the planner debug visualisation: publishes the RRT*
-    // search tree (/planner/search_tree) and the EDT clearance field
-    // (/planner/clearance_field). Off by default so regular flights pay nothing;
-    // flip true for a debugging/tuning run (live-reconfigurable).
-    declare_parameter("DEBUG_PLANNER_VIZ", false);
+    // search tree (/planner/search_tree), the EDT clearance field
+    // (/planner/clearance_field) and the corridor stages (/planner/corridor).
+    // Normally off so regular flights pay nothing (live-reconfigurable).
+    //
+    // Held TRUE for the PRESET_WAYPOINTS bring-up: /planner/corridor is what
+    // separates a margin collapse from a failed validation from a QP
+    // infeasibility when a preset refuses to generate. Turn it off for a real
+    // flight so the NUC pays nothing for it.
+    declare_parameter("DEBUG_PLANNER_VIZ", true);
     // Treat frontier voxels (the known-free/unknown boundary from RTAB-Map's
     // octomap_global_frontier_space) as obstacles, so the planner refuses to
     // route through unmapped space and only flies through explored-free space.
@@ -638,19 +653,31 @@ private:
 
     const double cx = state.pos.x();
     const double cy = state.pos.y();
-    const double h = kPresetSquareHalf;
-    const double z = kPresetAltitude;
-    // Centre first, round the four corners once, back to centre — ends where it
-    // started (rest-to-rest), visits each corner once (clean for the corridor QP).
+    // The preset shape, one waypoint per line so it can be edited directly here:
+    // offsets [m] from the drone's XY at the flip, absolute ENU altitude. As it
+    // stands, centre first, round the four corners of a 2 m square once, back to
+    // centre — ends where it started (rest-to-rest) and visits each corner once,
+    // which is clean for the corridor QP. Keep the first and last points equal if
+    // you want that rest-to-rest property; the first is also where control is
+    // handed back to POS_SP (below).
     const std::vector<Eigen::Vector3d> square = {
-        {cx, cy, z},         {cx + h, cy + h, z}, {cx - h, cy + h, z},
-        {cx - h, cy - h, z}, {cx + h, cy - h, z}, {cx, cy, z}};
+        {cx + 0.0, cy + 0.0, 1.5},
+        {cx + 1.0, cy + 0.5, 1.5},
+        {cx - 1.0, cy + 0.5, 1.5},
+        {cx - 1.0, cy - 0.5, 1.5},
+        {cx + 1.0, cy - 0.5, 1.5},
+        {cx + 0.0, cy + 0.0, 1.5},
+    };
 
     if (flying) {
-      // Point POS_SP at the square's centre so the kDirect hand-back at completion
-      // is continuous (no reposition). Skipped on the bench: no hand-back happens
-      // there, so don't silently move the operator's POS_SP.
-      set_parameter(rclcpp::Parameter("POS_SP", std::vector<double>{cx, cy, z}));
+      // Point POS_SP at the preset's first waypoint — where a rest-to-rest shape
+      // also ends — so the kDirect hand-back at completion is continuous (no
+      // reposition). Read off the list rather than restated, so editing the
+      // waypoints above keeps the hand-back correct. Skipped on the bench: no
+      // hand-back happens there, so don't silently move the operator's POS_SP.
+      const Eigen::Vector3d& home = square.front();
+      set_parameter(
+          rclcpp::Parameter("POS_SP", std::vector<double>{home.x(), home.y(), home.z()}));
     }
     {
       std::lock_guard<std::mutex> lock(cross_mutex_);
@@ -659,9 +686,10 @@ private:
 
     core_->firePreset(square);
     RCLCPP_INFO(get_logger(),
-                "PRESET_WAYPOINTS fired: 2 m square centred (%.2f, %.2f) at %.2f m [%s].",
-                cx, cy, z,
-                flying ? "in flight; POS_SP moved to centre, returns to POS_SP when done"
+                "PRESET_WAYPOINTS fired: %zu waypoints from (%.2f, %.2f, %.2f) [%s].",
+                square.size(), square.front().x(), square.front().y(), square.front().z(),
+                flying ? "in flight; POS_SP moved to the first waypoint, returns to POS_SP "
+                         "when done"
                        : "bench: generation only, not flying");
   }
 
