@@ -206,6 +206,7 @@ public:
     pub_clearance_field_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/clearance_field", 10);
     pub_occupancy_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/occupancy_map", 10);
     pub_corridor_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/corridor", 10);
+    pub_pos_ff_marker_ = create_publisher<visualization_msgs::msg::Marker>("/control/pos_ff", 10);
 
     control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this), cb_fast_);
     viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this), cb_slow_);
@@ -226,16 +227,16 @@ private:
     declare_parameter("MPC_Z_P", 1.0);
     declare_parameter("MPC_XY_VEL_P", 2.8);
     declare_parameter("MPC_XY_VEL_I", 0.4);
-    declare_parameter("MPC_XY_VEL_D", 0.2);
-    declare_parameter("MPC_Z_VEL_P", 2.6);
-    declare_parameter("MPC_Z_VEL_I", 0.5);
-    declare_parameter("MPC_Z_VEL_D", 0.2);
+    declare_parameter("MPC_XY_VEL_D", 0.3);
+    declare_parameter("MPC_Z_VEL_P", 3.5);
+    declare_parameter("MPC_Z_VEL_I", 0.8);
+    declare_parameter("MPC_Z_VEL_D", 0.05);
     // Low-pass time constant on the D term [s]. The raw derivative is refreshed
     // only when a new VIO/odom sample lands (~25 Hz), so this is what keeps the
     // term smooth between measurements. Roughly one measurement period; raise it
     // for less noise, lower it for less phase lag.
     declare_parameter("MPC_VEL_D_TAU", 0.04);
-    declare_parameter("MPC_HOVER_THRUST", 0.35);
+    declare_parameter("MPC_HOVER_THRUST", 0.33);
 
     // Takeoff / hover setpoint. Held at 1.5 m to match the preset's altitude, so a
     // PRESET_WAYPOINTS fire from this hover adds no altitude step to its first
@@ -305,6 +306,15 @@ private:
     // infeasibility when a preset refuses to generate. Turn it off for a real
     // flight so the NUC pays nothing for it.
     declare_parameter("DEBUG_PLANNER_VIZ", true);
+    // Single switch for the trajectory-tracking debug visualisation: publishes
+    // a sphere marker at pos_ff (/control/pos_ff), the reference point the
+    // controller is currently chasing on smooth_trajectory. Published from the
+    // 50 Hz control tick, so unlike the planner viz above it is NOT free when
+    // on — kept its own switch rather than folding into DEBUG_PLANNER_VIZ so
+    // toggling planner-search debugging doesn't silently add fast-path publish
+    // work. Held TRUE for the current trajectory-following bench tuning; turn
+    // it off for a real flight.
+    declare_parameter("DEBUG_CONTROL_VIZ", true);
     // Treat frontier voxels (the known-free/unknown boundary from RTAB-Map's
     // octomap_global_frontier_space) as obstacles, so the planner refuses to
     // route through unmapped space and only flies through explored-free space.
@@ -653,6 +663,8 @@ private:
 
     const double cx = state.pos.x();
     const double cy = state.pos.y();
+    const double cz = state.pos.z();
+
     // The preset shape, one waypoint per line so it can be edited directly here:
     // offsets [m] from the drone's XY at the flip, absolute ENU altitude. As it
     // stands, centre first, round the four corners of a 2 m square once, back to
@@ -661,12 +673,10 @@ private:
     // you want that rest-to-rest property; the first is also where control is
     // handed back to POS_SP (below).
     const std::vector<Eigen::Vector3d> square = {
-        {cx + 0.0, cy + 0.0, 1.5},
-        {cx + 1.0, cy + 0.5, 1.5},
-        {cx - 1.0, cy + 0.5, 1.5},
-        {cx - 1.0, cy - 0.5, 1.5},
-        {cx + 1.0, cy - 0.5, 1.5},
-        {cx + 0.0, cy + 0.0, 1.5},
+        {cx, cy, cz},
+        {cx + 0.5, cy, 1.3},
+        {cx + 1.5, cy + 0.5, 2.0},
+        {cx + 2.5, cy + 0.0, 1.3},
     };
 
     if (flying) {
@@ -675,7 +685,7 @@ private:
       // reposition). Read off the list rather than restated, so editing the
       // waypoints above keeps the hand-back correct. Skipped on the bench: no
       // hand-back happens there, so don't silently move the operator's POS_SP.
-      const Eigen::Vector3d& home = square.front();
+      const Eigen::Vector3d& home = square.back();
       set_parameter(
           rclcpp::Parameter("POS_SP", std::vector<double>{home.x(), home.y(), home.z()}));
     }
@@ -943,6 +953,13 @@ private:
     d.vel_sp.x = vsp.x(); d.vel_sp.y = vsp.y(); d.vel_sp.z = vsp.z();
     const Eigen::Vector3d asp = c.getAccelerationSetpoint();
     d.acc_sp.x = asp.x(); d.acc_sp.y = asp.y(); d.acc_sp.z = asp.z();
+    const Eigen::Vector3d perr = psp - state.pos;
+    d.pos_err.x = perr.x(); d.pos_err.y = perr.y(); d.pos_err.z = perr.z();
+    const Eigen::Vector3d pff = c.getPositionFeedforward();
+    const Eigen::Vector3d vff = c.getVelocityFeedforward();
+    d.vel_ff.x = vff.x(); d.vel_ff.y = vff.y(); d.vel_ff.z = vff.z();
+    const Eigen::Vector3d aff = c.getAccelerationFeedforward();
+    d.acc_ff.x = aff.x(); d.acc_ff.y = aff.y(); d.acc_ff.z = aff.z();
     d.thrust_cmd = c.getThrustSetpoint();
     d.hover_thrust = c.getHoverThrust();
     const Eigen::Vector3d p = c.getVelocityPTerm();
@@ -952,6 +969,23 @@ private:
     const Eigen::Vector3d dd = c.getVelocityDTerm();
     d.pid_vel_d_term.x = dd.x(); d.pid_vel_d_term.y = dd.y(); d.pid_vel_d_term.z = dd.z();
     pub_debug_->publish(d);
+
+    if (get_parameter("DEBUG_CONTROL_VIZ").as_bool()) {
+      visualization_msgs::msg::Marker m;
+      m.header.frame_id = "map";
+      m.header.stamp = now();
+      m.ns = "pos_ff";
+      m.id = 0;
+      m.type = visualization_msgs::msg::Marker::SPHERE;
+      m.action = visualization_msgs::msg::Marker::ADD;
+      m.pose.position.x = pff.x();
+      m.pose.position.y = pff.y();
+      m.pose.position.z = pff.z();
+      m.pose.orientation.w = 1.0;
+      m.scale.x = m.scale.y = m.scale.z = 0.15;  // sphere diameter [m]
+      m.color.r = 0.1f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 1.0f;
+      pub_pos_ff_marker_->publish(m);
+    }
   }
 
   void publishViz() {
@@ -1364,6 +1398,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_clearance_field_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_occupancy_map_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_corridor_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_pos_ff_marker_;
 
   rclcpp::TimerBase::SharedPtr control_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;

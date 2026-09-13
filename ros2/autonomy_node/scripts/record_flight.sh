@@ -43,6 +43,7 @@ TOPICS=(
   /smooth_trajectory                      # committed trajectory (nav_msgs/Path)
   /planner/geometric_path                 # planner intent
   /planner/goal_marker                    #   "
+  /control/pos_ff                         # live tracking point on smooth_trajectory (needs DEBUG_CONTROL_VIZ)
   /rtabmap/octomap_binary                 # world model the planner actually saw
   /telemetry/cpu_usage_total              # onboard CPU load
   /rosout                                 # console log of every ROS node (rclcpp logs; see note below)

@@ -6,6 +6,9 @@ float64 thrust_accel        # thrust per unit mass along body up [m/s^2]; 9.81 =
 geometry_msgs/Point pos_sp
 geometry_msgs/Vector3 vel_sp
 geometry_msgs/Vector3 acc_sp
+geometry_msgs/Vector3 pos_err     # pos_sp (== pos_ff while tracking) minus pos
+geometry_msgs/Vector3 vel_ff
+geometry_msgs/Vector3 acc_ff
 float64 thrust_cmd
 float64 hover_thrust
 geometry_msgs/Vector3 pid_vel_p_term

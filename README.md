@@ -615,7 +615,7 @@ cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
   /debug/telemetry /okvis/cam0_matches/compressed /okvis/okvis_odometry /okvis/okvis_path \
   /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_attitude_setpoint_v1 \
   /fmu/out/vehicle_status /smooth_trajectory /planner/geometric_path /planner/goal_marker \
-  /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
+  /control/pos_ff /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
 ```
 
 **Estimator-debug set** — the standard set plus every stream the node's sensor-health watchdog
@@ -627,7 +627,7 @@ cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
   /fmu/out/sensor_combined /fmu/out/vehicle_odometry /fmu/out/vehicle_status_v1 \
   /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_attitude_setpoint_v1 \
   /fmu/out/vehicle_status /smooth_trajectory /planner/geometric_path /planner/goal_marker \
-  /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
+  /control/pos_ff /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
 ```
 
 Two things to know about the extra topics. `/fmu/out/sensor_combined` is the raw IMU stream at a few

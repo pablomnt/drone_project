@@ -82,6 +82,7 @@ void PositionControl::setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp) 
 void PositionControl::setReference(const common::Reference& ref) {
   _pos_sp = ref.pos;
   _yaw_sp = ref.yaw;
+  _pos_ff = ref.pos;
   _vel_ff = ref.vel_ff;
   _acc_ff = ref.acc_ff;
 }

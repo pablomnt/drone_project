@@ -75,6 +75,17 @@ public:
   Eigen::Vector3d getVelocitySetpoint() const { return _vel_sp; }
   Eigen::Vector3d getAccelerationSetpoint() const { return _acc_sp; }
   double getHoverThrust() const { return _hover_thrust; }
+
+  // The raw reference last handed to setReference(), before any PID correction
+  // is added (setSetpoint() alone does not update these). Position has no
+  // separate feedback term the way velocity/acceleration do (the trajectory's
+  // position IS the position setpoint), so getPositionFeedforward() and
+  // getPositionSetpoint() read identically while tracking through
+  // TrajectoryTracker, which always calls setReference(). vel_ff/acc_ff are
+  // zero outside kTracking, matching setReference()'s callers.
+  Eigen::Vector3d getPositionFeedforward() const { return _pos_ff; }
+  Eigen::Vector3d getVelocityFeedforward() const { return _vel_ff; }
+  Eigen::Vector3d getAccelerationFeedforward() const { return _acc_ff; }
   Eigen::Vector3d getVelocityPTerm() const { return _vel_p_term; }
   Eigen::Vector3d getVelocityITerm() const { return _vel_int; }
   Eigen::Vector3d getVelocityDTerm() const { return _vel_d_term; }
@@ -121,6 +132,7 @@ private:
 
   // Differential-flatness feed-forward, applied only when enabled and only once
   // the vehicle is past the open-loop takeoff ramp.
+  Eigen::Vector3d _pos_ff{Eigen::Vector3d::Zero()};
   Eigen::Vector3d _vel_ff{Eigen::Vector3d::Zero()};
   Eigen::Vector3d _acc_ff{Eigen::Vector3d::Zero()};
   bool _feedforward_enabled{false};
