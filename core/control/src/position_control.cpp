@@ -74,6 +74,10 @@ void PositionControl::setDerivativeTau(double tau) {
   _deriv_tau = std::max(tau, 0.0);
 }
 
+void PositionControl::setIntegratorErrorLimit(double max_pos_err) {
+  _int_err_limit = max_pos_err;
+}
+
 void PositionControl::setSetpoint(const Eigen::Vector3d& pos_sp, double yaw_sp) {
   _pos_sp = pos_sp;
   _yaw_sp = yaw_sp;
@@ -257,7 +261,19 @@ void PositionControl::_velocityControl(double dt) {
   // Negated: d(vel_sp - vel)/dt with the setpoint half dropped is -d(vel)/dt.
   _vel_d_term = -_vel_deriv_filt.cwiseProduct(_gain_vel_d);
 
-  _vel_int += vel_error.cwiseProduct(_gain_vel_i) * dt;
+  // Integrate only near the setpoint. Far from it the velocity error is the
+  // transient of a large move, not a steady bias, and integrating it winds up a
+  // term that must unwind after arrival as overshoot. Frozen rather than reset:
+  // the integrator carries the standing trim (hover-thrust mismatch, wind), and
+  // throwing that away on every large error would make the vehicle sag or drift
+  // on arrival while it re-learns.
+  Eigen::Vector3d int_step = vel_error.cwiseProduct(_gain_vel_i) * dt;
+  if (_int_err_limit > 0.0) {
+    const Eigen::Vector3d pos_err = _pos_sp - _pos;
+    if (pos_err.head<2>().norm() > _int_err_limit) int_step.head<2>().setZero();
+    if (std::abs(pos_err.z()) > _int_err_limit) int_step.z() = 0.0;
+  }
+  _vel_int += int_step;
 
   const double int_limit = 0.4;  // limit the integrator to avoid windup
   _vel_int = _vel_int.cwiseMin(int_limit).cwiseMax(-int_limit);

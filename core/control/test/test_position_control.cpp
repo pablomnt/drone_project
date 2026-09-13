@@ -83,6 +83,43 @@ int main() {
     }
   }
 
+  // Integrator gate: the velocity integrator accumulates only while the position
+  // error is within the limit, judged separately for XY (norm) and z, and a
+  // large error FREEZES it at its current value rather than resetting it.
+  {
+    PositionControl g;
+    g.setPositionGains(Eigen::Vector3d(1.0, 1.0, 1.0));
+    g.setVelocityGains(Eigen::Vector3d::Zero(), Eigen::Vector3d(1.0, 1.0, 1.0),
+                       Eigen::Vector3d::Zero());  // isolate I
+    g.setIntegratorErrorLimit(0.2);
+    g.setState(Eigen::Vector3d(0.0, 0.0, 2.0), Eigen::Vector3d::Zero(), 0.0);
+    g.reset();
+
+    // Near: 0.1 m on every axis (XY norm 0.14 m) -> all three integrate.
+    g.setSetpoint(Eigen::Vector3d(0.1, 0.1, 2.1), 0.0);
+    for (int k = 0; k < 10; ++k) g.update(0.02);
+    const Eigen::Vector3d near = g.getVelocityITerm();
+    if (!(near.x() > 0.0 && near.y() > 0.0 && near.z() > 0.0)) {
+      std::cerr << "FAIL: integrator did not accumulate inside the limit: "
+                << near.transpose() << "\n";
+      ++failures;
+    }
+
+    // Far horizontally (1 m), still near vertically -> XY frozen, z integrates.
+    g.setSetpoint(Eigen::Vector3d(1.0, 0.0, 2.1), 0.0);
+    for (int k = 0; k < 10; ++k) g.update(0.02);
+    const Eigen::Vector3d far = g.getVelocityITerm();
+    if (far.x() != near.x() || far.y() != near.y()) {
+      std::cerr << "FAIL: XY integrator not held at its value outside the limit: "
+                << near.transpose() << " -> " << far.transpose() << "\n";
+      ++failures;
+    }
+    if (!(far.z() > near.z())) {
+      std::cerr << "FAIL: z integrator frozen by a horizontal-only error\n";
+      ++failures;
+    }
+  }
+
   if (failures == 0) {
     std::cout << "position_control: all checks passed\n";
     return 0;

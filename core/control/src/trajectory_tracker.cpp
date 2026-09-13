@@ -18,6 +18,10 @@ void TrajectoryTracker::setDerivativeTau(double tau) {
   controller_.setDerivativeTau(tau);
 }
 
+void TrajectoryTracker::setIntegratorErrorLimit(double max_pos_err) {
+  controller_.setIntegratorErrorLimit(max_pos_err);
+}
+
 void TrajectoryTracker::enableFeedforward(bool enabled) {
   feedforward_ = enabled;
 }

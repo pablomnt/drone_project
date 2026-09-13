@@ -130,9 +130,16 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
                                           const std::vector<double>& times,
                                           const std::vector<ConvexRegion>& regions,
                                           common::Trajectory& out,
-                                          double* cost_out) const {
+                                          double* cost_out,
+                                          const std::vector<Eigen::Vector3d>* pin_waypoints) const {
   const int S = static_cast<int>(times.size());
   if (S < 1 || regions.size() != times.size()) return false;
+  // Pinning needs one waypoint per segment boundary. A mismatched list is a
+  // caller bug rather than an infeasible problem, so refuse rather than
+  // silently solving the unpinned problem and returning a shape nobody asked
+  // for — that failure would look exactly like the bug pinning exists to fix.
+  if (pin_waypoints && static_cast<int>(pin_waypoints->size()) != S + 1) return false;
+  const bool pin = pin_waypoints != nullptr;
   for (double t : times) {
     if (!(t > 0.0) || !std::isfinite(t)) return false;
   }
@@ -173,7 +180,10 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   //     control-point limits.
   int faces_total = 0;
   for (const auto& r : regions) faces_total += static_cast<int>(r.A.rows());
-  const int m_eq = kAxes * (8 + 5 * (S - 1));
+  // The pinned variant adds one position row per interior junction per axis on
+  // top of the C0..C4 continuity already there: continuity says the segments
+  // meet, this says WHERE.
+  const int m_eq = kAxes * (8 + (pin ? 6 : 5) * (S - 1));
   const int m_in = faces_total * kCoeffs + S * kAxes * (7 + 6 + 5);
   const int m = m_eq + m_in;
 
@@ -211,6 +221,21 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
         A.block(row, idx(s, ax), 1, kCoeffs) = re;
         A.block(row, idx(s + 1, ax), 1, kCoeffs) = -rs;
         lower(row) = upper(row) = 0.0;
+        ++row;
+      }
+    }
+    // Optional waypoint interpolation: pin segment s's END position to
+    // waypoint s+1. Only one side needs pinning — the C0 row just emitted
+    // carries it to segment s+1's start, so constraining both would be
+    // redundant rows on an equality the solver already holds. Position only:
+    // the velocity, acceleration and jerk at the junction stay free and
+    // continuous, so the curve carries speed THROUGH each waypoint instead of
+    // stopping at it.
+    if (pin) {
+      const Eigen::RowVectorXd rp = derivRow(0, 1.0);
+      for (int ax = 0; ax < kAxes; ++ax) {
+        A.block(row, idx(s, ax), 1, kCoeffs) = rp;
+        lower(row) = upper(row) = (*pin_waypoints)[s + 1](ax);
         ++row;
       }
     }
@@ -343,6 +368,10 @@ struct CorridorTimeContext {
   const std::vector<ConvexRegion>* regions;
   double time_penalty;
   double infeasible_penalty;
+  // Null when junctions are free; otherwise the waypoints the curve must pass
+  // through. The time search has to solve the SAME problem the final solve
+  // will, or it optimises an allocation for a shape that is never built.
+  const std::vector<Eigen::Vector3d>* pin_waypoints;
 };
 
 // Feasibility-aware objective: QP snap cost + time penalty for a candidate
@@ -358,7 +387,8 @@ double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& 
 
   common::Trajectory traj;
   double cost = 0.0;
-  if (!ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost)) {
+  if (!ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost,
+                            ctx->pin_waypoints)) {
     return ctx->infeasible_penalty;
   }
   return cost + ctx->time_penalty * total;
@@ -368,9 +398,14 @@ double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& 
 
 bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     const common::MotionState& start, const std::vector<Eigen::Vector3d>& waypoints,
-    const std::vector<ConvexRegion>& regions, common::Trajectory& out) const {
+    const std::vector<ConvexRegion>& regions, common::Trajectory& out,
+    bool pin_waypoints) const {
   if (waypoints.size() < 2 || regions.size() != waypoints.size() - 1) return false;
   const int S = static_cast<int>(regions.size());
+  // Passed to every solve below, the seed-growth probe and the BOBYQA objective
+  // included: the allocation being searched has to be an allocation for the
+  // shape actually being built.
+  const std::vector<Eigen::Vector3d>* pin = pin_waypoints ? &waypoints : nullptr;
 
   // Velocity-consistent seed: long enough to traverse each segment at vmax with
   // some slack. BOBYQA must start on the feasible side (the infeasible region
@@ -392,7 +427,7 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     common::Trajectory probe;
     int grow = 0;
     while (grow < kMaxSeedGrowth &&
-           !solveQP(start, waypoints.back(), times, regions, probe)) {
+           !solveQP(start, waypoints.back(), times, regions, probe, nullptr, pin)) {
       for (double& t : times) t *= 1.5;
       ++grow;
     }
@@ -404,8 +439,8 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     if (grow == kMaxSeedGrowth) return false;  // corridor unusable at any sane duration
   }
 
-  CorridorTimeContext ctx{this, start, waypoints.back(), &regions,
-                          kTimePenalty, kInfeasiblePenalty};
+  CorridorTimeContext ctx{this,         start,              waypoints.back(), &regions,
+                          kTimePenalty, kInfeasiblePenalty, pin};
 
   nlopt::opt optimizer(nlopt::LN_BOBYQA, S);
   optimizer.set_min_objective(corridorTimeObjective, &ctx);
@@ -426,9 +461,9 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // Final solve at the chosen allocation. The search started feasible, but
   // BOBYQA returns its lowest evaluated point, which can sit just inside the
   // infeasible boundary; retry once with a modest stretch before giving up.
-  if (solveQP(start, waypoints.back(), times, regions, out)) return true;
+  if (solveQP(start, waypoints.back(), times, regions, out, nullptr, pin)) return true;
   for (double& t : times) t *= 1.5;
-  return solveQP(start, waypoints.back(), times, regions, out);
+  return solveQP(start, waypoints.back(), times, regions, out, nullptr, pin);
 }
 
 }  // namespace drone_core::planning

@@ -132,6 +132,7 @@ AutonomyCore::AutonomyCore(const Config& config)
   tracker_.setPositionGains(cfg_.pos_p);
   tracker_.setVelocityGains(cfg_.vel_p, cfg_.vel_i, cfg_.vel_d);
   tracker_.setDerivativeTau(cfg_.vel_d_tau);
+  tracker_.setIntegratorErrorLimit(cfg_.int_err_limit);
   tracker_.setHoverThrust(cfg_.hover_thrust);
   tracker_.enableFeedforward(cfg_.enable_feedforward);
   tracker_.setStaleTimeout(cfg_.stale_timeout);
@@ -255,6 +256,7 @@ common::Command AutonomyCore::stepControl(double dt) {
     tracker_.setPositionGains(cfg_.pos_p);
     tracker_.setVelocityGains(cfg_.vel_p, cfg_.vel_i, cfg_.vel_d);
     tracker_.setDerivativeTau(cfg_.vel_d_tau);
+    tracker_.setIntegratorErrorLimit(cfg_.int_err_limit);
     if (hover_thrust_changed) tracker_.setHoverThrust(cfg_.hover_thrust);
     tracker_.enableFeedforward(cfg_.enable_feedforward);
     tracker_.setStaleTimeout(cfg_.stale_timeout);
@@ -439,7 +441,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                               const std::shared_ptr<DynamicEDTOctomap>& cons_edt,
                               const planning::MapHandle& cons_map,
                               const planning::CorridorUnknownFn& unknown_fn,
-                              common::Trajectory& traj) {
+                              common::Trajectory& traj, bool pin_waypoints) {
   if (path.size() < 2) return false;
 
   if (cfg_.use_corridor_qp && cons_edt && cons_map) {
@@ -645,7 +647,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       // `start` carries the splice state. Its position is path.front() by
       // construction (the caller rooted the path there), so it satisfies
       // regions[0]; the derivatives are what make the engage continuous.
-      if (optimizer.optimizeTrajectory(start, resampled, regions, traj)) {
+      if (optimizer.optimizeTrajectory(start, resampled, regions, traj, pin_waypoints)) {
         traj.t0 = t0;
         if (cfg_.debug_planner_viz) {
           DRONE_LOG_INFO("[trajgen] corridor: OK " << regions.size() << " regions / "
@@ -733,10 +735,14 @@ void AutonomyCore::runPreset(const common::State& state, const planning::MapHand
 
   const planning::MapHandle cons = conservative ? conservative : map;
   common::Trajectory traj;
+  // Pin the waypoints. For a preset the shape IS the test — with the junctions
+  // free the QP is pinned only at the two ends and takes the cheapest route the
+  // corridor allows, which for a closed square (last waypoint == first) is
+  // barely moving at all. Planning deliberately leaves them free; see runTrajgen.
   const bool ok = runTrajgen(path, anchor.t0, anchor.start, conservativeField(cons), cons,
                              cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
                                                           : planning::CorridorUnknownFn{},
-                             traj);
+                             traj, /*pin_waypoints=*/true);
   if (!ok) {
     // runTrajgen has already logged which stage failed and why. Stage nothing;
     // the vehicle keeps holding POS_SP. preset_active_ stays false, so control is

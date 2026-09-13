@@ -35,6 +35,11 @@ public:
   // measurement period.
   void setDerivativeTau(double tau);
 
+  // Position error [m] above which the velocity integrator is frozen: held at
+  // its current value, not reset. Checked separately for the horizontal (XY
+  // norm) and vertical axes. A value <= 0 disables the gate (always integrate).
+  void setIntegratorErrorLimit(double max_pos_err);
+
   // Loop inputs.
   void setState(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double yaw);
 
@@ -146,6 +151,7 @@ private:
   // Integrator memory.
   Eigen::Vector3d _vel_int;
   bool _first_update = true;
+  double _int_err_limit{0.0};  // <= 0: integrator gate disabled
 
   // Derivative-on-measurement memory. The derivative is taken on _vel rather
   // than on the velocity error: the two are identical in steady state, but

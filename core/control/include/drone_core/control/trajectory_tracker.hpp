@@ -25,6 +25,7 @@ public:
   void setVelocityGains(const Eigen::Vector3d& P, const Eigen::Vector3d& I, const Eigen::Vector3d& D);
   void setHoverThrust(double hover_thrust);
   void setDerivativeTau(double tau);
+  void setIntegratorErrorLimit(double max_pos_err);
   void enableFeedforward(bool enabled);
 
   // Seconds without a new trajectory before falling back to hover-hold.

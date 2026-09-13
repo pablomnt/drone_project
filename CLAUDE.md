@@ -421,6 +421,12 @@ requires it; validate any change in `USE_SIM_MODE`/SITL first. Notable behavior:
   because closed-loop control near the ground with noisy VIO causes skidding.
 - **Online hover-thrust estimation**: back-calculates hover thrust from filtered command + measured
   vertical accel, de-weighting the estimate at high vertical speed; overridable via `MPC_HOVER_THRUST`.
+- **Integrator gate (`MPC_INT_ERR_MAX`, default 0.2 m)**: the velocity integrator only accumulates
+  while the position error is within the limit, judged separately for XY (norm) and z. Outside it
+  the integrator is **frozen, not reset** — it carries the standing trim (hover-thrust mismatch,
+  wind), so resetting would make the vehicle sag/drift on arrival. Added because a long move wound
+  it up and it unwound as overshoot at the stop. `<= 0` disables; `PositionControl`'s own default is
+  disabled, the core `Config` and the node default to 0.2.
 - **Differential-flatness feed-forward (added on top; `PositionControl`'s own default is OFF, but the
   node now ships `ENABLE_FEEDFORWARD` defaulted `true`)**: `setReference()` accepts
   `vel_ff`/`acc_ff`; with feed-forward disabled the controller is byte-identical to the baseline

@@ -50,9 +50,15 @@ public:
   // regions[0]. Only the END is at rest, which is what makes an un-replaced
   // trajectory a safety stop; the start is at rest only when the caller says
   // so (first plan of a flight, or a replan off a hover).
+  //
+  // `pin_waypoints`, when non-null, additionally pins the curve's position at
+  // every interior junction to the corresponding entry (see optimizeTrajectory).
+  // It must hold regions.size() + 1 points. Null leaves the junctions free,
+  // which is the planner's behaviour.
   bool solveQP(const common::MotionState& start, const Eigen::Vector3d& goal,
                const std::vector<double>& times, const std::vector<ConvexRegion>& regions,
-               common::Trajectory& out, double* cost_out = nullptr) const;
+               common::Trajectory& out, double* cost_out = nullptr,
+               const std::vector<Eigen::Vector3d>* pin_waypoints = nullptr) const;
 
   // Convenience overload: start from rest at `start`.
   bool solveQP(const Eigen::Vector3d& start, const Eigen::Vector3d& goal,
@@ -77,18 +83,32 @@ public:
   // start.pos is used in place of waypoints.front(), which it must coincide
   // with for the corridor to contain it. Returns false when no feasible time
   // allocation was found (the final QP at the best times fails).
+  //
+  // `pin_waypoints` decides what the waypoints are FOR. False (the planner's
+  // case) uses them only to shape the corridor and seed the time allocation:
+  // the trajectory is pinned at its two ends and is otherwise free to take any
+  // minimum-snap route through the regions, which is the point — it smooths out
+  // the geometric search's zig-zag rather than tracking it. True additionally
+  // constrains the curve to pass exactly through every interior waypoint, for
+  // callers whose waypoints ARE the intent rather than a hint (PRESET_WAYPOINTS,
+  // where the shape is the thing under test). Note what the free case does to a
+  // CLOSED path: with the last waypoint equal to the first, "start here, end
+  // here, stay in the regions" is minimised by barely moving at all, so a preset
+  // loop collapses instead of being flown.
   bool optimizeTrajectory(const common::MotionState& start,
                           const std::vector<Eigen::Vector3d>& waypoints,
                           const std::vector<ConvexRegion>& regions,
-                          common::Trajectory& out) const;
+                          common::Trajectory& out,
+                          bool pin_waypoints = false) const;
 
   // Convenience overload: start from rest at waypoints.front().
   bool optimizeTrajectory(const std::vector<Eigen::Vector3d>& waypoints,
                           const std::vector<ConvexRegion>& regions,
-                          common::Trajectory& out) const {
+                          common::Trajectory& out,
+                          bool pin_waypoints = false) const {
     common::MotionState s;
     if (!waypoints.empty()) s.pos = waypoints.front();
-    return optimizeTrajectory(s, waypoints, regions, out);
+    return optimizeTrajectory(s, waypoints, regions, out, pin_waypoints);
   }
 
   const CorridorLimits& limits() const { return limits_; }

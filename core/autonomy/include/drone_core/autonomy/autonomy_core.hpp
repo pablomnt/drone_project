@@ -35,6 +35,7 @@ public:
     Eigen::Vector3d vel_i{0.4, 0.4, 0.5};
     Eigen::Vector3d vel_d{0.2, 0.2, 0.2};
     double vel_d_tau{0.04};  // low-pass time constant on the D term [s]
+    double int_err_limit{0.2};  // freeze the velocity integrator above this position error [m]; <= 0 disables
     double hover_thrust{0.35};
     bool enable_feedforward{false};
     double stale_timeout{1.5};        // hover-hold fallback threshold [s]
@@ -277,12 +278,18 @@ private:
   // map handle so that decision is visible at the call site next to the
   // `conservative` handle it depends on, instead of being re-derived here from
   // which map objects happen to be distinct.
+  //
+  // `pin_waypoints` forces the trajectory through every resampled corridor
+  // waypoint instead of only its two ends. False for planning, where the
+  // waypoints are a hint and letting the QP smooth across them is the whole
+  // point of having a corridor. True for a preset, where they are the intent.
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const common::MotionState& start,
                   const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
                   const planning::MapHandle& cons_map,
                   const planning::CorridorUnknownFn& is_unknown,
-                  common::Trajectory& traj);
+                  common::Trajectory& traj,
+                  bool pin_waypoints = false);
   void stagePending(const common::Trajectory& traj);
   // Build and stage a one-shot preset trajectory through `waypoints` (see
   // firePreset), splice-anchored at rest on the current state, and arm the
