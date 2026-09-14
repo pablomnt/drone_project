@@ -4,8 +4,10 @@
 
 #include "drone_core/control/position_control.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <random>
 
 int main() {
   using drone_core::control::PositionControl;
@@ -118,6 +120,60 @@ int main() {
       std::cerr << "FAIL: z integrator frozen by a horizontal-only error\n";
       ++failures;
     }
+  }
+
+  // Hover-thrust estimator under flight-level vibration. The accel in flight reads
+  // about ±3.5 m/s² of heavy-tailed noise around 9.81. The estimator must keep the
+  // accel on top of the fraction it filters (thrust gain a/T): averaging the
+  // per-sample ratio T·g/a puts the noise underneath and is biased high (it read 0.31 against a true 0.29 on the
+  // 2026-09-14 flights). Closed loop: with zero gains the command is the
+  // estimate itself, and the simulated vehicle's thrust accel follows from it.
+  {
+    constexpr double kTrueHover = 0.29;
+    constexpr double kDt = 0.02;
+    PositionControl h;  // gains default to zero: thrust_sp == hover estimate
+    h.setState(Eigen::Vector3d(0.0, 0.0, 1.5), Eigen::Vector3d::Zero(), 0.0);
+    h.setHoverThrust(0.33);  // seeded wrong, like MPC_HOVER_THRUST was
+    h.reset();
+    h.setSetpoint(Eigen::Vector3d(0.0, 0.0, 1.5), 0.0);
+
+    std::mt19937 rng(42);
+    std::student_t_distribution<double> t3(3.0);  // heavy tails; variance 3
+    const double noise_scale = 3.5 / std::sqrt(3.0);
+
+    double old_form = 0.33;  // the previous per-sample ratio estimator, as a contrast
+    double sum_new = 0.0, sum_old = 0.0;
+    int n = 0;
+    double cmd = 0.33;
+    const int ticks = static_cast<int>(60.0 / kDt);
+    for (int k = 0; k < ticks; ++k) {
+      const double a = 9.81 * cmd / kTrueHover + noise_scale * t3(rng);
+      h.setThrustAccel(a);
+      h.update(kDt);
+      old_form += (kDt / 2.5) * (std::clamp(cmd * 9.81 / a, 0.2, 0.5) - old_form);
+      cmd = h.getThrustSetpoint();
+      if (k * kDt >= 40.0) {  // settled window: last 20 s
+        sum_new += h.getHoverThrust();
+        sum_old += old_form;
+        ++n;
+      }
+    }
+    const double est = sum_new / n;
+    const double old_est = sum_old / n;
+    if (std::abs(est - kTrueHover) > 0.01) {
+      std::cerr << "FAIL: hover estimate " << est << " under vibration, expected " << kTrueHover
+                << " +/- 0.01\n";
+      ++failures;
+    }
+    // Guard the test itself: if the noise were too mild to bias the old form, a
+    // pass above would prove nothing about which way up the fraction is.
+    if (std::abs(old_est - kTrueHover) <= 0.01) {
+      std::cerr << "FAIL: test noise too weak to exercise the bias (old form read " << old_est
+                << ")\n";
+      ++failures;
+    }
+    std::cout << "hover estimate under vibration: " << est << " (per-sample ratio would read "
+              << old_est << ", true " << kTrueHover << ")\n";
   }
 
   if (failures == 0) {

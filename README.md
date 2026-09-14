@@ -155,7 +155,10 @@ flight; do not touch the gains or control math unless a task specifically requir
   because closed-loop control near the ground with noisy VIO causes skidding.
 - **Online hover-thrust estimation**: back-calculates hover thrust from the filtered command and
   `State::thrust_accel` (measured thrust per unit mass along body up — *not* a vertical
-  acceleration, see `common/`), de-weighting the estimate at high vertical speed; overridable via
+  acceleration, see `common/`), de-weighting the estimate at high vertical speed. It filters the thrust gain
+  (accel ÷ command) and takes hover thrust as 9.81 ÷ gain, keeping the noisy accel on top of the
+  fraction — the old per-sample `command·9.81/accel` was biased high under flight vibration (read
+  0.31 vs a true 0.29); overridable via
   `MPC_HOVER_THRUST`. This is the only consumer of a measured IMU quantity anywhere in the
   controller.
 - **Differential-flatness feed-forward** (added on top, default OFF): `setReference()` accepts
@@ -630,14 +633,12 @@ cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
   /control/pos_ff /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
 ```
 
-Two things to know about the extra topics. `/fmu/out/sensor_combined` is the raw IMU stream at a few
-hundred Hz — by far the heaviest thing in either list, so use this tier when you are chasing a
+Two things to know about the extra topics. `/fmu/out/sensor_combined` is the raw IMU stream (~100 Hz
+received in flight) — by far the heaviest thing in either list, so use this tier when you are chasing a
 timeout, not as the always-on recorder on the NUC. (It is bridged with **no rate limit**, unlike
 every other topic in PX4's `dds_topics.yaml`, and carries no vibration filtering — so it looks very
-noisy and that is expected. The control loop samples it at 50 Hz with no low-pass, which aliases
-vibration into slow wander; if `hover_thrust` in `ControllerDebug` is seen drifting, that is the
-cause and the fix is a filter in `onSensorCombined`, at message rate rather than in the control
-loop.) And `/fmu/out/vehicle_status_v1` is the topic the
+noisy and that is expected. `onSensorCombined` accumulates every sample and the 50 Hz
+control loop uses the per-tick mean, so vibration is averaged at message rate rather than aliased.) And `/fmu/out/vehicle_status_v1` is the topic the
 node actually subscribes to (PX4 v1.17); the standard set's `/fmu/out/vehicle_status` is the legacy
 name and can land in the bag with zero messages — if `ros2 bag info` shows that, record the `_v1`
 topic instead (or add the `qos_overrides.yaml` flag noted in `record_flight.sh`, since a best-effort

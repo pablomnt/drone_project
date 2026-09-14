@@ -100,6 +100,7 @@ private:
   void _velocityControl(double dt);
   void _accelerationControl();
   void _updateHoverThrust(double dt);
+  void _seedHoverFilters();
   Eigen::Vector2d _constrainXY(const Eigen::Vector2d& v0, double max);
 
   // Gains.
@@ -116,6 +117,10 @@ private:
 
   double _hover_thrust;
   double _filtered_thrust_cmd;
+  // Low-passed thrust gain: measured thrust accel per unit of lagged command
+  // [m/s^2 per unit thrust], 9.81 / hover thrust. The noisy accel sits on top of
+  // this fraction so its noise averages out; see _updateHoverThrust.
+  double _thrust_gain_lpf{9.81 / 0.4};
   bool _reset_hover_filter;
   double _learning_rate;
   double _hover_thrust_convergence_time;

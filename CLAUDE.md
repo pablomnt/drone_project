@@ -705,7 +705,7 @@ Why no rotation belongs here, and why this is now correct by construction rather
   sideways. They are no longer stored at all.
 - **The estimator's model wants exactly this.** `_updateHoverThrust` inverts `a_z = g(T/T_hover - 1)`,
   which assumes thrust acts along body z. The sensor makes the same assumption, so the pairing is
-  exact at any tilt: `inst_hover = T·9.81 / c` recovers `T_hover` with no tilt term. Rotate the
+  exact at any tilt: `T_hover = 9.81 / (c/T)` recovers the hover thrust with no tilt term. Rotate the
   measurement into the world instead and the estimate picks up a `1/cosθ` error — +1.5% at 10°,
   +6.4% at 20°. The old note's "fix" was that error.
 - **It is a scalar on purpose.** A world-frame acceleration cannot be passed here by mistake; the
@@ -721,11 +721,23 @@ and add it as a **separate** field. Do not route the hover-thrust estimator thro
 derivative of an EKF velocity state driven largely by the same accelerometer, and the EKF's own
 accel-z bias state overlaps physically with hover thrust, so the two would chase each other.
 
-**Noise:** `sensor_combined` is PX4's rawest IMU topic and is bridged with **no rate limit**, while
-the control loop samples it at 50 Hz — so vibration aliases into slow wander. There is no filter on
-it today. If `ControllerDebug.hover_thrust` is seen wandering in a flight log, the fix is a low-pass
-in `onSensorCombined` (at message rate, *before* the decimation — filtering in the control loop
-cannot undo aliasing). PX4's own `vehicle_acceleration` is exactly this signal with a 2-pole
+**Noise, and why the estimator averages before dividing.** `sensor_combined` is PX4's rawest IMU
+topic, bridged with **no rate limit** (~100 Hz received), and in flight its z reads **±3.5 m/s²** of
+vibration around 9.81 (2026-09-14 flights; the average itself agrees with VIO to <1%). Two defences:
+
+- **`onSensorCombined` accumulates, `controlLoop` takes the per-tick mean.** Keeping only the newest
+  sample at 50 Hz folds vibration into slow error; averaging has to happen at message rate because
+  the decimation cannot be undone later.
+- **`_updateHoverThrust` filters the thrust gain `c/T`, then takes `T_hover = 9.81 / gain`.** The
+  old form averaged the per-sample `T·9.81/c`, which puts the noise underneath the fraction and is
+  biased high (a sample at 4 m/s² inflates it far more than one at 15 deflates it). It read **0.31
+  against a true 0.29** on both flights, pinned the z integrator at its clamp and held the vehicle
+  ~20 cm above its setpoint. Arrival-averaging alone only cut that to 0.306; flipping the fraction is
+  the fix: with the noisy accel on top, noise cancels and every sample weighs the same, and the
+  final division is by an already-smoothed gain. `test_position_control` checks this under
+  heavy-tailed ±3.5 m/s² noise and guards that the old form *would* fail it.
+
+PX4's own `vehicle_acceleration` is exactly this signal with a 2-pole
 low-pass at `IMU_ACCEL_CUTOFF`, but it is **not** in `uxrce_dds_client/dds_topics.yaml`, which is
 consumed at firmware build time — so using it needs a rebuild and reflash. (The trajectory splice
 deliberately uses none of this — see the control section.)

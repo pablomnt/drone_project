@@ -54,7 +54,10 @@ void PositionControl::setConstraints(double vel_horizontal, double vel_up, doubl
   _lim_tilt = tilt_max_rad;
 }
 
-void PositionControl::setHoverThrust(double hover_thrust) { _hover_thrust = hover_thrust; }
+void PositionControl::setHoverThrust(double hover_thrust) {
+  _hover_thrust = hover_thrust;
+  _seedHoverFilters();
+}
 
 void PositionControl::setState(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double yaw) {
   _pos = pos;
@@ -318,11 +321,18 @@ void PositionControl::_accelerationControl() {
   _attitude_sp = Eigen::Quaterniond(rot);
 }
 
+void PositionControl::_seedHoverFilters() {
+  // Park the gain filter on the current estimate, so the hover thrust starts
+  // exactly at _hover_thrust and moves only as new flight data arrives.
+  _thrust_gain_lpf = 9.81 / std::clamp(_hover_thrust, 0.2, 0.5);
+}
+
 void PositionControl::_updateHoverThrust(double dt) {
   // Re-seed the filter after a regime change (e.g. a mid-air mode switch) so it
   // does not spool up from a stale state.
   if (_reset_hover_filter) {
     _filtered_thrust_cmd = _thrust_sp;
+    _seedHoverFilters();
     _reset_hover_filter = false;
   }
 
@@ -330,6 +340,7 @@ void PositionControl::_updateHoverThrust(double dt) {
   // to the command so it cannot diverge.
   if (_thrust_sp < 0.1) {
     _filtered_thrust_cmd = _thrust_sp;
+    _seedHoverFilters();
     return;
   }
 
@@ -341,6 +352,7 @@ void PositionControl::_updateHoverThrust(double dt) {
       // Still grounded: keep the filter pre-charged so there is no glitch at
       // the moment of takeoff.
       _filtered_thrust_cmd = _thrust_sp;
+      _seedHoverFilters();
       return;
     }
   }
@@ -356,26 +368,38 @@ void PositionControl::_updateHoverThrust(double dt) {
   const double alpha = dt / (tau + dt);
   _filtered_thrust_cmd += alpha * (_thrust_sp - _filtered_thrust_cmd);
 
-  // Invert the idealised vertical dynamics a_z = g (T / T_hover - 1) to back out
-  // the hover thrust. That model assumes thrust acts along body z, and
-  // _thrust_accel measures the specific force along exactly that axis, so the
-  // two assumptions match and the result is correct at any tilt — which is why
-  // no attitude rotation belongs here. _thrust_accel is (a_z + g) directly, so
-  // the gravity term the old form added back has cancelled out of the algebra.
-  double inst_hover_thrust = (_filtered_thrust_cmd * 9.81) / _thrust_accel;
-  inst_hover_thrust = std::clamp(inst_hover_thrust, 0.2, 0.5);
-
   // Trust the IMU less while climbing or descending fast, where unmodelled
-  // aerodynamics corrupt the instantaneous estimate.
+  // aerodynamics corrupt the measurement.
   const double current_speed = std::abs(_vel.z());
   double trust_factor = 1.0;
   if (current_speed > 0.5) {
     trust_factor = 0.5 / current_speed;
   }
-
   const double effective_learning_rate = _learning_rate * trust_factor;
-  _hover_thrust = (_hover_thrust * (1.0 - effective_learning_rate)) +
-                  (inst_hover_thrust * effective_learning_rate);
+
+  // Invert the idealised vertical dynamics a_z = g (T / T_hover - 1) to back out
+  // the hover thrust. That model assumes thrust acts along body z, and
+  // _thrust_accel measures the specific force along exactly that axis, so the
+  // two assumptions match and the result is correct at any tilt — which is why
+  // no attitude rotation belongs here.
+  //
+  // The noisy accel must stay on TOP of the fraction. In flight it reads
+  // ±3.5 m/s² of vibration around 9.81. The previous form averaged T g / a,
+  // putting that noise underneath, where a dip to 4 m/s² inflates the result far
+  // more than a spike to 15 deflates it: it read 0.31 against a true hover of
+  // 0.29 on both 2026-09-14 flights, pinned the z integrator and held the
+  // vehicle ~20 cm above its setpoint. So filter the thrust gain a / T instead.
+  // Noise enters it linearly and cancels, every sample weighs the same, and T is
+  // a clean command. The final g / gain divides by an already-smoothed value,
+  // so it adds no bias.
+  //
+  // Guard: anything under 0.1 thrust returned above, but the motor-lag filter
+  // can trail just below that for a tick after the command rises.
+  if (_filtered_thrust_cmd > 0.05) {
+    const double thrust_gain = _thrust_accel / _filtered_thrust_cmd;
+    _thrust_gain_lpf += effective_learning_rate * (thrust_gain - _thrust_gain_lpf);
+    _hover_thrust = std::clamp(9.81 / _thrust_gain_lpf, 0.2, 0.5);
+  }
 }
 
 Eigen::Quaterniond PositionControl::getAttitudeSetpoint() const { return _attitude_sp; }

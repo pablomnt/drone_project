@@ -547,7 +547,14 @@ private:
     // thrust per unit mass along the vehicle's own up axis (9.81 in hover), which
     // is the whole of what a quadrotor's accelerometer can report — see the note
     // on drone_core::common::State::thrust_accel.
-    thrust_accel_ = -msg->accelerometer_m_s2[2];
+    //
+    // Accumulated, not overwritten: this arrives at ~100 Hz against the 50 Hz
+    // control tick, and keeping only the newest sample would fold the vibration
+    // above the tick's Nyquist into slow error. controlLoop folds the sum into
+    // thrust_accel_ once per tick. Same (mutually exclusive) fast group as the
+    // tick, so no lock.
+    accel_sum_ += -msg->accelerometer_m_s2[2];
+    ++accel_count_;
     t_sensor_ = get_clock()->now().seconds();
   }
 
@@ -788,6 +795,14 @@ private:
     const bool position_fresh = use_sim_mode_
         ? streamHealthy(t_px4_odom_, now_s, sensor_timeout)
         : streamHealthy(t_vio_odom_, now_s, sensor_timeout);
+    // Mean of every accelerometer sample since the last tick (see onSensorCombined).
+    // Folded every tick, not only when position is fresh, so the window never
+    // spans more than one tick. No new sample: hold the previous mean.
+    if (accel_count_ > 0) {
+      thrust_accel_ = accel_sum_ / accel_count_;
+      accel_sum_ = 0.0;
+      accel_count_ = 0;
+    }
     drone_core::common::State state;
     double yaw_used = 0.0;
     if (position_fresh) {
@@ -1422,6 +1437,9 @@ private:
   Eigen::Vector3d vio_vel_enu_{Eigen::Vector3d::Zero()};
   // Thrust per unit mass along body up [m/s^2]; 9.81 = hover. NOT an acceleration.
   double thrust_accel_{9.81};
+  // Accel samples accumulated between control ticks; see onSensorCombined.
+  double accel_sum_{0.0};
+  int accel_count_{0};
   double yaw_px4_enu_{0.0};
   double yaw_vio_enu_{0.0};
 
