@@ -341,6 +341,7 @@ bool AutonomyCore::planOnce() {
                   traj))
     return false;
 
+  restampRestStart(anchor, traj);
   stagePending(traj);
   return true;
 }
@@ -757,6 +758,9 @@ void AutonomyCore::runPreset(const common::State& state, const planning::MapHand
                            path[i][2] - path[i - 1][2]);
   }
 
+  // A preset starts at rest, so this moves t0 to after the solve; preset_end_
+  // below then follows it rather than cutting the one-shot short by the solve time.
+  restampRestStart(anchor, traj);
   stagePending(traj);
   // Hold the one-shot for its whole duration, then release (see stepControl). The
   // trajectory plays in absolute time from traj.t0, so its end is t0 + duration.
@@ -799,6 +803,13 @@ AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state
     anchor.from_trajectory = false;
   }
   return anchor;
+}
+
+void AutonomyCore::restampRestStart(const SpliceAnchor& anchor, common::Trajectory& traj) const {
+  if (anchor.from_trajectory) return;
+  // kLeadMin (two control ticks) rather than now() itself, so the tracker
+  // promotes it at its own beginning instead of a tick in.
+  traj.t0 = now() + kLeadMin;
 }
 
 std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
@@ -1188,7 +1199,8 @@ void AutonomyCore::plannerLoop() {
         const double solve_time = now() - t_gen;
         trajgen_solve_max_ = std::max(solve_time, kLeadMaxDecay * trajgen_solve_max_);
         trajgen_lead_ = std::clamp(kLeadSafetyFactor * trajgen_solve_max_, kLeadMin, kLeadMax);
-        if (solve_time > anchor.t0 - t_gen) {
+        // Only a splice can engage late: a rest start is re-anchored below.
+        if (anchor.from_trajectory && solve_time > anchor.t0 - t_gen) {
           // The trajectory is due to engage before it was finished, so it will
           // start slightly past its own beginning. Self-correcting (the lead
           // just grew), but worth naming: this is the one case that puts a step
@@ -1200,6 +1212,7 @@ void AutonomyCore::plannerLoop() {
         }
 
         if (ok) {
+          restampRestStart(anchor, traj);
           stagePending(traj);
           last_trajgen_ = t;
         }

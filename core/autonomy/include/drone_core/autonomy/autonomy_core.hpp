@@ -322,6 +322,17 @@ private:
   // the vehicle is no longer on would command a jump. Worker thread only.
   SpliceAnchor spliceAnchor(const common::State& state, double t_now) const;
 
+  // Re-anchor a solved trajectory's start time to after the solve, for a start
+  // at rest only (anchor.from_trajectory false). The lead exists so a splice
+  // meets the outgoing trajectory at an instant fixed BEFORE solving; a rest
+  // start has nothing to meet, and the vehicle holds still on POS_SP or
+  // hover-hold while the solve runs, so the start can simply wait for the
+  // solve. Without this a solve longer than the lead (presets routinely take
+  // 1-3 s against a 0.04 s lead) engaged the trajectory already partway along,
+  // stepping the reference ahead of the vehicle. Call before stagePending, which
+  // records the trajectory for later splices by absolute time.
+  void restampRestStart(const SpliceAnchor& anchor, common::Trajectory& traj) const;
+
   // Configure `planner` with the shared clearance-aware objective used by BOTH
   // the monitor and improve passes, so a forced replan and an improvement
   // search minimise exactly the same cost.

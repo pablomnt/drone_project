@@ -77,6 +77,51 @@ int main() {
     check(core.inHoverHold(), "watchdog fell back to hover-hold when guidance went stale");
   }
 
+  // A start at rest is re-anchored to after the solve. The clock jumps 2 s
+  // straight after its first read inside planOnce (the splice anchor), as if the
+  // solve took that long: with t0 fixed at the anchor, the trajectory would be
+  // overdue by the time it was staged and engage partway along on the very next
+  // tick.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.stale_timeout = 0.5;
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    bool slow_clock = false;
+    core.setClock([&]() {
+      const double t = fake_time;
+      if (slow_clock) {
+        fake_time += 2.0;
+        slow_clock = false;
+      }
+      return t;
+    });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    core.setMap(octree);
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+
+    slow_clock = true;
+    const double t_before = fake_time;
+    check(core.planOnce(), "slow planOnce produced a trajectory");
+    slow_clock = false;
+    check(fake_time - t_before >= 1.0, "the slow clock actually advanced during the solve");
+
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "rest start does not engage on the tick after a slow solve");
+
+    fake_time += 0.1;
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.stepControl(0.02);
+    check(!core.inHoverHold(), "rest start engages once its re-anchored t0 has passed");
+  }
+
   // Corridor-QP mode: planOnce must route trajgen through the corridor
   // pipeline (truncation + box corridor + QP against the conservative EDT) and
   // still stage a trajectory. A mapped floor gives the distance field real
