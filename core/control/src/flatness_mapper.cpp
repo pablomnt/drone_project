@@ -1,27 +1,10 @@
 #include "drone_core/control/flatness_mapper.hpp"
 
-#include <algorithm>
 #include <cmath>
 
+#include "drone_core/common/trajectory_eval.hpp"
+
 namespace drone_core::control {
-
-namespace {
-
-// Evaluate a polynomial (coefficients in ascending power order) or one of its
-// derivatives at local time t. deriv = 0 gives position, 1 velocity, 2 acceleration.
-double evalPoly(const Eigen::VectorXd& c, double t, int deriv) {
-  double result = 0.0;
-  for (int k = deriv; k < c.size(); ++k) {
-    double term = c[k];
-    for (int d = 0; d < deriv; ++d) {
-      term *= (k - d);
-    }
-    result += term * std::pow(t, k - deriv);
-  }
-  return result;
-}
-
-}  // namespace
 
 void FlatnessMapper::reset(double initial_yaw) {
   last_yaw_ = initial_yaw;
@@ -34,26 +17,10 @@ common::Reference FlatnessMapper::sample(const common::Trajectory& traj, double 
     return ref;
   }
 
-  // Locate the active segment for the clamped elapsed time.
-  const double elapsed = std::clamp(now - traj.t0, 0.0, traj.total_duration);
-  size_t seg = 0;
-  double seg_start = 0.0;
-  while (seg + 1 < traj.segment_times.size() &&
-         seg_start + traj.segment_times[seg] <= elapsed) {
-    seg_start += traj.segment_times[seg];
-    ++seg;
-  }
-  const double t = elapsed - seg_start;
-
-  ref.pos = Eigen::Vector3d(evalPoly(traj.coeffs_x[seg], t, 0),
-                            evalPoly(traj.coeffs_y[seg], t, 0),
-                            evalPoly(traj.coeffs_z[seg], t, 0));
-  ref.vel_ff = Eigen::Vector3d(evalPoly(traj.coeffs_x[seg], t, 1),
-                               evalPoly(traj.coeffs_y[seg], t, 1),
-                               evalPoly(traj.coeffs_z[seg], t, 1));
-  ref.acc_ff = Eigen::Vector3d(evalPoly(traj.coeffs_x[seg], t, 2),
-                               evalPoly(traj.coeffs_y[seg], t, 2),
-                               evalPoly(traj.coeffs_z[seg], t, 2));
+  const common::MotionState m = common::sampleMotion(traj, now);
+  ref.pos = m.pos;
+  ref.vel_ff = m.vel;
+  ref.acc_ff = m.acc;
 
   // Yaw follows the direction of travel so the forward camera leads the motion.
   // The heading turn rate is available analytically from velocity and

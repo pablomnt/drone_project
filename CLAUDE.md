@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Answering style: be brief.** Lead with the answer. Don't develop reasoning at length unless asked.
+
+**HARD RULE — 30-second test budget.** Never let a test run longer than **30 s**: pass
+`--timeout 30` to `ctest`, and if something is still going at 30 s, **kill it** and report that it
+was killed. Do not wait it out, do not background it and check back, do not "give it another
+minute". **Never run the full suite** (`ctest` with no `-R`) — run only the specific fast test for
+what you changed, e.g. `ctest --test-dir build/core --timeout 30 -R corridor`. `planner` and
+`autonomy_core` drive real OMPL solves and are the slow ones; `planner` in particular has been
+observed spinning for **8+ minutes** — treat it as long-running and do not run it casually.
+
 ## Project
 
 `drone_project`: software for an autonomous vision-based quadcopter. The drone runs PX4 firmware,
@@ -87,14 +97,21 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
 
 ## Test / Lint
 
-- **Core unit tests (no ROS).** This is the primary test path and the proof the core is ROS-free:
+- **Core unit tests (no ROS).** This is the primary test path and the proof the core is ROS-free.
+  Always bound the run and select the test for what you changed — see the 30-second rule at the top
+  of this file:
   ```bash
   cmake -S src/core -B build/core -DDRONE_CORE_BUILD_TESTS=ON
   cmake --build build/core
-  ctest --test-dir build/core --output-on-failure
+  ctest --test-dir build/core --timeout 30 --output-on-failure -R corridor   # NOT the whole suite
   ```
   Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
-  OFF ≡ baseline), `flatness_mapper`, `planner`, `autonomy_core` (plan→track→watchdog).
+  OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (fast, map-free corridor-QP checks
+  against analytic oracles — run it with `ctest -R corridor` on every planning edit),
+  `rigid_transform` (the `map`↔`world` trajectory/state conversion, instant), `goal_projection` (invalid-goal → nearest-valid-state projection; analytic clearance fields and
+  0.5 s solve budgets, ~3 s total, so it also runs on every planning edit),
+  `unknown_cost` (unknown-space surcharge + truncation's hard stop; analytic predicates, ~0.5 s,
+  also on every planning edit), `autonomy_core` (plan→track→watchdog).
 - ROS packages use `ament_lint_auto` / `ament_lint_common` via `colcon test`; the python packages
   (`pc_publisher` C++ aside, `system_monitor_pkg`) carry the standard flake8/pep257/copyright triplet.
 
@@ -141,15 +158,25 @@ and the fast control thread:
   are thus rooted at the drone, so a candidate can't win merely because the drone has advanced toward
   the goal (which would shrink a drone-rooted candidate while the full committed cost still billed the
   already-traversed prefix). One search ⇒ one
-  EDT use per tick. Both validity and cost use the **same cached `DynamicEDTOctomap`** (`maxdist =
-  clearance_threshold`), rebuilt only when the map object changes (see `clearanceField`), not per
-  tick. Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`. Path post-processing: with **no**
+  EDT use per tick. Validity and cost use **separate cached `DynamicEDTOctomap`s** when a distinct
+  conservative view exists: validity reads the search map's field, the cost reads the conservative
+  one (see *Two fields, two questions* below). Both are rebuilt only when their map object changes
+  (`clearanceField` / `conservativeField`), not per tick, and the conservative field is the same one
+  truncation and corridor growth already use, so the split costs no extra distance transform.
+  Clearance-aware cost `= ∫(1 + w·max(0,thresh−d)) ds`. Path post-processing: with **no**
   clearance field, plain length-only `simplifyMax`; in clearance mode, a **cost-aware shortcut**
   (`shortcutClearanceAware`) drops an interior waypoint only when the straight bypass is
   collision-free *and* doesn't raise the clearance-aware cost — so it removes the RRT* zig-zag
   without the wall-hugging that pure `simplifyMax` would cause (a `kMaxShortcutSegment` cap keeps
   waypoint density for min-snap). Each tick logs one line (phase, committed cost, min clearance,
   blocked/why, outcome); OMPL's own console is set to `LOG_WARN` to keep the terminal clean.
+  A tick that **cannot** plan (no goal, or no map) logs `[plan] idle: …` naming the missing
+  precondition, on every change of reason and then every 5 s — otherwise "I sent a goal and nothing
+  happened" is indistinguishable from a dead worker, since the planning branch is the only one that
+  produces output. The node pairs this with a throttled warning while no octomap has arrived, which
+  reports the **resolved** map topic and its publisher count: zero publishers means the map source is
+  silent (RTAB-Map only emits on motion-gated map-graph updates, so it needs camera motion *and*
+  usable odometry), a non-zero count means a QoS or remap mismatch on our side.
 - **Trajectory generation (~1 Hz, `trajgen_period`):** re-anchors min-snap to current position.
   **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
   control stays on `kDirect` / POS_SP.
@@ -179,17 +206,207 @@ Module roles:
   required clearance drops to `kStartMargin` (0 m) so a parked/just-lifting drone — sitting within the
   normal margin of the mapped floor — can root the tree; obstacles are never skipped (clearance must
   still exceed 0, i.e. not inside a voxel). Anchored at the start in `planPath`, at the first waypoint
-  in `isPathValid`. `kGoalFlexibility` (0.3 m): RRT* approximate solutions that stop farther than this
-  from the goal are **rejected** (`planPath` returns false → caller sees infinite cost) rather than
-  committing to a path that ends short. All four are `static constexpr` in the class (deliberately not
-  ROS params). The same field feeds the **clearance-aware cost** via `setClearance(fn, weight,
-  threshold)` (obstacle-proximity integral penalty up to `clearance_threshold`); `isPathValid()`
-  re-checks a committed path under the same model; `pathCost()` scores a waypoint list for the
-  hysteresis gate; `minClearance()` reports a path's tightest clearance (diagnostic / logging).
+  in `isPathValid`. `kGoalFlexibility` (0.3 m): solutions ending farther than this from the
+  **requested** goal are **rejected** (`planPath` returns false → caller sees infinite cost) rather than
+  committing to a path that ends short — whether the search stopped short or the goal was projected
+  (below). All four are `static constexpr` in the class (deliberately not
+  ROS params). `setClearance(fn, weight, threshold)` sets that validity field and the
+  **clearance-aware cost**'s weight/threshold (obstacle-proximity integral penalty up to
+  `clearance_threshold`); `isPathValid()` re-checks a committed path under the same model;
+  `pathCost()` scores a waypoint list for the hysteresis gate; `minClearance()` reports a path's
+  tightest clearance (diagnostic / logging).
+
+  **Goal projection — why an invalid goal is not a refusal.** The collision check applies to *every*
+  state OMPL touches, the goal included, and OMPL discards invalid goal states inside
+  `PlannerInputStates::nextGoal` and then aborts (`EIT*: No solution can be found as no goal states
+  are available`). So a goal within `kCollisionMargin` of a mapped obstacle used to produce **no path
+  at all** rather than an approach that stops at the margin, and `BEST_EFFORT_GOAL` could not rescue
+  it — best-effort accepts a search that *stopped short of a valid goal*, and here the search never
+  ran. Note this is about mapped obstacles only: unknown space reads as free in the optimistic
+  validity field, so a goal beyond the frontier was never the problem.
+  `planPath` therefore projects the goal before solving (`projectGoal`): clamp into the state-space
+  bounds, and if it still collides, walk outward in `kGoalProjectStep` (0.05 m) shells over the six
+  axis directions plus a 128-point Fibonacci lattice, taking the first radius that yields a valid
+  point and, among those, the candidate nearest the start — every point on the shell is equally far
+  from the goal, but the one on the drone's side is the one the search can reach and cannot be a point
+  through a thin wall. The axes are searched explicitly because octomap obstacles are boxes, so the
+  shortest way out is usually a face normal. `kGoalProjectRadius` (2.0 m) bounds the displacement;
+  past it `planPath` returns false without solving and `lastGoalProjection()` reports infinity, which
+  the plan log turns into `[goal (…) is inside an obstacle: no point clearing 0.5m nearby]`. The
+  radius is deliberately generous because both modes already have their own guard: strict mode
+  rejects anything ending more than `kGoalFlexibility` from the requested goal, and best-effort wants
+  the closest safe approach whatever the distance. `lastGoalGap()` is measured from the solution
+  endpoint to the **requested** goal (not OMPL's `getSolutionDifference()`, which would measure to
+  the projection), so it stays comparable with the host's own endpoint-to-goal distances in the
+  best-effort ADVANCE test. A successful projection is logged as a suffix on the tick's `[plan]`
+  line — the drone will deliberately stop short of the commanded point, which the operator has to be
+  able to see. Covered by the fast `goal_projection` test (`ctest -R goal_projection`, ~3 s), which
+  also duplicates the walled-off-goal assertions from the slow `planner` test.
+
+  **The unknown-space surcharge — `setUnknownPenalty`.** A distance field cannot make unmapped
+  space expensive, and this is structural rather than a tuning failure. The EDT saturates at its
+  `maxdist`, which the host sets equal to `CLEARANCE_THRESHOLD`, so any point further than the
+  threshold from a mapped obstacle scores a proximity penalty of **exactly zero** — that covers the
+  interior of unmapped space and everything outside the field's bounding box (where
+  `makeClearanceFn` returns the saturation distance by convention). Stamping the frontier buys a
+  gradient within `CLEARANCE_THRESHOLD` of the stamped shell and nothing beyond it, and the shell is
+  not reliably closed: the sensor's field of view leaves gaps, and `kFrontierKeepOutRadius`
+  deliberately leaves one around the vehicle. The observed failure was the planner routing
+  *backwards* out through a gap and then flying to the goal through unmapped space, because that
+  route was genuinely cheaper. Raising `CLEARANCE_WEIGHT` cannot fix it — it multiplies a zero.
+  The fix adds a third term to the objective, giving
+  `∫(1 + w·max(0, threshold − clearance) + unknown_weight·[unknown]) ds`, where `[unknown]` is a
+  **predicate on the octree** (`map->search(p) == nullptr`, i.e. no node ⇒ never observed) rather
+  than a field lookup. That is O(log n), allocation-free, has no dependence on the shell's geometry,
+  and is correct outside the map's bounding box. Three properties are deliberate:
+  - **Flat, not a ramp.** A distance-based penalty fades out as the path gets further from the
+    boundary, so a route diving deep into unmapped space eventually stops paying. A flat per-metre
+    charge is paid for every metre out there, so among routes that must end in unknown space (a goal
+    beyond the frontier) the search prefers the one entering latest and travelling least far inside.
+  - **Cost only, never validity.** Unknown space stays *enterable*: the collision check still reads
+    it as free, so `EIT*` still accepts a goal beyond the frontier and `BEST_EFFORT_GOAL` still
+    chases it. Making it invalid would wall the search into the mapped region and reintroduce the
+    "no goal states are available" failure. Keeping the vehicle out is truncation's job, not the
+    search's.
+  - **Read from the RAW map**, not the conservative one: frontier stamping writes voxels into its
+    copy, and a stamped point that did not already exist would make genuinely unobserved space read
+    as observed.
+  - **Gated on `TREAT_FRONTIER_AS_OBSTACLE`**, carried into the core as `Config::
+    treat_unknown_as_hazard` and driving truncation's stop as well, so the flag is a genuine master
+    switch: with it off, nothing anywhere in the pipeline distinguishes unknown from free.
+    **Gated on the flag itself, NOT on a conservative map view existing** — that was a real bug
+    worth not repeating. The node only builds the conservative view once a frontier cloud has
+    arrived (`TREAT_FRONTIER_AS_OBSTACLE && frontier_cloud_`), so keying off it meant a late or
+    missing `/octomap_frontier` silently switched off both guards with the flag still on — visible
+    only as `unk_cost` quietly vanishing from the `[plan]` line. Neither guard needs the frontier
+    cloud: both read the raw octree, where a cell with no node has never been observed. The node now
+    warns (throttled, naming the resolved topic and its publisher count) when the flag is on but no
+    cloud has arrived, since that state is otherwise invisible.
+
+  Admissibility is preserved (the term is ≥ 0, so the integrand stays ≥ 1 and both heuristics remain
+  lower bounds). **Accuracy caveat:** OMPL integrates the objective trapezoidally over states
+  interpolated at the state-validity resolution (~0.5 m for this state space), so a step-function
+  surcharge is smeared across the straddling segment and the total lands within about
+  `step × weight` of exact. Fine for steering the search; **not** a safety mechanism — a sliver of
+  unobserved space thinner than the step can be missed entirely. `CostBreakdown` gained an
+  `unknown` field so the `[plan]` line reports `len=… + clr_cost=… + unk_cost=…` (the last shown
+  only when charged), because "long", "hugs a wall" and "routes through unmapped space" need
+  different fixes. Covered by `ctest -R unknown_cost` (~0.5 s).
+
+  **Truncation stops at unobserved space (when `TREAT_FRONTIER_AS_OBSTACLE` is on).** The same
+  predicate is a hard stop in `truncatePath`, checked *before* the clearance test and **exempt from
+  the escape ramp**. The caller supplies the predicate only when a conservative view exists and
+  passes an empty one otherwise, so with the flag off truncation is exactly the clearance walk it
+  always was. It is passed down as the predicate rather than as a map handle specifically so that
+  decision sits at the call site beside the `conservative` handle it depends on, instead of being
+  re-derived inside `runTrajgen` from which map objects happen to be distinct. This is a
+  genuine hole in the clearance test rather than a refinement of it: the conservative field measures
+  distance to the stamped shell, so a path leaving mapped space through a gap in that shell reads as
+  high-clearance the whole way out and was committed in full — after which the corridor grew regions
+  out there and the QP certified them, since the obstacle list only contains occupied and stamped
+  voxels. The ramp exemption is the point: the ramp trades margin for the ability to move at all,
+  which is defensible against a hazard whose distance we can measure, and unobserved space is not
+  that. **This makes free cells load-bearing.** RTAB-Map's `Grid/RayTracing true` carves free space
+  along each ray, `toOcTree` copies free leaves with their log-odds, and free nodes survive the
+  binary octomap round-trip — so the flight volume has nodes and truncation commits normally. But a
+  map carrying *only* obstacles now reads as "nothing here has ever been observed" and commits
+  nothing; the `autonomy_core` test had to start writing free space for this reason. The empty-
+  truncation log names which test stopped it (`path leaves observed space at the drone` vs
+  `clearance below the ramped margin`), since those want opposite responses.
+
+  **Two fields, two questions — `setCostClearance`.** The cost may be scored against a *different*
+  field from the collision check, and under `USE_CORRIDOR_QP` + `TREAT_FRONTIER_AS_OBSTACLE` it is.
+  The two ask different questions. Validity asks "would the vehicle hit something here", and must
+  read unmapped space as free or the informed planners find no path to a goal beyond the frontier
+  at all — so it always uses the **optimistic** search field, never the conservative one. Stamped
+  frontier is a closed shell; validating against it would wall the search inside the mapped region.
+  The cost asks "is this somewhere we would rather fly", and there the frontier is worth being
+  repelled by. **The problem this fixes:** truncation cuts the committed prefix where *conservative*
+  clearance drops below `FRONTIER_MARGIN`, but the cost only ever saw the *optimistic* field, so the
+  search was optimising a metric blind to the criterion deciding how much of its path survived. It
+  had no reason not to return paths running tangent to the frontier, which then truncated to almost
+  nothing. Scoring both against the same field aligns them and the surviving prefix gets longer.
+  Because the frontier is stamped as a **thin shell** of known-free voxels bordering unknown (not the
+  whole unknown volume), the conservative field is `min(distance to real obstacle, distance to that
+  shell)` — a strict refinement of the optimistic field, identical wherever the shell is not the
+  nearest source, so no real-obstacle shaping is lost by scoring against it. The penalty saturates at
+  `w·threshold` where clearance is 0, so the shell is expensive to approach but never a barrier. The
+  cost-to-go heuristics stay admissible (the integrand is still ≥1). `setCostClearance` is
+  order-independent with `setClearance`; passing an empty function restores single-field scoring, and
+  with no distinct conservative view (frontier stamping off, or the legacy non-corridor mode where
+  the search already runs on the conservative map) the override is skipped entirely.
+  **Watch for:** with the goal at the frontier the cost is at its maximum exactly there, so the
+  search approaches reluctantly and `BEST_EFFORT_GOAL` may settle short — `CLEARANCE_WEIGHT` is the
+  knob if prefixes lengthen but the drone stops advancing.
   `MinSnapTrajectory` / `MinSnapTimeOptimizer` (KKT min-snap + NLopt BOBYQA
   time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a `Trajectory`
   of **per-segment polynomial coefficients + durations** (not sampled points) so the flatness mapper
   can differentiate it analytically.
+  **Corridor-QP trajectory generation (Stage 1, gated by `USE_CORRIDOR_QP`)** replaces plain
+  min-snap with a provably collision-free pipeline over a **dual map view** (see `setMap`): the
+  geometric search runs on the raw **optimistic** map (unknown = free, so EIT*/BIT* accept a goal
+  beyond the mapped frontier instead of failing "no goal states available"), while safety comes from
+  the **conservative** (frontier-stamped) view. `corridor.{hpp,cpp}`: `truncatePath` cuts the
+  committed path where conservative clearance drops below `FRONTIER_MARGIN` (the requirement ramps
+  from 0 at the drone to the full margin over `ESCAPE_RAMP_DIST` — the escape-sphere idea without its
+  dead band, and with the ramp *length* decoupled from the margin so a large margin doesn't make the
+  ramp steep), `resamplePath`
+  + `buildCorridor` grows one maximal free **convex polyhedron** (at `CORRIDOR_MARGIN`) per
+  ≤`MAX_SEGMENT_LEN` piece via **DecompUtil**'s ellipsoid inflation (Liu et al. RA-L 2017, the
+  decomposition FASTER uses): the ellipsoid grows along the segment and cuts a half-space at each
+  obstacle that binds, so the region follows the path instead of a bounding box. It consumes an
+  obstacle **point list** (occupied + frontier-stamped voxel centres, windowed around the prefix by
+  `runTrajgen` — a whole room at 5 cm is 1e5-1e6 points and DecompUtil rescans per segment), while
+  `truncatePath` keeps using the EDT **clearance oracle**; tests drive both with analytic data. Faces
+  are pulled in by `CORRIDOR_MARGIN` + the voxel half-diagonal (obstacle points are voxel *centres*),
+  then each region is validated for a non-empty overlap with its neighbour, since C0 continuity pins
+  the junction into that intersection and shrinking can empty it. **The first region is the
+  exception** — see the start relaxation below. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
+  solves degree-7 min-snap as an **OSQP QP** — monomial coefficients (same snap `Q`), C0–C4
+  continuity, rest-to-rest ends, Bézier control points of position confined to the regions and of
+  vel/acc/jerk within per-axis `VMAX/AMAX/JMAX` (hull property ⇒ the whole curve complies; solved in
+  per-segment normalized time or OSQP stalls on conditioning), plus a feasibility-aware BOBYQA time
+  search (infeasible ⇒ flat penalty; velocity-consistent seed grown until feasible).
+
+  **Failure stages nothing — there is no min-snap fallback under `USE_CORRIDOR_QP`.** Any corridor
+  failure (empty truncation, decomposition rejected, QP infeasible) makes `runTrajgen` return false,
+  so the tracker rides out whatever it already has and latches hover-hold after `STALE_TIMEOUT`.
+  There used to be a plain min-snap fallback on the truncated prefix; it was removed because min-snap
+  ignores obstacles entirely, which makes it least defensible in exactly the situation that produces
+  it — the corridor stage saying it cannot certify a safe trajectory. Standing still is the honest
+  answer. The caller does not advance `last_trajgen_` on false, so this retries every cadence and
+  recovers as soon as the map or the path allows a corridor. Each failure logs which stage failed and
+  why — `truncated to N wp / L m`
+  (pipeline refusing to commit toward unknown space), `decomposition FAILED (<which check>) …
+  tightest conservative clearance C m vs required M m` — the parenthetical names the actual check
+  that rejected it (two regions stopped overlapping, the goal fell outside the last region, or the
+  drone is inside/touching an occupied or unknown cell), since the clearance figure is context, not
+  the cause — or `QP INFEASIBLE over S regions` (corridor fine, no trajectory fits it within
+  `VMAX/AMAX/JMAX`). These are distinct faults needing opposite fixes, hence distinct messages. A
+  successful corridor logs one line only when `DEBUG_PLANNER_VIZ` is on.
+
+  **The start relaxation — why the first region is special.** `truncatePath` ramps its requirement to
+  *zero* at the drone (`ESCAPE_RAMP_DIST`) so a vehicle in a tight pocket can root a path at all. A
+  convex region has no interior gradient — one plane holds over the whole region — so a uniform
+  `CORRIDOR_MARGIN` next to the drone means truncation commits prefixes the corridor then refuses,
+  every tick, for a drone that is merely *near* a wall. `buildCorridor` closes that gap by relaxing
+  the first region, bounded in both available senses:
+  - **In extent.** The first segment is split at `ESCAPE_RAMP_DIST` (`CorridorParams::start_relax_dist`,
+    fed from the same ROS param), so reduced margin applies over that distance only and every later
+    region carries the full `CORRIDOR_MARGIN`. The split is the *only* place an extent bound can come
+    from, which is why it exists rather than just relaxing region 0 as-is (that would relax over a
+    whole `MAX_SEGMENT_LEN`).
+  - **In magnitude.** Region 0 is shrunk by the largest amount that still contains the drone —
+    `min_r(b_r − n_r·p_drone)`, one pass over the faces, no bisection — clamped to the full shrink.
+    Never more relaxation than the geometry forces, and it heals itself as the map fills in, with
+    nothing to retune. Growth-window planes can never trigger it: the window is sized `+ pull_in`
+    beyond what it wants to keep, so its slack always exceeds the shrink.
+
+  The floor is `voxel_half_diagonal`, and that is geometry rather than taste: below it the region
+  would contain points inside an occupied voxel's actual volume, not merely close to it. A drone
+  that close fails the corridor outright with its own message. `runTrajgen` logs `start margin
+  relaxed to X m` **unconditionally** (not behind `DEBUG_PLANNER_VIZ`) whenever it bites — it is the
+  number that says how much protection the first stretch of the flown trajectory actually has.
 - **`control`** — see the flight-critical note below.
 
 ### control (`core/control/`) — flight-critical, be careful
@@ -202,20 +419,287 @@ requires it; validate any change in `USE_SIM_MODE`/SITL first. Notable behavior:
 - **Open-loop takeoff override**: on a ground `reset()` it primes a takeoff; when a setpoint above
   0.5 m arrives it ramps thrust open-loop (flat attitude) until liftoff, then hands to the PID —
   because closed-loop control near the ground with noisy VIO causes skidding.
-- **Online hover-thrust estimation**: back-calculates hover thrust from filtered command + measured
-  vertical accel, de-weighting the estimate at high vertical speed; overridable via `MPC_HOVER_THRUST`.
-- **Differential-flatness feed-forward (added on top, default OFF)**: `setReference()` accepts
+- **Online hover-thrust estimation**: filters the thrust gain — measured `thrust_accel` (thrust per
+  unit mass along body up, *not* a vertical acceleration) divided by the motor-lag-filtered command —
+  and takes hover thrust as `9.81 / gain`, clamped to [0.2, 0.5]. The learning rate (2.5 s) is
+  de-weighted at high vertical speed; overridable via `MPC_HOVER_THRUST`. The accel stays on top of
+  that fraction on purpose: see *Noise* in the autonomy_node section. **This form replaced the old
+  per-sample `cmd·9.81/accel` in `2deb93a` (2026-09-14) and flew on 2026-09-16**: the estimate now
+  tracks the true hover thrust and the vehicle holds its commanded altitude, so the ~20 cm sag the
+  biased estimate used to cause is gone. The constants are unchanged.
+- **Integrator gate (`MPC_INT_ERR_MAX`, default 0.2 m)**: the velocity integrator only accumulates
+  while the position error is within the limit, judged separately for XY (norm) and z. Outside it
+  the integrator is **frozen, not reset** — it carries the standing trim (hover-thrust mismatch,
+  wind), so resetting would make the vehicle sag/drift on arrival. Added because a long move wound
+  it up and it unwound as overshoot at the stop. `<= 0` disables; `PositionControl`'s own default is
+  disabled, the core `Config` and the node default to 0.2.
+- **Differential-flatness feed-forward (added on top; `PositionControl`'s own default is OFF, but the
+  node now ships `ENABLE_FEEDFORWARD` defaulted `true`)**: `setReference()` accepts
   `vel_ff`/`acc_ff`; with feed-forward disabled the controller is byte-identical to the baseline
   (the `feedforward` unit test asserts this). Toggle live with the `ENABLE_FEEDFORWARD` parameter.
   Feed-forward is suppressed during the takeoff ramp. The accel→attitude/thrust map *is* the flatness
   output stage and already existed — that's why trajectory tracking didn't require a new controller.
 
+  **Exactly two quantities are fed forward, at two structurally different points**, and the
+  difference is the part worth remembering:
+  - `vel_ff` is added to the velocity setpoint **before** the clamp and therefore **before** the
+    velocity PID, so it does not bypass the loop — it raises the target the loop chases. The velocity
+    error becomes `(Kp_pos·e_pos + vel_ff) − vel_meas`, which is what stops the controller needing a
+    standing position error (and a wound-up integrator) just to hold speed.
+  - `acc_ff` is added to the acceleration setpoint **after** the PID, so it genuinely bypasses
+    feedback and goes straight into the attitude/thrust map. That is what tilts the vehicle into a
+    turn when the trajectory asks, rather than after error has accumulated.
+
+  **Not** fed forward: **jerk** (the trajectory has it and the QP pins it at the splice, but jerk maps
+  to angular *rate* and the node publishes `VehicleAttitudeSetpoint` with only `q_d` + `thrust_body`,
+  so there is no channel — the pinned jerk buys reference continuity, not a command) and **yaw rate**
+  (`Reference` has no such field by design; `yaw_sp_move_rate` is left at zero). Three gates must all
+  be open for any of it: `ENABLE_FEEDFORWARD`, tracker mode `kTracking` (the tracker forces it off in
+  `kDirect`/`kHoverHold`), and `!_is_taking_off`.
+
 `flatness_mapper` samples the trajectory for pos/vel/acc and derives **yaw from the velocity
 heading** (camera leads the motion), holding the last yaw only when slow *and* the heading is
-spinning. `trajectory_tracker` composes the mapper + controller and runs the **watchdog state
-machine**: `kDirect` (explicit setpoint — takeoff/manual hover), `kTracking` (follow a fresh planner
-trajectory), `kHoverHold` (failsafe: latch current position when guidance goes stale, i.e. the
-planner stalled/died). The stale fallback hovers; it does not land (PX4 rejects offboard land).
+spinning. The polynomial evaluation itself lives in `common/trajectory_eval` (`evalTrajectory` /
+`sampleMotion`), not in the mapper, because planning needs it too — a replan samples the trajectory
+it is about to replace. `trajectory_tracker` composes the mapper + controller and runs the
+**watchdog state machine**: `kDirect` (explicit setpoint — takeoff/manual hover), `kTracking`
+(follow a fresh planner trajectory), `kHoverHold` (failsafe: latch current position when guidance
+goes stale, i.e. the planner stalled/died). The stale fallback hovers; it does not land (PX4 rejects
+offboard land).
+
+**The D term differentiates the MEASUREMENT, on the estimator's clock.** `_vel` is a zero-order
+hold: the node re-sends the newest VIO sample every 20 ms tick whether or not a new one arrived, so
+differencing per control tick gave exactly `0.0` on held ticks and, on the ticks a sample did land,
+the whole accumulated change divided by the *control* period rather than the true (longer)
+measurement interval. At ~25 Hz VIO against the 50 Hz loop that is a train of double-height impulses
+on alternate ticks — damping delivered half the time and overstated when it arrived. Two changes fix
+it, and they are independent:
+
+- **Differencing on the estimator's clock.** `PositionControl::setStateStamp()` takes
+  `common::State::stamp` (previously written by the node and read by nothing — this is what it was
+  for), fed by `TrajectoryTracker::update`. The raw derivative is recomputed only when that stamp
+  advances, divided by the real interval — so a **varying** sample rate is handled correctly by
+  construction, which matters because OKVIS here wanders between roughly 12 and 30 Hz. Intervals
+  shorter than `kMinMeasInterval` (5 ms) are ignored as message-queue artefacts, since the stamp is
+  an arrival time: two samples dequeued back-to-back would otherwise divide a full period of motion
+  by microseconds. A separate low-pass, `MPC_VEL_D_TAU` (default 0.04 s ≈ one
+  sample period), runs every tick so the term stays smooth and current between measurements instead
+  of stepping or dropping out. Larger tau = smoother but more phase lag, which costs real damping.
+  A host that never calls `setStateStamp` (the unit tests) falls back to per-tick differencing.
+- **Derivative on measurement, not error.** `d(vel_sp − vel)/dt` with the setpoint half dropped is
+  `−d(vel)/dt`, hence the minus sign on `_vel_d_term`. Identical in steady state; what it removes is
+  the one-tick kick that a stepped `POS_SP` used to inject through the setpoint's own derivative.
+- **While tracking, the setpoint half is `acc_ff`, not zero (2026-09-16, NOT yet flown).**
+  `_vel_d_term = Kd·(acc_ff − d(vel)/dt)` when feed-forward is applied (same three gates), plain
+  `−Kd·d(vel)/dt` otherwise — so hover and `POS_SP` are unchanged. With the pure measurement form the
+  D term opposed every *planned* acceleration too: in the 2026-09-16 12:31 flight it cancelled
+  30–45% of the horizontal `acc_ff` (fit of D against `acc_ff`), and the vehicle ran 0.2–0.4 s behind
+  the reference (11–21 cm RMS horizontal error per preset). `acc_ff` is a smooth polynomial sample,
+  so this reintroduces no setpoint kick. The other contributors to that lag, not addressed: OKVIS
+  state ~150–180 ms old at the controller, and PX4's attitude response ~190 ms behind the command.
+
+`test_position_control` pins the fixed behaviour: 25 Hz samples into a 50 Hz loop must give the true
+constant `dv/dt` on every tick, not an alternating impulse train.
+
+**How vehicle state reaches the controller — two setters, deliberately named apart.** The node
+assembles one `common::State` (pos, vel, yaw, `thrust_accel`, `stamp`) and hands the whole struct to
+`AutonomyCore::setVehicleState()`, which stores it under `io_mutex_`. The core is the only thing
+holding a full snapshot: the planner worker reads it for the splice anchor and the geometric start,
+and `stepControl` passes it down to `TrajectoryTracker::update`. The tracker is where it gets
+**unpacked**, into two structurally different setters on `PositionControl`:
+
+- `setState(pos, vel, yaw)` — the feedback quantities, re-supplied every tick because the PID closes
+  on them.
+- `setThrustAccel(thrust_accel)` — the input to the hover-thrust calibration, a separate setter
+  because what it calibrates is a slowly-varying scale factor for the thrust map, not part of the
+  feedback state, and so does not have to move in lockstep with pose. The input itself is the
+  noisiest signal in the loop (±3.5 m/s² of vibration per tick); the estimator does the averaging.
+
+The core method is `setVehicleState`, **not** `setState`, purely to keep those two apart:
+`PositionControl::setState` is an unrelated method at the bottom of the stack, and when both were
+spelled `setState` a call site read as though the node were talking straight to the controller. If
+you are following state through the stack, the sequence is
+`autonomy_node` → `AutonomyCore::setVehicleState` → `state_` → `TrajectoryTracker::update` →
+`PositionControl::{setState,setThrustAccel}`.
+
+`State::stamp` carries **when the position sample was taken** (the odom callback's arrival time,
+`t_vio_odom_` or `t_px4_odom_`), *not* the control-tick time — writing the tick time there silently
+defeats its one consumer, the D term's measurement clock (see below), because every tick then looks
+like a fresh sample. It is **not** a freshness guard — trajectory promotion at `t0` and the stale-guidance timeout both use the
+`now` argument passed alongside the state, not the state's own timestamp — so do not read its
+presence as evidence that a staleness check exists.
+
+**Mode precedence is strictly ordered, and `POS_SP` is NOT an override.** The branch order in
+`TrajectoryTracker::update` is: fresh trajectory → `kTracking`; else *any* installed trajectory →
+`kHoverHold`; else direct setpoint → `kDirect`. Two consequences that surprise operators:
+
+- **Changing `POS_SP` while a goal is being tracked does nothing.** The node re-reads the parameter
+  and pushes it in via `setSetpoint()` every tick, so it is accepted silently — stored, never used,
+  no warning. A fresh trajectory always wins.
+- **`POS_SP` is unreachable for as long as a trajectory is installed, even after guidance dies.**
+  The stale case falls to `kHoverHold` (latch *current* position), not to `kDirect`. The only thing
+  that restores `POS_SP` is `reset()`, i.e. a disarm or leaving offboard. (Before the splice work
+  `reset()` did not clear trajectories either, so `POS_SP` was dead for the rest of the process once
+  the first trajectory landed. It now clears them, so an interruption genuinely restores it.)
+
+So `POS_SP` is a **pre-takeoff / no-goal setpoint only**. There is no "return to setpoint" or abort
+path through it, and **there is no goal-cancel API at all**: `AutonomyCore::has_goal_` is set by
+`setGoal` and never cleared, so once a goal is published the worker replans toward it forever. If an
+in-flight abort is wanted it needs to be built — the honest options are a goal-clear that drops the
+tracker back to `kDirect`, or reusing the node's existing latched `NAV_LAND` failsafe.
+
+**Replans splice onto the outgoing trajectory; they are not rest-to-rest.** `solveQP`'s start
+boundary pins position *and* velocity/acceleration/jerk to a `common::MotionState`; only the END is
+at rest (which is what makes an un-replaced trajectory a safety stop). `AutonomyCore::spliceAnchor`
+builds that state by sampling the **outgoing trajectory** at `t0 = now + lead` — deliberately not
+from the estimator, since the reference is what the controller tracks and therefore what must be
+continuous, and feeding VIO velocity / IMU accel back in would both inject estimator noise into the
+boundary conditions and forgive the accumulated tracking error every replan. It falls back to rest
+at the measured position when there is no outgoing trajectory (first plan) or the tracker has gone
+stale into hover-hold. The committed path is re-rooted at the splice point, not the drone, so the
+corridor is grown around where the trajectory actually starts (rooting at the measured position
+would put the splice point outside region 0 under tracking error, making the start equality
+infeasible).
+
+The **lead is measured, not tuned**: a decaying max of observed `runTrajgen` wall times × 1.5,
+clamped to [`kLeadMin` 0.04 s, `kLeadMax` 0.5 s], timed around the whole call including failures.
+This works because `setTrajectory` **stages** rather than engages — the tracker holds a new
+trajectory until wall-clock reaches its `t0` and keeps evaluating the old one until then. So
+overshooting the lead costs nothing (bias it high), while overrunning it only starts the trajectory
+slightly past its own beginning and logs a line saying so. Note the corollary: a trajectory does
+**not** take effect on the tick that produced it, which is what `test_autonomy_core` and
+`test_trajectory_tracker` pin.
+
+**A start from rest waits for the solve instead (`f90a888`).** The lead exists so a splice can meet
+the outgoing trajectory at an instant fixed *before* solving. A trajectory with nothing to meet — a
+preset, the first plan of a flight, a replan out of hover-hold, all of which `spliceAnchor` already
+marks `from_trajectory = false` — carries no such constraint, and the vehicle is holding still
+(POS_SP or hover-hold) while the solve runs. So `restampRestStart` sets `t0 = now + kLeadMin` *after*
+the solve returns, immediately before `stagePending` — that order matters, since `stagePending` also
+records the trajectory for later splices to sample by absolute time. This is what stops a slow solve
+engaging a trajectory partway along: presets never update the measured lead, so they always ran on
+the 0.04 s floor while their solves take **1-3 s** (39 logged presets: min 0.23 s, median 1.1 s, max
+4.4 s, and they grow over a session), which put the reference up to 0.99 m ahead of the vehicle and
+already moving at 0.76 m/s on the first tracked tick — the drone then chased it and caught up. Two
+corollaries: `preset_end_` is computed from the restamped `t0`, so a preset no longer ends early by
+its own solve time; and the engaging-late log now fires only for splices, the only starts that can
+still be late.
+
+**Planning runs in `map`, control in `world` (fixed 2026-09-16, NOT yet flown).** RTAB-Map's `map`
+frame (the octomap, the frontier cloud) and OKVIS's `world` frame (the state estimate) only coincide
+while RTAB-Map's `map→world` drift correction is identity. The node used to use no TF and treat them
+as one frame; in the 2026-09-16 flight (`~/flight_logs/rosbag2_2026_09_16-10_56_44_recovered`) the
+correction was identity for ~35 s and then settled around **(−0.37, +0.02, −0.15) m with a ~2° tilt**,
+so every obstacle the planner, truncation and the corridor saw was ~37 cm off relative to the vehicle
+against a 0.4 m `CORRIDOR_MARGIN`. It was noticed because `/control/pos_ff` (stamped `map`, carrying
+`world` numbers) drifted ~37 cm in RViz while the vehicle held `POS_SP` correctly.
+
+How it works now — keep all of it, the parts depend on each other:
+- **Control stays in `world`.** State, `POS_SP`, the tracked trajectory. Do not switch the controller
+  to RTAB-Map's pose: RTAB-Map runs with `visual_odometry:=false` on `/okvis/okvis_odometry`, so its
+  pose *is* OKVIS plus a correction that arrives in jumps of tens of cm at ≤1 Hz, and feeding that to
+  the PID would make it lurch.
+- **Planning is in `map`.** Goals (`setGoal`), preset waypoints (`firePreset`), the search, truncation,
+  the corridor and the QP. The node looks up `world←map` from TF every control tick
+  (`lookupWorldFromMap`, identity in `USE_SIM_MODE`) and pushes it with `AutonomyCore::setMapToWorld`.
+- **One transform per planning cycle.** The worker snapshots it with the state, map and goal, converts
+  the vehicle position into `map` for the search start and the remaining-cost baseline, and converts
+  the solved trajectory back into `world` with the *same* snapshot (`stagePlanned`). A different
+  snapshot on the way out would move the trajectory's start off the splice point.
+- **The splice state is sampled in `world`, then converted.** `last_planned_` is stored in `world`
+  (it is what the tracker flies); `spliceAnchor` samples it there and converts the `MotionState` into
+  `map`. Sampling a `map`-frame copy would splice at wherever the map *used to* say the vehicle was.
+- **Trajectory conversion is exact** (`common/rigid_transform`): every coefficient vector is rotated
+  and the translation goes on the constant term only; velocity, acceleration and jerk take the
+  rotation only. The tilt matters — RTAB-Map's corrections carry a couple of degrees.
+- **No transform, no planning** when `Config::require_map_to_world` is set (the node sets it outside
+  sim): the worker logs `[plan] idle: … no map->world transform yet`, a preset fire is refused with its
+  own line, and the node warns (throttled) while TF has not delivered it. Assuming identity instead
+  would silently reintroduce the bug.
+- **Node details:** a goal on `/planner/goal` stamped `world` is converted to `map` once on arrival
+  (empty `frame_id` = `map`, anything else is rejected); the preset square is built around the drone's
+  `map` position, with the `POS_SP` hand-back converted back to `world`; the frontier keep-out ball is
+  centred on the drone's `map` position. `/control/pos_ff` and `/smooth_trajectory` are stamped
+  `world`; every planner/map/goal output stays `map`.
+
+Verified: `ctest -R rigid_transform` (trajectory, motion and state conversion against sampled ground
+truth, including a tilt), the frame block in `ctest -R autonomy_core` (no plan without a transform;
+trajectory starts at the world position and ends at the goal converted to world; a replan while
+tracking starts exactly on the outgoing world trajectory — mutation-checked: skipping the output
+conversion fails four checks, skipping the splice conversion fails exactly the splice check), and a
+bench replay of the 2026-09-16 bag from 60 s in, where a preset square's three map-frame corners landed
+3–4 cm from their correctly converted world positions and 42–68 cm from a reversed lookup. **What is
+still open:** a trajectory planned just before a correction lands is flown in `world` on the old map
+until the next replan (≤ `TRAJGEN_PERIOD`) — the same "tracked trajectory is not re-validated" gap as
+before.
+
+**Four known gaps in this area — read before flying tracked trajectories:**
+
+1. **No airborne gate: a trajectory can pre-empt the takeoff ramp.** The worker plans and stages
+   while disarmed (state feed sits above the arm gate by design), and a fresh trajectory beats the
+   direct setpoint. So if a goal is live when you arm, the first `stepControl` engages `kTracking`
+   with a ground-level reference, and the open-loop ramp — which triggers on *reference* z > 0.5 —
+   fires partway into the trajectory instead of cleanly off the ground, holds the vehicle flat and
+   climbing while the reference runs away horizontally, then hands back to the PID at z > 1.0 with a
+   large accumulated error. `reset()` clearing trajectories narrows this but does not close it: the
+   worker re-stages within one `TRAJGEN_PERIOD`.
+
+   **Still open. The fix is a gate, not a tweak to any of the three parts** — each is individually
+   correct and load-bearing. The disarmed state feed is what stops plans rooting at the map origin;
+   trajectory-beats-setpoint is what makes tracking work at all; and the ramp keys on the reference
+   because off the ground on `POS_SP` that is exactly right (the setpoint is already above 0.5 m and
+   the ramp fires at rest). What is missing is a latch in `TrajectoryTracker` that holds `kDirect`
+   from engage until takeoff has actually completed, and only then allows the trajectory branch.
+
+   **Watch the exact condition — the obvious one is wrong.** "Takeoff done" is *not*
+   `!_is_taking_off`: that flag is false at engage too, because the ramp has not started yet, so a
+   latch waiting on it alone opens on the very first tick and reproduces the bug exactly. The state
+   machine is `_takeoff_primed` (set by a ground `reset()`, consumed when the ramp fires) then
+   `_is_taking_off` (true for the ramp's duration). So the gate must hold until the ramp has both
+   **started and finished** — primed consumed *and* `_is_taking_off` back to false. Both are private
+   in `PositionControl` with no accessor, so the fix needs one added; deriving it from measured
+   altitude instead re-implements that state badly and gets the engage tick wrong the same way.
+   Until it exists, the operational rule is: **do not have a goal live when you arm.**
+
+   **The `PRESET_WAYPOINTS` path is NOT affected, and the reason is worth keeping.** A preset fired
+   on the bench also stages a trajectory from the ground, but `core_->reset()` on the engage
+   transition (`autonomy_node.cpp`, the `!controller_running_` branch) runs *before* `stepControl` is
+   reached on that tick and clears `preset_pending_` / `preset_active_` along with the tracker's
+   trajectories. Unlike a goal — which persists in `has_goal_` and makes the worker re-stage within
+   one `TRAJGEN_PERIOD` — a preset is a one-shot with no re-trigger, so once cleared it stays
+   cleared. That asymmetry is the whole difference: the goal path re-arms itself, the preset path
+   does not.
+2. **The plain min-snap path (`USE_CORRIDOR_QP=false`) is still rest-to-rest.** It inherits the
+   splice *position* and the lead anchor, but `MinSnapTrajectory` has no start-derivative boundary,
+   so engaging it while moving steps the velocity reference to zero — the exact stutter the corridor
+   path was fixed for. Tolerable only because that mode is the obstacle-blind one anyway. Give
+   `MinSnapTrajectory` a start-derivative boundary before relying on it.
+3. **`_lim_tilt` is dead code — there is NO tilt limit.** It is assigned in the constructor (0.43 rad,
+   ~25°) and by `setConstraints`, and then read nowhere. `_accelerationControl` builds `body_z`
+   straight from the unbounded thrust vector with no saturation. This matters most for feed-forward:
+   `acc_ff` is added to `_acc_sp` *after* the PID, so a trajectory's commanded acceleration converts
+   directly into commanded tilt with nothing bounding it. Not dangerous at present limits (`AMAX`
+   1.5 m/s² ⇒ atan(1.5/9.81) ≈ 8.7°), but the guard you appear to have does not exist.
+4. **`setConstraints()` is never called by anything** — not the tracker, the core, or the node. So
+   the limits are constructor defaults: `_lim_vel_horz` **10.0 m/s**, up 2.0, down 1.0. The comment
+   at the `vel_ff` injection says it is added before the clamp "so the total commanded velocity stays
+   within the configured limits", which is true but the configured limit is ~10× `VMAX`. The clamp is
+   not a meaningful bound on the feed-forward as wired. Fixing 3 and 4 together means plumbing
+   `VMAX`/`AMAX` into `setConstraints` from the same config the QP uses, and applying `_lim_tilt` in
+   `_accelerationControl`. **Deliberately not done** — `position_control.cpp` is the flight-tested
+   file and this should wait until after the first tracked flight.
+
+**Corridor conservatism with a moving start (expect this on the bench).** The corridor bounds the
+Bézier *control points*, and the low-index ones are built from the start derivatives scaled by
+segment time: `b3 = 3Tv/7 + 3T²a/42 + T³j/210`. A 4 s segment multiplies start jerk by ~0.3, so an
+aggressive splice state in a narrow region can push a control point outside and make the QP refuse a
+curve that would actually have stayed inside. Replanning while manoeuvring hard in a tight corridor
+is when this bites. Shorter `MAX_SEGMENT_LEN` weakens it; MINVO attacks it directly.
+
+A moving start also adds one **genuinely physical** infeasibility: braking from v0 within distance d
+needs `a >= v0²/(2d)` whatever the time allocation, so the seed-growth loop cannot rescue a committed
+prefix shorter than the stopping distance. At `VMAX` 1.0 / `AMAX` 1.5 that is 0.33 m, so it should
+not bite — but read it as "the prefix is too short to stop in", not as a tuning failure.
 
 ### autonomy_node (`ros2/autonomy_node/`)
 
@@ -227,6 +711,117 @@ applies the **yaw-drift correction** (toward PX4's yaw) and the ENU→NED/FRD co
 arrive on `/planner/goal` (geometry_msgs/PoseStamped, position only — yaw ignored); a `POS_SP`
 parameter provides the default takeoff/hover setpoint. All PX4 message types and frame conversions
 are confined to this file.
+
+**Threading model — two callback groups on a `MultiThreadedExecutor`. Respect it when adding
+callbacks.** `main` spins a `MultiThreadedExecutor` with 3 threads, and every subscription and timer
+is explicitly assigned to one of two **mutually exclusive** groups:
+
+- **`cb_fast_`** — the 20 ms control timer and every estimator stream feeding it: `onPx4Odom`,
+  `onVioOdom`, `onSensorCombined`, `onStatus`, `onJoy`, `onGoal`.
+- **`cb_slow_`** — everything that can block for longer than a tick: `onOctomap`, `onFrontier`, and
+  the 500 ms viz timer.
+- The node's **default group** is left holding only the parameter services, which is the third thread.
+
+This exists because of a real mid-flight auto-land on 2026-07-31. On the previous single-threaded
+`rclcpp::spin`, `onOctomap` (deserialize the tree, deep-copy it for the conservative view, stamp the
+frontier, then walk every leaf in `publishOccupancyMap`) blocked the one executor thread for
+150–520 ms on **every** map update. Measured from that flight's bag: 39 loop stalls in 137 s, one per
+octomap message, two of them over 0.5 s. No odometry callback could run during a stall, so the first
+tick afterwards saw all three estimator streams stale *at the same instant* and the in-flight
+watchdog landed the aircraft — while all three were in fact publishing normally throughout
+(`/okvis/okvis_odometry` had **zero** gaps > 0.15 s across the whole flight). The same stalls were
+also straddling PX4's own 500 ms offboard-loss threshold. After the split, replaying that bag gives
+**0** stalls above 0.06 s across 2823 ticks while 20 octomap callbacks (1.2 M nodes each) complete.
+
+**Locking rules that follow from the split — read before touching node state:**
+
+- Both groups are `MutuallyExclusive`, **not** `Reentrant`, deliberately. A group never runs two of
+  its own callbacks concurrently, so state reached only from *within one group* keeps exactly the
+  old single-threaded semantics and needs **no** synchronisation. That covers nearly everything:
+  the estimator samples, the `t_*` watchdog timestamps, `vehicle_status_`, `last_buttons_`, and all
+  the control latches (`controller_running_`, `failsafe_landing_`, `all_healthy_since_`,
+  `warmup_announced_`, `was_armed_`, `was_offboard_`) are fast-only; `frontier_cloud_` and
+  `got_octomap_` are slow-only.
+- **`cross_mutex_`** guards *only* what genuinely crosses the two groups: `px4_pos_enu_` /
+  `vio_pos_enu_` (written by the odom callbacks, read by `onOctomap` as the frontier keep-out centre)
+  and `goal_pos_` / `has_goal_` (written by `onGoal` and `firePresetSquare`, read by
+  `publishGoalMarker`). It is never held across anything slow, so it cannot delay the tick. Do not
+  grow it into a general node lock.
+- `use_sim_mode_` is `std::atomic<bool>` (written every tick, read by `onOctomap`); a lone bool with
+  no invariant tying it to anything else.
+- `tf_buffer_` (the `map→world` lookup) is read from both groups — the control tick, `onGoal` and
+  `onOctomap` — and needs no lock of ours: `tf2_ros::Buffer` is thread-safe, and the pointer is set
+  once in the constructor before any callback exists.
+- `AutonomyCore` is already fully internally locked (`io_mutex_` / `traj_mutex_`, both short-held)
+  and was already being called from the planner worker thread, so `setMap` from the slow group
+  alongside `setVehicleState`/`stepControl` from the fast group is safe as-is.
+- **Never take a reference to a cross-group member** — snapshot it by value under the lock.
+  `onOctomap` used to hold a `const Eigen::Vector3d&` to the drone position across the whole map
+  rebuild; that is now a copy, because the reference would be rewritten underneath it.
+- **Adding a callback:** decide its group first. Anything that can block longer than one 20 ms tick
+  belongs in `cb_slow_`. If it then touches fast-group state, either guard that state or move the
+  work — do not quietly promote `cross_mutex_` into a lock the control tick waits on.
+- **Known residual coupling:** the viz getters (`clearanceSamples()`, `geometricPath()`,
+  `searchTree()`, `corridorSnapshot()`) each take `traj_mutex_` to return a copy, and `stepControl`
+  takes the same mutex. So heavy viz converts a direct block into lock contention on the control
+  tick — far smaller (a vector memcpy, not an octree rebuild), but non-zero. `DEBUG_PLANNER_VIZ`
+  off makes it disappear entirely.
+
+**`State::thrust_accel` is a thrust measurement, not an acceleration — and must NOT be rotated.**
+This corrects an earlier note in this file that called it a frame bug and prescribed rotating it by
+attitude; that prescription was wrong and would have made the hover-thrust estimator *worse*.
+
+`onSensorCombined` reads `SensorCombined.accelerometer_m_s2`, which is specific force in the **FRD
+body frame**, and stores `-accelerometer_m_s2[2]` — thrust per unit mass along the vehicle's own up
+axis, **9.81 in hover**, not 0. No frame conversion is applied, deliberately. (It used to run through
+`frames::pxNedToEnu`, an axis relabel defined for *world* vectors; on a body vector that was a
+category error whose z component happened to come out right.)
+
+Why no rotation belongs here, and why this is now correct by construction rather than by luck:
+
+- **A quadrotor's accelerometer only ever measures thrust.** Gravity is not felt, and lateral
+  acceleration is produced by *tilting*, which keeps thrust along body z. So in coordinated flight
+  the reading is `(0, 0, -c)` at any attitude, with `c` = thrust/mass. The two horizontal components
+  carry nothing but drag and vibration — they sit near zero however hard the vehicle accelerates
+  sideways. They are no longer stored at all.
+- **The estimator's model wants exactly this.** `_updateHoverThrust` inverts `a_z = g(T/T_hover - 1)`,
+  which assumes thrust acts along body z. The sensor makes the same assumption, so the pairing is
+  exact at any tilt: `T_hover = 9.81 / (c/T)` recovers the hover thrust with no tilt term. Rotate the
+  measurement into the world instead and the estimate picks up a `1/cosθ` error — +1.5% at 10°,
+  +6.4% at 20°. The old note's "fix" was that error.
+- **It is a scalar on purpose.** A world-frame acceleration cannot be passed here by mistake; the
+  type makes the distinction unrepresentable rather than relying on a comment being read.
+
+`ControllerDebug` publishes it as `float64 thrust_accel` (it was a `Vector3 acc`), so Foxglove
+layouts plotting `acc.x/y/z` need repointing.
+
+**If a genuine world-frame acceleration is ever wanted** (a state estimator, accel feedback, a
+disturbance observer), do *not* reach for this field. Take `VehicleLocalPosition.ax/ay/az`, which is
+EKF-filtered, gravity-free and already NED-world — so `pxNedToEnu` is legitimately correct on it —
+and add it as a **separate** field. Do not route the hover-thrust estimator through it: it is a
+derivative of an EKF velocity state driven largely by the same accelerometer, and the EKF's own
+accel-z bias state overlaps physically with hover thrust, so the two would chase each other.
+
+**Noise, and why the estimator filters accel ÷ command.** `sensor_combined` is PX4's rawest IMU
+topic, bridged with **no rate limit** (~100 Hz received), and in flight its z reads **±3.5 m/s²** of
+vibration around 9.81 (2026-09-14 flights; the average itself agrees with VIO to <1%). Two defences:
+
+- **`onSensorCombined` accumulates, `controlLoop` takes the per-tick mean.** Keeping only the newest
+  sample at 50 Hz folds vibration into slow error; averaging has to happen at message rate because
+  the decimation cannot be undone later.
+- **`_updateHoverThrust` filters the thrust gain `c/T`, then takes `T_hover = 9.81 / gain`.** The
+  old form averaged the per-sample `T·9.81/c`, which puts the noise underneath the fraction and is
+  biased high (a sample at 4 m/s² inflates it far more than one at 15 deflates it). It read **0.31
+  against a true 0.29** on both flights, pinned the z integrator at its clamp and held the vehicle
+  ~20 cm above its setpoint. Arrival-averaging alone only cut that to 0.306; flipping the fraction is
+  the fix: with the noisy accel on top, noise cancels and every sample weighs the same, and the
+  final division is by an already-smoothed gain. `test_position_control` checks this under
+  heavy-tailed ±3.5 m/s² noise and guards that the old form *would* fail it.
+
+PX4's own `vehicle_acceleration` is exactly this signal with a 2-pole
+low-pass at `IMU_ACCEL_CUTOFF`, but it is **not** in `uxrce_dds_client/dds_topics.yaml`, which is
+consumed at firmware build time — so using it needs a rebuild and reflash. (The trajectory splice
+deliberately uses none of this — see the control section.)
 
 **Sensor-health watchdog (node-level, distinct from the core's `kHoverHold` / `STALE_TIMEOUT`
 planner-stale→hover path).** The node stamps a per-stream last-receive time (`t_px4_odom_ /
@@ -247,11 +842,23 @@ subsumes them. Two guards use this:
   `NAVIGATION_STATE_AUTO_LAND` (a single VehicleCommand can be dropped, and NAV_LAND itself drops us
   out of offboard — hence the latch block sits *above* the armed/offboard gate). The latch clears only
   on the **disarm edge** (touchdown), never on leaving offboard, so it cannot un-latch mid-descent.
+  The error names every unhealthy stream with its topic and how long it has been silent (or that it
+  never arrived), via `staleStreamReport()`, computed only on the failing tick.
+
+**Open caveat on the in-flight watchdog: it cannot distinguish "the sensors died" from "I did not get
+to run."** Both look identical to it — a set of `t_*` timestamps that stopped advancing. The
+2026-07-31 auto-land was entirely the second case (see the threading model above), and the giveaway
+in the log was that all three streams reported staleness within 20 ms of each other and right at the
+threshold, which independent sensors on two different processes never do. The callback-group split
+removes the known source of such stalls, but not the failure mode: any other stall on the fast group
+would land the aircraft the same way. The fix, not yet implemented, is to measure the tick's own
+period and report a **loop stall** rather than a sensor timeout when the tick itself was late by more
+than `SENSOR_TIMEOUT`, and/or to require the staleness to survive a second consecutive tick.
 
 `SENSOR_TIMEOUT` and `SENSOR_WARMUP` are live-reconfigurable node params.
 
 **State feed is independent of arm/offboard** (fixes an earlier bug where plans rooted at the map
-origin on the disarmed bench). The ENU `State` assembly + `core_->setState()` sit **above** the
+origin on the disarmed bench). The ENU `State` assembly + `core_->setVehicleState()` sit **above** the
 `armed && offboard` gate, so the core — and thus the planner worker, which reads `state_` for its
 `start` — always has the drone's live position, armed or not. The feed is gated on the **position
 source** being fresh (`streamHealthy(t_vio_odom_)` in normal mode, `t_px4_odom_` in sim) rather than
@@ -266,8 +873,9 @@ so the state it reads is always populated.
   LINE_STRIP + blue SPHERE_LIST, frame `map`. Populated even when `PLAN_TRAJECTORY=false`.
 - `/planner/goal_marker` (`visualization_msgs/Marker`) — red sphere at the active goal position.
   Published every viz tick so late-joining RViz sessions see it immediately.
-- `/smooth_trajectory` (`nav_msgs/Path`) — sampled min-snap trajectory. Dormant while
-  `PLAN_TRAJECTORY=false`.
+- `/smooth_trajectory` (`nav_msgs/Path`) — sampled trajectory as handed to the tracker, frame
+  **`world`** (the only planner output that is; see *Planning runs in `map`, control in `world`*).
+  Dormant while `PLAN_TRAJECTORY=false` unless a preset is playing.
 
 **Debug-only planner visualisation** (gated by `DEBUG_PLANNER_VIZ`, default off — see below). These
 publish nothing and cost nothing when the flag is off:
@@ -278,11 +886,62 @@ publish nothing and cost nothing when the flag is off:
 - `/planner/clearance_field` (`sensor_msgs/PointCloud2`, `intensity` = clearance distance) — coarse
   (0.15 m) samples of the cached EDT, colour near→far. Shows exactly what the clearance cost "sees",
   for tuning `CLEARANCE_WEIGHT` / `CLEARANCE_THRESHOLD`. Sampled on the worker thread only when the
-  map changes.
+  map changes. **Follows the cost, not the collision check**: this samples the *conservative* field
+  whenever one exists as a distinct view (see *Two fields, two questions*), so the stamped frontier
+  shows up as a low-clearance shell. That is the point — it is the field the objective is scored
+  against. The optimistic field the collision check uses is not published.
+- `/planner/corridor` (`visualization_msgs/MarkerArray`) — the corridor-QP pipeline's intermediate
+  products, **published on failed ticks too**, stage by stage, because a failing corridor is what you
+  need to look at (clearing the drawing made "viz broken", "flag off" and "failing every tick" look
+  identical). Face **outlines** rather than filled hulls, since regions overlap by construction and
+  stacked translucent solids turn to mush:
+  - grey outlines — the polyhedra **as decomposed**, before `CORRIDOR_MARGIN` is applied;
+  - cyan outlines — the same regions **after** the margin pull-in, when the corridor was accepted;
+  - red outlines — ditto when it was **rejected**;
+  - white line strip — the truncated committed prefix (drawn as soon as truncation succeeds);
+  - orange sphere — the truncation endpoint, the intermediate goal in known-safe space, which should
+    ratchet toward the red goal marker as the room is mapped.
+
+  Reading it: grey present but nothing coloured ⇒ the margin collapsed the regions, so there is less
+  room than `CORRIDOR_MARGIN` demands. Red ⇒ regions survived the shrink but failed validation (the
+  `[trajgen]` line names which check). Where the white line stops short of the green
+  `/planner/geometric_path` is where truncation refused to commit into unknown space. Needs
+  `PLAN_TRAJECTORY` + `USE_CORRIDOR_QP` + `DEBUG_PLANNER_VIZ`.
 
 **Planning-related node parameters** (all live-reconfigurable via `onParameterChange`):
-- `PLAN_TRAJECTORY` (bool, default `false`) — geometry-first phase gate; set `true` to enable
-  min-snap + trajectory tracking.
+
+> **The defaults quoted in this list are NOT what the node currently comes up with, and several of
+> these parameters are not in use at all right now.** Two separate things are going on. First, the
+> list has drifted from the code — `RRT_MONITOR_PERIOD`, `RRT_IMPROVE_PERIOD`, `RRT_SOLVE_TIME`,
+> `PLANNER_TYPE` and `UNKNOWN_WEIGHT` all quote values the `declare_parameter` calls no longer use.
+> Second, the node is currently configured for `PRESET_WAYPOINTS` bring-up with
+> `PLAN_TRAJECTORY=false`, so the planning branch does not execute and the search-tuning knobs above
+> are dormant whatever they are set to. Treat
+> `ros2/autonomy_node/src/autonomy_node.cpp` as authoritative for what a value actually is, and
+> `README.md` (*Runtime parameters*) for the current table. **Reconciling these numbers and actually
+> tuning the planner is deferred** — it is worth doing once the trajectory-generation and tracking
+> stages have been validated on the preset, since tuning a search whose output nothing consumes
+> proves nothing. The *descriptions* below stay accurate; it is only the quoted defaults that are
+> stale.
+- `PLAN_TRAJECTORY` (bool, default `true`) — the geometry-first phase gate. False stops the worker
+  after the geometric search (path published for viz, control stays on `POS_SP`); true runs trajgen
+  and hands trajectories to the tracker. **Now defaulted true for Stage 1 bench validation** — set it
+  false to go back to pure geometric planning.
+- `PRESET_WAYPOINTS` (bool, default `false`) — **momentary trigger, not a mode.** A `false->true`
+  edge fires one preset trajectory through waypoints hardcoded in `firePresetSquare`
+  (`autonomy_node.cpp`) — as it stands a 2 m square centred on the drone's XY at 1.5 m — and the node
+  sets the parameter straight back to `false` itself. Isolates trajectory generation + the DFB
+  controller from the planner: the geometric search is bypassed entirely, the corridor QP is solved
+  **once** against the current map, and the result is held (re-stamped by `stepControl`, since it is
+  deliberately never replanned) until it completes, after which control drops back to `POS_SP`.
+  Firing also **clears any active goal** — this is the only goal-cancel path that exists.
+  **Independent of `PLAN_TRAJECTORY`**: `runPreset` sits at the top level of the worker loop while
+  the `plan_trajectory` check is nested inside the normal planning branch, so the preset works with
+  the flag off — and running it off is the safer bench setting, since the worker then cannot stage a
+  competing trajectory at all. Needs a map (`[preset] ignored: no map yet` otherwise). Rejects a fire
+  below 0.8 m while actively controlling, so take off to a hover on `POS_SP` first; a fire on the
+  disarmed bench is allowed on purpose (generation-only test) and is cleared by `reset()` at the next
+  engage. There is no in-flight abort — leaving offboard is the abort.
 - `RRT_MONITOR_PERIOD` (double, default `0.5` s) — path validity re-check cadence.
 - `RRT_IMPROVE_PERIOD` (double, default `5.0` s) — clearance-aware improvement search cadence.
 - `RRT_SOLVE_TIME` (double, default `5.0` s) — planner optimisation budget per solve (all planners
@@ -294,13 +953,140 @@ publish nothing and cost nothing when the flag is off:
   `geometric_planner.hpp`**; edit there and rebuild the core to tune a specific planner. (RRT*'s old
   `RRT_RANGE` param is gone — it's now `PlannerConfig::rrtstar.range`.)
 - `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
-- `CLEARANCE_WEIGHT` (double, default `4.0`) — obstacle-proximity penalty weight.
+- `CLEARANCE_WEIGHT` (double, default `1.0`) — obstacle-proximity penalty weight. Lowered from 4.0
+  during bench work; raising it pushes the search off the walls, which is one way to buy the corridor
+  stage the room it needs to grow regions. Since the cost is scored against the **conservative**
+  field (see *Two fields, two questions*), this now also sets how hard the search is pushed off the
+  *frontier*, and is therefore the main lever on how much of the path survives truncation — at the
+  cost of longer detours, and of a goal at the frontier being approached more reluctantly.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
-- `DEBUG_PLANNER_VIZ` (bool, default `false`) — **single switch** for the debug planner
-  visualisation (search tree + clearance field above). Off by default so a regular flight pays
-  nothing: with it false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is
-  never sampled, and the two publish methods early-return. Flip it true for a bench/tuning run; it is
-  live-reconfigurable, so no relaunch.
+- `UNKNOWN_WEIGHT` (double, default `10.0`) — flat extra cost charged per metre of path routed
+  through never-observed space (see *The unknown-space surcharge*). Read it as "how many metres of
+  detour through mapped space is one metre through unmapped space worth". **`CLEARANCE_WEIGHT`
+  cannot substitute for this**: the distance field saturates at `CLEARANCE_THRESHOLD`, so unmapped
+  space beyond that scores a proximity penalty of exactly zero and the weight multiplies a zero.
+  Raise it if the planner still prefers leaving mapped space to detouring within it; `0` restores
+  the old behaviour. Affects the cost only — unknown space stays enterable, so goals beyond the
+  frontier still work. **Ignored when `TREAT_FRONTIER_AS_OBSTACLE` is false**, along with
+  truncation's unobserved-space stop: that flag is the single switch for whether unmapped space is
+  treated as a hazard at all.
+
+  **Raising this defocuses the informed planners, and badly.** BIT*/AIT*/EIT* sample only where
+  `‖start−x‖ + ‖x−goal‖ ≤ best_cost_so_far`, and both distances are straight-line estimates that
+  know nothing about this term. Inflating the true cost without inflating the estimate inflates that
+  sampling region, and once it exceeds the state-space diameter (~30 m here) the search degenerates
+  to uniform sampling — the tree spreads behind the drone with almost nothing between start and
+  goal. Measured on a mapped room with the goal 10 m beyond the frontier, as the fraction of tree
+  nodes near the straight start→goal line: weight 0 → 100%, 0.5 → 91%, 1 → 49%, 2 → 17%, 5 → 8%,
+  10 → 9%; the loss tracks `path_cost / straight_line_distance` exactly (1.00, 1.39, 1.77, 2.54,
+  4.85, 8.71). **It only bites when the goal is beyond the frontier** — with the goal inside mapped
+  space the optimal path pays no surcharge, cost stays near the straight-line distance, and the tree
+  is unchanged even at weight 10. Which is to say it bites in the normal exploration case.
+  **And it buys less than it looks like it should**: when the goal is beyond the frontier every
+  candidate route ends in unknown space and pays a similar charge, so the term is close to a
+  constant offset that shifts all costs without changing which route wins. It discriminates only
+  between routes that differ in how many *metres* of unknown they traverse (flying out and around
+  the outside of the map), which is what the `unknown_cost` test checks. Keep it low, and remember
+  the exact defence against flying into unmapped space is truncation, not this.
+- `DEBUG_PLANNER_VIZ` (bool, default `true`) — **single switch** for the debug planner
+  visualisation (search tree, clearance field, corridor). Designed to be zero-cost when off: with it
+  false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is never sampled, the
+  corridor snapshot is never taken, and the publish methods early-return. **Now defaulted true for
+  bench validation** — turn it off for a real flight so the NUC pays nothing for it.
+- `TREAT_FRONTIER_AS_OBSTACLE` (bool, **currently defaulted `false`** for corridor bench tests, so
+  the decomposition is exercised against real obstacles alone; `true` is the intended flight
+  setting) — stamp RTAB-Map's frontier cloud
+  (`/rtabmap/octomap_global_frontier_space`, remapped in the launch) as occupied voxels into a deep
+  **copy** of each incoming octomap, fed to the core as the **conservative** map view (the raw map
+  stays the optimistic search view — dual-map; a small keep-out ball around the drone stays
+  unstamped so it can root the search). With `USE_CORRIDOR_QP` off the search itself runs on the
+  conservative view (legacy behavior); with it on, the conservative view drives truncation, corridor
+  growth **and the search's cost objective** — but never its collision check, which stays optimistic
+  (see *Two fields, two questions*). NOTE: on a fresh map almost everything is frontier — the drone
+  is boxed in until it has scanned its surroundings.
+  **This is the master switch for "is unmapped space a hazard".** It gates three things: the stamped
+  shell, `UNKNOWN_WEIGHT`'s cost surcharge, and `truncatePath`'s stop at never-observed cells. Turn
+  it off and the pipeline is the legacy one in this respect — unknown reads as ordinary free space
+  everywhere. The last two are gated via `Config::treat_unknown_as_hazard`, set straight from this
+  parameter, **not** via whether a conservative map view exists: that view needs a frontier cloud,
+  and those two guards do not (they read the raw octree), so tying them to it made a missing
+  `/octomap_frontier` disable them silently. The shell genuinely does need the cloud, so with the
+  flag on but no cloud the node warns and you run without the shell's gradient but with both octree
+  guards intact.
+- `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
+  short of the goal (the reachable point closest to it) instead of reporting "no path"; the worker
+  keeps advancing the endpoint as the map grows.
+- `USE_CORRIDOR_QP` (bool, default `true`) — switch trajgen from plain min-snap to the
+  corridor-constrained QP pipeline (see the planning module notes). Off = byte-identical legacy
+  trajgen. Needs `TREAT_FRONTIER_AS_OBSTACLE` for the frontier to count as unsafe (without it the
+  conservative view equals the raw map and nothing guards against unknown space).
+- `VMAX` / `AMAX` / `JMAX` (double, defaults `1.0` / `1.5` / `3.0`) — per-axis velocity /
+  acceleration / jerk limits enforced by the corridor QP (conservative box bounds; the true norm can
+  reach √3× in the corner case).
+- `FRONTIER_MARGIN` (double, default `0.5` m) — clearance the committed *path prefix* keeps from
+  unknown space (the truncation margin against the conservative EDT). Enforced exactly as set; a
+  committed point must still have strictly positive clearance whatever the value, so the prefix can
+  never reach into an occupied or unknown voxel.
+- `ESCAPE_RAMP_DIST` (double, default `1.0` m) — distance over which truncation's required clearance
+  ramps from 0 at the drone up to the full `FRONTIER_MARGIN`. **Deliberately independent of the
+  margin.** Ramping over the margin itself makes the requirement climb at 1 m/m, so on a thinly
+  mapped scene the rising requirement meets the shrinking clearance within centimetres and the
+  committed path collapses to almost nothing (observed on the bench: 0.25 m committed out of a
+  2.47 m path). A longer ramp commits further before demanding full clearance. `<= 0` disables the
+  ramp entirely. Clearance must still be strictly positive everywhere, so leniency near the start is
+  never blindness — the prefix cannot enter an occupied or unknown voxel at any setting.
+  **Also drives the corridor's start relaxation**: `buildCorridor` splits the first segment here, so
+  this one number is where "the vehicle is a special case" ends for both stages. `<= 0` disables the
+  relaxation too (uniform `CORRIDOR_MARGIN` everywhere, and a drone closer than that to anything
+  mapped or unknown gets no corridor at all).
+- `CORRIDOR_MARGIN` (double, default `0.4` m) — clearance the *corridor regions* keep from obstacles
+  and unknown space. **This is a strictly harder test than the planner's `kCollisionMargin`**: the
+  search validates only its centreline (and exempts a sphere at the start), while the corridor needs
+  the margin over a whole 3D volume of the frontier-stamped map. Lowering it does not forfeit the
+  safety guarantee — the trajectory stays provably confined to the regions, so it keeps exactly this
+  clearance — but it is the clearance you actually fly with, so weigh it against the airframe's
+  half-width. If `[trajgen] corridor: decomposition FAILED` reports a tightest conservative clearance
+  below the required margin, this is the knob.
+- `MAX_SEGMENT_LEN` (double, default `2.0` m) — corridor resample cap; one free region per piece.
+  **Lowering this is the lever against convex over-conservatism**: a region spanning a long segment
+  gets a plane cut across its *entire* length by one obstacle near the middle, so shorter segments
+  recover free volume next to complex geometry. Costs `S`: the QP is `24·S` variables and BOBYQA
+  searches in `S` dimensions. Do not lower it without pinning `CORRIDOR_BBOX` (below), or you give
+  back in region width what you gained in region length. Note the first segment is additionally split
+  at `ESCAPE_RAMP_DIST` for the start relaxation, so the true segment count can exceed
+  `ceil(L / MAX_SEGMENT_LEN)`.
+- `CORRIDOR_BBOX` (double[3], default `[1, 2, 2]`) — **minimum usable** half-extents of the
+  region-growth window in the **segment-aligned** frame (component 0 = slack along the segment, 1/2 =
+  lateral), not world axes. A floor, not a literal size: `buildCorridor` scales it with the longest
+  segment (lateral ≥ segment length, along-track ≥ half of it, so consecutive regions overlap
+  generously) and adds the margin pull-in on top, so the window planes can never eat into the volume
+  the trajectory can actually use. The default is exactly what `MAX_SEGMENT_LEN = 2.0` derives, so it
+  changes nothing at stock settings — it exists to **decouple the two knobs** the moment
+  `MAX_SEGMENT_LEN` is lowered, since a purely derived window would narrow in proportion. Raise a
+  component for wider regions, at the cost of more obstacle points per decomposition. All zeros
+  restores the purely derived behaviour.
+
+**Planning mode matrix.** Three flags compose into the pipeline's operating modes. `PLAN_TRAJECTORY`
+gates trajgen entirely; `USE_CORRIDOR_QP` picks the trajgen algorithm; `TREAT_FRONTIER_AS_OBSTACLE`
+decides whether a conservative map view exists at all (without it the conservative view *is* the raw
+map, so nothing distinguishes unknown space from free space).
+
+| `PLAN_TRAJECTORY` | `USE_CORRIDOR_QP` | `TREAT_FRONTIER` | Search map | Trajgen | Guards unknown space |
+|---|---|---|---|---|---|
+| false | *(any)* | false | raw | none — control stays on `POS_SP` | n/a |
+| false | *(any)* | true | conservative | none — control stays on `POS_SP` | search only |
+| true | false | false | raw | plain min-snap | **no** |
+| true | false | true | conservative | plain min-snap | search only (trajectory may still cut corners between waypoints) |
+| true | true | false | raw | corridor QP | obstacles only — with the flag off nothing distinguishes unknown from free anywhere in the pipeline (no surcharge, no truncation stop, no stamped shell), so the corridor is collision-free against mapped obstacles but unknown space reads as free |
+| true | true | true | **optimistic** (raw) validity, **conservative** cost + unknown surcharge | corridor QP | **yes** — full Stage 1: optimistic search, conservative truncation + corridor, unobserved space priced and never committed |
+
+Notes: with `PLAN_TRAJECTORY=false` the corridor snapshot is never populated, so `/planner/corridor`
+stays empty regardless of the other flags — trajgen is where truncation and corridor growth happen.
+`BEST_EFFORT_GOAL` is orthogonal and matters whenever the goal is unreachable or unmapped: true
+(default) commits to the closest reachable point and ratchets forward, false holds. The last row is
+the only configuration that delivers the Stage 1 safety claim. Note the two `USE_CORRIDOR_QP=true`
+rows never fall back to min-snap: a corridor failure stages nothing and the vehicle hovers, so an
+unchecked polynomial is only reachable via the legacy `USE_CORRIDOR_QP=false` rows.
 
 > **Instrumentation principle (apply to any future debug/viz):** keep it behind a *single*,
 > *default-off* runtime parameter and make it *zero-cost when off* — no extraction, no allocation, no
@@ -310,6 +1096,23 @@ publish nothing and cost nothing when the flag is off:
 **Additional dependency**: `libdynamicedt3d-dev` (apt, version-matched to octomap 1.9.7). Used in
 `autonomy_core.cpp` only; linked into `drone_core_autonomy`. Headers at
 `<dynamicEDT3D/dynamicEDTOctomap.h>`. Re-install if rebuilding on a fresh machine.
+
+**DecompUtil (safe-flight-corridor decomposition)**: system CMake install at `/usr/local` from
+https://github.com/sikang/DecompUtil — **header-only**, so `find_package(decomp_util)` supplies only
+`${DECOMP_UTIL_INCLUDE_DIRS}`, added PRIVATE to `drone_core_planning` with its types confined to
+`corridor.cpp`; nothing is linked and no target reaches the `drone_core` export. Its CMake declares
+`cmake_minimum_required(VERSION 2.8.3)`, so on CMake >= 4 it must be configured with
+`-DCMAKE_POLICY_VERSION_MINIMUM=3.5`. Keep the source out of `src/` — it ships a `package.xml` and
+colcon would try to build it. Note an upstream bug we route around: `EllipsoidDecomp::add_global_bbox`
+(3D) places both the +Y and -Y planes at `global_bbox_max_(1)`, so the `(origin, dim)` constructor is
+never used — only `set_local_bbox`.
+
+**OSQP (corridor-QP solver)**: system CMake install at `/usr/local` (v1.x C API,
+`libosqpstatic.a`). Deliberately located as a **concrete library path** (`find_library` in
+`src/core/CMakeLists.txt`), *not* `find_package(osqp)`, and linked **PRIVATE** into
+`drone_core_planning` with the C API confined to `corridor_trajectory.cpp` — so the exported
+`drone_coreTargets.cmake` carries no `osqp::` target and consumers need no `find_dependency(osqp)`.
+The solver requires a double-precision OSQP build (static_assert on `OSQPFloat`).
 
 ### Frames & TF (OKVIS ↔ RTAB-Map) — why odom can look fine while the voxel map is wrong
 
@@ -377,10 +1180,11 @@ Required at runtime, referenced by path/command in the launch files:
   longer used — RTAB-Map publishes the octomap itself; see *Map source*.)
 - The OKVIS config (`ros2/third_party/okvis2/config/realsense_D435i.yaml`) and the cpu monitor are
   referenced by expanded `$HOME` paths in the launch files — update those paths if the workspace moves.
-- **Map-frame consistency (verify before flying planned trajectories)**: the octomap/RTAB-Map "map"
-  frame must share an origin with the controller's VIO-rooted ENU. The TF tree is patched by a
-  `body→camera_link` static transform (`--pitch -1.5708 --roll 1.5708`), now folded into
-  `autonomy_vision_launch.py` rather than run by hand.
+- **Map-frame consistency**: the octomap/RTAB-Map `map` frame and the controller's VIO-rooted `world`
+  frame are reconciled through RTAB-Map's `map→world` TF (see *Planning runs in `map`, control in
+  `world`*), so planning pauses until RTAB-Map publishes it. The TF tree also needs the
+  `body→camera_link` static transform (`--pitch -1.5708 --roll 1.5708`), folded into
+  `autonomy_vision_launch.py`.
 
 ### NUC resource constraints
 

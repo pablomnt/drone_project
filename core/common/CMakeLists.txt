@@ -1,7 +1,7 @@
 # Shared types, frame conversions and logging. Header-heavy and dependency-light:
 # everything here speaks Eigen and nothing else.
 
-add_library(drone_core_common src/frames.cpp)
+add_library(drone_core_common src/frames.cpp src/rigid_transform.cpp src/trajectory_eval.cpp)
 add_library(drone_core::common ALIAS drone_core_common)
 
 target_include_directories(drone_core_common PUBLIC
@@ -21,4 +21,8 @@ if(DRONE_CORE_BUILD_TESTS)
   add_executable(test_frames test/test_frames.cpp)
   target_link_libraries(test_frames PRIVATE drone_core_common)
   add_test(NAME frames COMMAND test_frames)
+
+  add_executable(test_rigid_transform test/test_rigid_transform.cpp)
+  target_link_libraries(test_rigid_transform PRIVATE drone_core_common)
+  add_test(NAME rigid_transform COMMAND test_rigid_transform)
 endif()

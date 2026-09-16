@@ -20,18 +20,22 @@ namespace drone_core::planning {
 
 namespace {
 
-// Single-integral cost that rewards short, high-clearance paths. The per-state
-// cost is 1 (so the integral over the path equals its length when there is no
-// clearance term) plus an obstacle-proximity penalty that grows as a state
-// approaches an obstacle and saturates at the clearance threshold. Integrating
-// over arc length makes the total comparable between any two paths regardless of
-// how many waypoints each has.
+// Single-integral cost that rewards short, high-clearance paths that stay in
+// mapped space. The per-state cost is 1 (so the integral over the path equals
+// its length when there is no other term) plus two additions: an
+// obstacle-proximity penalty that grows as a state approaches an obstacle and
+// saturates at the clearance threshold, and a flat surcharge wherever the state
+// sits in space that has never been observed. Integrating over arc length makes
+// the total comparable between any two paths regardless of how many waypoints
+// each has.
 class ClearanceObjective : public ompl::base::StateCostIntegralObjective {
 public:
   ClearanceObjective(const ompl::base::SpaceInformationPtr& si,
-                     GeometricPlanner::ClearanceFn clearance, double weight, double threshold)
+                     GeometricPlanner::ClearanceFn clearance, double weight, double threshold,
+                     GeometricPlanner::UnknownFn is_unknown, double unknown_weight)
       : ompl::base::StateCostIntegralObjective(si, /*enableMotionCostInterpolation=*/true),
-        clearance_(std::move(clearance)), weight_(weight), threshold_(threshold) {
+        clearance_(std::move(clearance)), weight_(weight), threshold_(threshold),
+        unknown_(std::move(is_unknown)), unknown_weight_(unknown_weight) {
     // Register a state->goal cost-to-go heuristic (distance to the goal region).
     // This is what RRT*'s informed sampler and the BIT*-lineage goal heuristic
     // query via hasCostToGoHeuristic()/costToGo(); without it OMPL warns that
@@ -42,12 +46,20 @@ public:
   }
 
   ompl::base::Cost stateCost(const ompl::base::State* state) const override {
+    if (!clearance_ && !unknown_) return ompl::base::Cost(1.0);
+    const auto* se3 = state->as<ompl::base::SE3StateSpace::StateType>();
+    const auto* pos = se3->as<ompl::base::RealVectorStateSpace::StateType>(0);
+    const double x = pos->values[0], y = pos->values[1], z = pos->values[2];
+
     double penalty = 0.0;
     if (clearance_) {
-      const auto* se3 = state->as<ompl::base::SE3StateSpace::StateType>();
-      const auto* pos = se3->as<ompl::base::RealVectorStateSpace::StateType>(0);
-      const double d = clearance_(pos->values[0], pos->values[1], pos->values[2]);
-      penalty = weight_ * std::max(0.0, threshold_ - d);
+      penalty += weight_ * std::max(0.0, threshold_ - clearance_(x, y, z));
+    }
+    // Flat, not proportional to anything: the point is that every metre spent in
+    // unobserved space costs the same, so a route diving deep into it keeps
+    // paying. See GeometricPlanner::setUnknownPenalty.
+    if (unknown_ && unknown_(x, y, z)) {
+      penalty += unknown_weight_;
     }
     return ompl::base::Cost(1.0 + penalty);
   }
@@ -67,6 +79,8 @@ private:
   GeometricPlanner::ClearanceFn clearance_;
   double weight_;
   double threshold_;
+  GeometricPlanner::UnknownFn unknown_;
+  double unknown_weight_;
 };
 
 }  // namespace
@@ -101,15 +115,18 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
 bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
   const auto* se3state = state->as<ompl::base::SE3StateSpace::StateType>();
   const auto* pos = se3state->as<ompl::base::RealVectorStateSpace::StateType>(0);
+  return positionValid(pos->values[0], pos->values[1], pos->values[2]);
+}
 
+bool GeometricPlanner::positionValid(double x, double y, double z) const {
   // Margin to enforce here: the full collision margin in general, the reduced
   // start margin within the escape sphere so a parked/lifting drone sitting within
   // the margin of the mapped floor can still root the search without ever entering
   // an obstacle. The sphere centre (start_pos_) is anchored in planPath /
   // isPathValid.
-  const double ex = pos->values[0] - start_pos_[0];
-  const double ey = pos->values[1] - start_pos_[1];
-  const double ez = pos->values[2] - start_pos_[2];
+  const double ex = x - start_pos_[0];
+  const double ey = y - start_pos_[1];
+  const double ez = z - start_pos_[2];
   const bool near_start =
       ex * ex + ey * ey + ez * ez <= kStartEscapeRadius * kStartEscapeRadius;
   const double margin = near_start ? kStartMargin : kCollisionMargin;
@@ -120,8 +137,13 @@ bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
   // horizontal-only fallback below — and is far cheaper than the cell scan.
   // Outside the field / unknown space reads as free (it returns the saturation
   // distance), matching the treat-unknown-as-free policy.
+  //
+  // This is deliberately clearance_fn_ and never the cost field: the cost may be
+  // scored against a conservative view in which the mapped frontier reads as an
+  // obstacle (see setCostClearance), and testing validity against that would
+  // make the frontier a closed surface the search could not cross anywhere.
   if (clearance_fn_) {
-    return clearance_fn_(pos->values[0], pos->values[1], pos->values[2]) > margin;
+    return clearance_fn_(x, y, z) > margin;
   }
 
   // Fallback for standalone use (no clearance field, e.g. unit tests): scan the
@@ -133,8 +155,7 @@ bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
   const double res = octree_ptr_->getResolution();
   for (double dx = -margin; dx <= margin; dx += res) {
     for (double dy = -margin; dy <= margin; dy += res) {
-      const octomap::point3d query(pos->values[0] + dx, pos->values[1] + dy,
-                                   pos->values[2]);
+      const octomap::point3d query(x + dx, y + dy, z);
       const auto* node = octree_ptr_->search(query);
       if (node != nullptr && octree_ptr_->isNodeOccupied(node)) {
         return false;
@@ -144,8 +165,87 @@ bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
   return true;
 }
 
+bool GeometricPlanner::projectGoal(const std::vector<double>& goal,
+                                   std::array<double, 3>& out) const {
+  const auto& bounds = space_->as<ompl::base::SE3StateSpace>()->getBounds();
+  // Nudge inside the bounds rather than onto them: OMPL's bounds test is
+  // inclusive, but a goal sitting exactly on the ceiling plane leaves the search
+  // no room on one side, and the inset is far below the map resolution.
+  constexpr double kBoundsInset = 1.0e-3;
+  auto clampToBounds = [&](std::array<double, 3>& p) {
+    for (int i = 0; i < 3; ++i) {
+      p[i] = std::min(std::max(p[i], bounds.low[i] + kBoundsInset),
+                      bounds.high[i] - kBoundsInset);
+    }
+  };
+
+  std::array<double, 3> base{goal[0], goal[1], goal[2]};
+  clampToBounds(base);
+  if (positionValid(base[0], base[1], base[2])) {
+    out = base;
+    return true;
+  }
+
+  // Escape directions: the six axes first (a voxel obstacle's shortest way out is
+  // usually normal to one of its faces), then a Fibonacci lattice over the sphere
+  // for everything else — deterministic, no clustering at the poles, and no trig
+  // table to keep in sync with the count.
+  std::array<std::array<double, 3>, 6 + kGoalProjectDirections> dirs{
+      {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}};
+  const double golden = M_PI * (3.0 - std::sqrt(5.0));
+  for (int i = 0; i < kGoalProjectDirections; ++i) {
+    const double dz = 1.0 - 2.0 * (static_cast<double>(i) + 0.5) / kGoalProjectDirections;
+    const double r = std::sqrt(std::max(0.0, 1.0 - dz * dz));
+    const double phi = golden * static_cast<double>(i);
+    dirs[6 + i] = {r * std::cos(phi), r * std::sin(phi), dz};
+  }
+
+  // Walk outward. The first radius that yields any valid point is the answer:
+  // everything closer to the goal has already been rejected, so no later radius
+  // can do better.
+  const int steps = static_cast<int>(std::floor(kGoalProjectRadius / kGoalProjectStep));
+  for (int s = 1; s <= steps; ++s) {
+    const double radius = s * kGoalProjectStep;
+    bool found = false;
+    double best_start_dist = std::numeric_limits<double>::infinity();
+    std::array<double, 3> best{};
+    for (const auto& d : dirs) {
+      std::array<double, 3> cand{base[0] + radius * d[0], base[1] + radius * d[1],
+                                 base[2] + radius * d[2]};
+      clampToBounds(cand);
+      if (!positionValid(cand[0], cand[1], cand[2])) continue;
+      const double sx = cand[0] - start_pos_[0];
+      const double sy = cand[1] - start_pos_[1];
+      const double sz = cand[2] - start_pos_[2];
+      const double start_dist = sx * sx + sy * sy + sz * sz;
+      if (start_dist < best_start_dist) {
+        best_start_dist = start_dist;
+        best = cand;
+        found = true;
+      }
+    }
+    if (found) {
+      out = best;
+      return true;
+    }
+  }
+  return false;
+}
+
 double GeometricPlanner::minClearance(const std::vector<std::vector<double>>& path) const {
   if (!clearance_fn_ || path.size() < 2) return std::numeric_limits<double>::infinity();
+  // Only the region the validity check actually enforces is meaningful here:
+  // points within kStartEscapeRadius of the start are exempt (their margin drops
+  // to kStartMargin so a parked/lifting drone can root the search), so a tight
+  // clearance there is expected and would not block the path. Anchor the sphere
+  // at the first waypoint, mirroring isPathValid, and skip sampled points inside
+  // it so this reports the lowest clearance among the points that could actually
+  // flag the path. Returns +infinity if every sampled point is inside the sphere.
+  const std::array<double, 3> center{path.front()[0], path.front()[1], path.front()[2]};
+  auto insideEscape = [&](double x, double y, double z) {
+    const double dx = x - center[0], dy = y - center[1], dz = z - center[2];
+    return dx * dx + dy * dy + dz * dz <= kStartEscapeRadius * kStartEscapeRadius;
+  };
   double mind = std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i + 1 < path.size(); ++i) {
     const auto& a = path[i];
@@ -154,9 +254,11 @@ double GeometricPlanner::minClearance(const std::vector<std::vector<double>>& pa
     const int steps = std::max(1, static_cast<int>(std::ceil(seg / 0.05)));
     for (int s = 0; s <= steps; ++s) {
       const double u = static_cast<double>(s) / steps;
-      mind = std::min(mind, clearance_fn_(a[0] + u * (b[0] - a[0]),
-                                          a[1] + u * (b[1] - a[1]),
-                                          a[2] + u * (b[2] - a[2])));
+      const double x = a[0] + u * (b[0] - a[0]);
+      const double y = a[1] + u * (b[1] - a[1]);
+      const double z = a[2] + u * (b[2] - a[2]);
+      if (insideEscape(x, y, z)) continue;
+      mind = std::min(mind, clearance_fn_(x, y, z));
     }
   }
   return mind;
@@ -195,6 +297,17 @@ void GeometricPlanner::setClearance(ClearanceFn clearance, double weight, double
   clearance_fn_ = std::move(clearance);
   clearance_weight_ = weight;
   clearance_threshold_ = threshold;
+}
+
+void GeometricPlanner::setUnknownPenalty(UnknownFn is_unknown, double weight) {
+  unknown_fn_ = std::move(is_unknown);
+  unknown_weight_ = weight;
+}
+
+void GeometricPlanner::setCostClearance(ClearanceFn clearance) {
+  // Deliberately does not touch clearance_fn_, so a host may call the two
+  // setters in either order (see the header note on order-independence).
+  cost_clearance_fn_ = std::move(clearance);
 }
 
 ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
@@ -263,11 +376,18 @@ ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
   }
 }
 
-ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective() const {
+ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective(
+    bool include_unknown) const {
   // With no clearance function the per-state cost is a constant 1, so this is
   // exactly a path-length objective; with one it adds the proximity penalty.
-  return std::make_shared<ClearanceObjective>(si_, clearance_fn_, clearance_weight_,
-                                              clearance_threshold_);
+  // The field sampled here is the cost field, which is the validity field
+  // unless the host set a separate one (see setCostClearance). Everything that
+  // scores a path — pathCost, costBreakdown, the shortcut pass — therefore
+  // agrees with what the search minimised.
+  return std::make_shared<ClearanceObjective>(
+      si_, costClearanceFn(), clearance_weight_, clearance_threshold_,
+      (include_unknown && unknownPenaltyActive()) ? unknown_fn_ : UnknownFn{},
+      unknown_weight_);
 }
 
 bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
@@ -279,10 +399,28 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   start->setXYZ(start_vec[0], start_vec[1], start_vec[2]);
   start->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
 
-  // Anchor the start-state collision exemption at this solve's start.
+  // Anchor the start-state collision exemption at this solve's start. Must
+  // precede projectGoal, which validates candidates under the same exemption.
   start_pos_ = {start_vec[0], start_vec[1], start_vec[2]};
 
-  goal->setXYZ(goal_vec[0], goal_vec[1], goal_vec[2]);
+  // Move the goal to the nearest state the collision check accepts, if it does
+  // not accept the requested one. OMPL drops invalid goal states inside
+  // PlannerInputStates::nextGoal and the planner then has nothing to grow
+  // toward, so an unprojected goal near a wall produces no path at all — not a
+  // path that stops at the margin. Projecting is what turns "invalid goal" back
+  // into the ordinary "goal we approach as closely as the margin allows" case.
+  std::array<double, 3> planning_goal{};
+  if (!projectGoal(goal_vec, planning_goal)) {
+    last_goal_projection_ = std::numeric_limits<double>::infinity();
+    last_goal_gap_ = std::numeric_limits<double>::infinity();
+    return false;
+  }
+  last_planning_goal_ = planning_goal;
+  last_goal_projection_ = std::sqrt(std::pow(planning_goal[0] - goal_vec[0], 2) +
+                                    std::pow(planning_goal[1] - goal_vec[1], 2) +
+                                    std::pow(planning_goal[2] - goal_vec[2], 2));
+
+  goal->setXYZ(planning_goal[0], planning_goal[1], planning_goal[2]);
   goal->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
 
   auto pdef = std::make_shared<ompl::base::ProblemDefinition>(si_);
@@ -320,25 +458,46 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   }
 
   if (!solved) {
-    return false;
-  }
-
-  // OMPL reports both exact and approximate solutions as "solved". An approximate
-  // solution stops short of the goal (the tree never connected to it). Accept one
-  // only if its endpoint is within kGoalFlexibility of the goal; otherwise reject
-  // the plan — the caller then treats this as no path (infinite cost) rather than
-  // committing the vehicle to a route that ends partway. getSolutionDifference()
-  // is the distance from the returned path's end to the goal.
-  if (pdef->hasApproximateSolution() && pdef->getSolutionDifference() > kGoalFlexibility) {
+    last_goal_gap_ = std::numeric_limits<double>::infinity();
     return false;
   }
 
   auto path = std::static_pointer_cast<ompl::geometric::PathGeometric>(pdef->getSolutionPath());
 
+  // Distance from the returned solution's endpoint to the goal the *caller* asked
+  // for, which with a projected goal is not the one OMPL solved to. Measured off
+  // the endpoint rather than taken from getSolutionDifference() so the two cases
+  // report on the same reference point: the host compares this against its own
+  // endpoint-to-goal distances when scoring best-effort progress, and a path that
+  // stopped at the projection is genuinely still that far from the commanded
+  // point. Recorded before post-processing, which never moves the endpoint.
+  last_goal_gap_ = std::numeric_limits<double>::infinity();
+  if (path->getStateCount() > 0) {
+    const auto* end = path->getState(path->getStateCount() - 1)
+                          ->as<ompl::base::SE3StateSpace::StateType>();
+    const auto* epos = end->as<ompl::base::RealVectorStateSpace::StateType>(0);
+    last_goal_gap_ = std::sqrt(std::pow(epos->values[0] - goal_vec[0], 2) +
+                               std::pow(epos->values[1] - goal_vec[1], 2) +
+                               std::pow(epos->values[2] - goal_vec[2], 2));
+  }
+
+  // A solution can stop short of the requested goal two ways: the tree never
+  // connected to the goal (OMPL calls that an approximate solution), or the goal
+  // was projected before the solve because the requested point was not a valid
+  // state. Both are the same thing to the caller — the vehicle would end up this
+  // far from where it was sent — so strict mode gates on the one number that
+  // covers both, and rejects the plan rather than committing to a route that
+  // ends somewhere else. The caller then treats it as no path (infinite cost).
+  // Best-effort mode keeps it: it is the path to the closest point that is both
+  // reachable and safe, and the caller uses lastGoalGap() to act on the shortfall.
+  if (!best_effort_ && last_goal_gap_ > kGoalFlexibility) {
+    return false;
+  }
+
   // Straighten the jagged planner result. Deliberately skip B-spline smoothing so
   // the original waypoints survive for the minimum-snap optimiser downstream.
   // With no clearance field, plain length-only simplifyMax is correct and cheap.
-  if (!clearance_fn_) {
+  if (!clearanceMode()) {
     ompl::geometric::PathSimplifier simplifier(si_);
     simplifier.simplifyMax(*path);
   }
@@ -352,7 +511,7 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   // In clearance mode, use a cost-aware shortcut instead of simplifyMax: it cuts
   // the planner's zig-zag but, by gating on the clearance-aware cost, keeps the
   // detours the objective actually wanted (see shortcutClearanceAware).
-  if (clearance_fn_) {
+  if (clearanceMode()) {
     shortcutClearanceAware(result_path);
   }
   return true;
@@ -419,11 +578,19 @@ GeometricPlanner::costBreakdown(const std::vector<std::vector<double>>& path) co
     s->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
     geo.append(s.get());
   }
-  // The objective's per-state cost is 1 + proximity penalty, so the total minus
-  // the geometric length isolates the penalty the clearance term contributed.
+  // The objective's per-state cost is 1 + proximity penalty + unknown surcharge,
+  // so the total minus the geometric length isolates what the penalties added.
+  // Splitting those two apart needs a second pass with the surcharge switched
+  // off — worth it because they call for opposite fixes (hugging a wall vs.
+  // routing through unmapped space), and skipped entirely when no surcharge is
+  // configured, which is the case that must stay cheap.
   const double total = geo.cost(makeObjective()).value();
   const double length = geo.length();
-  return {length, total - length, total};
+  double unknown = 0.0;
+  if (unknownPenaltyActive()) {
+    unknown = total - geo.cost(makeObjective(/*include_unknown=*/false)).value();
+  }
+  return {length, total - length - unknown, unknown, total};
 }
 
 }  // namespace drone_core::planning

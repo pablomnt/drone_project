@@ -1,0 +1,13 @@
+# QoS overrides for `ros2 bag record`.
+#
+# Only needed if a best-effort PX4 output topic records 0 messages under the
+# default (adaptive) subscription. Enable by adding to the record command:
+#   --qos-profile-overrides-path <path-to-this-file>
+#
+# The /fmu/out/* topics are published best-effort by the micro-XRCE agent; a
+# reliable subscription can silently miss them.
+/fmu/out/vehicle_status:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile

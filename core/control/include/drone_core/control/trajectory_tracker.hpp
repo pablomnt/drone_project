@@ -24,6 +24,8 @@ public:
   void setPositionGains(const Eigen::Vector3d& P);
   void setVelocityGains(const Eigen::Vector3d& P, const Eigen::Vector3d& I, const Eigen::Vector3d& D);
   void setHoverThrust(double hover_thrust);
+  void setDerivativeTau(double tau);
+  void setIntegratorErrorLimit(double max_pos_err);
   void enableFeedforward(bool enabled);
 
   // Seconds without a new trajectory before falling back to hover-hold.
@@ -38,15 +40,47 @@ public:
   void setDirectSetpoint(const Eigen::Vector3d& pos, double yaw);
 
   // Install a freshly planned trajectory, stamped with its arrival time.
+  //
+  // The trajectory does NOT take effect immediately: it is held until wall-clock
+  // reaches its own `t0`, and the outgoing trajectory keeps driving the
+  // reference until then. The planner solves a replan against the state the
+  // vehicle will be in at `t0` (a lead time ahead, covering the solve), so
+  // switching at exactly `t0` is what makes the splice continuous — switching
+  // early would jump the reference to a point the vehicle has not reached yet.
+  // A `t0` already in the past (the solve overran its lead) takes effect on the
+  // next update, which is the graceful-degradation case.
   void setTrajectory(const common::Trajectory& traj, double arrival_time);
+
+  // Re-stamp the installed trajectory's freshness to `now` without re-staging it.
+  // The trajectory is evaluated in absolute wall-clock time (mapper.sample uses
+  // now vs traj_.t0), so a single long trajectory keeps playing correctly; the
+  // only thing the stale timeout would otherwise trip is the planner-death
+  // failsafe. This lets a caller that knows the trajectory is still valid (the
+  // preset one-shot square, which is deliberately solved once and never
+  // replanned) hold kTracking for the whole duration instead of falling to
+  // hover-hold after stale_timeout. Does nothing useful unless a trajectory is
+  // installed. Control thread only, like setTrajectory/update.
+  void keepFresh(double now) { last_arrival_ = now; }
+
+  // Drop any installed/staged trajectory, so the next update() with a direct
+  // setpoint present falls straight to kDirect (POS_SP) rather than kHoverHold.
+  // The normal precedence keeps POS_SP unreachable for as long as a trajectory
+  // is installed; this is the explicit release the preset one-shot uses when its
+  // square completes, so control returns to POS_SP without a disarm. Continuous
+  // from a trajectory that has run out (it ends at rest) into a POS_SP that the
+  // caller has pointed at that same rest position. Control thread only.
+  void clearTrajectory();
 
   // Run one control step and return the attitude/thrust command.
   common::Command update(const common::State& state, double now, double dt);
 
   Mode mode() const { return mode_; }
-  bool hasTrajectory() const { return has_traj_ && !traj_.empty(); }
+  bool hasTrajectory() const { return (has_traj_ && !traj_.empty()) || has_next_; }
   const common::Trajectory& trajectory() const { return traj_; }
   const PositionControl& controller() const { return controller_; }
+
+  // True while a trajectory has been installed but its t0 has not arrived yet.
+  bool hasPendingTrajectory() const { return has_next_; }
 
 private:
   PositionControl controller_;
@@ -54,6 +88,9 @@ private:
 
   common::Trajectory traj_;
   bool has_traj_{false};
+  // Installed but not yet in effect; promoted to traj_ once now >= next_.t0.
+  common::Trajectory next_;
+  bool has_next_{false};
   bool mapper_needs_reset_{false};
   double last_arrival_{0.0};
   double stale_timeout_{0.5};

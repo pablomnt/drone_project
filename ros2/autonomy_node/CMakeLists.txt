@@ -20,6 +20,8 @@ find_package(octomap_msgs REQUIRED)
 find_package(octomap REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(drone_interfaces REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_eigen REQUIRED)
 
 # The ROS-free autonomy core, installed to a prefix on CMAKE_PREFIX_PATH.
 find_package(drone_core REQUIRED CONFIG)
@@ -41,7 +43,9 @@ ament_target_dependencies(autonomy_node
   nav_msgs
   visualization_msgs
   octomap_msgs
-  drone_interfaces)
+  drone_interfaces
+  tf2_ros
+  tf2_eigen)
 
 install(TARGETS autonomy_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})

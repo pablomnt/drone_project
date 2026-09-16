@@ -14,6 +14,14 @@ void TrajectoryTracker::setHoverThrust(double hover_thrust) {
   controller_.setHoverThrust(hover_thrust);
 }
 
+void TrajectoryTracker::setDerivativeTau(double tau) {
+  controller_.setDerivativeTau(tau);
+}
+
+void TrajectoryTracker::setIntegratorErrorLimit(double max_pos_err) {
+  controller_.setIntegratorErrorLimit(max_pos_err);
+}
+
 void TrajectoryTracker::enableFeedforward(bool enabled) {
   feedforward_ = enabled;
 }
@@ -21,6 +29,15 @@ void TrajectoryTracker::enableFeedforward(bool enabled) {
 void TrajectoryTracker::reset() {
   controller_.reset();
   mode_ = Mode::kHoverHold;
+  // Drop any trajectory across a re-engage. Both are anchored to a wall-clock
+  // t0 and were spliced onto a reference that no longer exists, so re-engaging
+  // onto one would jump the reference to wherever that curve had got to. A
+  // fresh engage must start from the direct setpoint (takeoff) and wait for the
+  // planner to solve against the vehicle's actual state.
+  has_traj_ = false;
+  has_next_ = false;
+  traj_ = common::Trajectory{};
+  next_ = common::Trajectory{};
 }
 
 void TrajectoryTracker::setDirectSetpoint(const Eigen::Vector3d& pos, double yaw) {
@@ -30,17 +47,40 @@ void TrajectoryTracker::setDirectSetpoint(const Eigen::Vector3d& pos, double yaw
 }
 
 void TrajectoryTracker::setTrajectory(const common::Trajectory& traj, double arrival_time) {
-  traj_ = traj;
-  has_traj_ = true;
+  // Staged, not engaged: the outgoing trajectory keeps driving the reference
+  // until wall-clock reaches this one's t0 (see the header). Freshness is
+  // stamped here, on arrival, so a planner that has stopped producing still
+  // trips the stale timeout even while a staged trajectory waits to start.
+  next_ = traj;
+  has_next_ = true;
   last_arrival_ = arrival_time;
-  // Seed the held yaw to the vehicle's heading on the next update so the
-  // commanded yaw does not jump when a new trajectory is engaged.
-  mapper_needs_reset_ = true;
+}
+
+void TrajectoryTracker::clearTrajectory() {
+  traj_ = common::Trajectory{};
+  next_ = common::Trajectory{};
+  has_traj_ = false;
+  has_next_ = false;
 }
 
 common::Command TrajectoryTracker::update(const common::State& state, double now, double dt) {
   controller_.setState(state.pos, state.vel, state.yaw);
-  controller_.setCurrentAcceleration(state.acc);
+  controller_.setThrustAccel(state.thrust_accel);
+  // Lets the D term difference on the estimator's clock instead of the control
+  // clock — see PositionControl::setStateStamp.
+  controller_.setStateStamp(state.stamp);
+
+  // Promote a staged trajectory once its start instant has arrived. The planner
+  // matched position, velocity, acceleration and jerk to the outgoing reference
+  // at exactly this instant, so the swap is continuous.
+  if (has_next_ && now >= next_.t0) {
+    traj_ = next_;
+    has_traj_ = true;
+    has_next_ = false;
+    // Seed the held yaw to the vehicle's heading so the commanded yaw does not
+    // jump when the new trajectory engages.
+    mapper_needs_reset_ = true;
+  }
 
   const bool has_fresh_traj =
       has_traj_ && !traj_.empty() && (now - last_arrival_ <= stale_timeout_);

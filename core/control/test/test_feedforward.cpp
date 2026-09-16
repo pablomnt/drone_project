@@ -23,7 +23,7 @@ void configure(PositionControl& c) {
 // feed-forward terms) does not engage.
 void primeAirborne(PositionControl& c) {
   c.setState(Eigen::Vector3d(0.0, 0.0, 1.0), Eigen::Vector3d::Zero(), 0.0);
-  c.setCurrentAcceleration(Eigen::Vector3d::Zero());
+  c.setThrustAccel(9.81);  // hover: thrust exactly cancels gravity
   c.reset();
 }
 
@@ -62,20 +62,20 @@ int main() {
   for (int i = 0; i < 40; ++i) {
     const Eigen::Vector3d state_pos(0.0, 0.0, 1.0);
     const Eigen::Vector3d state_vel = Eigen::Vector3d::Zero();
-    const Eigen::Vector3d state_acc = Eigen::Vector3d::Zero();
+    const double state_thrust_accel = 9.81;  // hover
 
     baseline.setState(state_pos, state_vel, 0.0);
-    baseline.setCurrentAcceleration(state_acc);
+    baseline.setThrustAccel(state_thrust_accel);
     baseline.setSetpoint(pos_sp, yaw_sp);
     baseline.update(0.02);
 
     ff_off.setState(state_pos, state_vel, 0.0);
-    ff_off.setCurrentAcceleration(state_acc);
+    ff_off.setThrustAccel(state_thrust_accel);
     ff_off.setReference(ref);
     ff_off.update(0.02);
 
     ff_on.setState(state_pos, state_vel, 0.0);
-    ff_on.setCurrentAcceleration(state_acc);
+    ff_on.setThrustAccel(state_thrust_accel);
     ff_on.setReference(ref);
     ff_on.update(0.02);
   }

@@ -2,6 +2,7 @@ import launch
 import launch_ros.actions
 import launch_ros.substitutions
 import launch.actions
+import launch.substitutions
 import os
 
 def generate_launch_description():
@@ -9,6 +10,14 @@ def generate_launch_description():
     config_file = os.path.expandvars('$HOME/ws_paramio/src/ros2/third_party/okvis2/config/realsense_D435i.yaml')
     cpu_script_path = os.path.expandvars('$HOME/ws_paramio/src/ros2/tools/system_monitor_pkg/system_monitor_pkg/cpu_monitor.py')
     return launch.LaunchDescription([
+        # Forwarded to okvis's launch XML, which owns the only rviz2 in this stack.
+        # Defaults true (unchanged behaviour); pass rviz:=false to save CPU.
+        launch.actions.DeclareLaunchArgument(
+            'rviz',
+            default_value='true',
+            description="Start okvis's RViz view. Set false to save CPU on the NUC."
+        ),
+
         # Launch the autonomy node in a new terminal
         launch.actions.ExecuteProcess(
             cmd=[
@@ -24,11 +33,17 @@ def generate_launch_description():
             output='screen'
         ),
 
-        # Launch the okvis node in a new terminal
+        # Launch the okvis node in a new terminal. Built as a list of substitution
+        # fragments because `rviz` is a LaunchConfiguration resolved at launch
+        # time, so it cannot be interpolated into an f-string here.
         launch.actions.ExecuteProcess(
             cmd=[
                 'xterm', '-hold', '-e', 'bash', '-lc',
-                f"ros2 launch okvis okvis_node_realsense.launch.xml config_filename:={config_file}"
+                [
+                    'ros2 launch okvis okvis_node_realsense.launch.xml ',
+                    f'config_filename:={config_file} ',
+                    'rviz:=', launch.substitutions.LaunchConfiguration('rviz'),
+                ]
             ],
             output='screen'
         ),

@@ -10,8 +10,11 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <atomic>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -22,6 +25,11 @@
 #include <octomap/ColorOcTree.h>
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
+
+#include <tf2/exceptions.h>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -41,12 +49,28 @@
 
 #include "drone_core/autonomy/autonomy_core.hpp"
 #include "drone_core/common/frames.hpp"
+#include "drone_core/common/logging.hpp"
 
 using namespace std::chrono_literals;
 
 namespace {
 constexpr double kControlDt = 0.02;       // 50 Hz
 constexpr double kDefaultYaw = M_PI_2;    // ENU heading for direct/hover setpoints
+
+// Frame names. Planning — goals, the octomap and frontier cloud, the preset
+// square, the planner viz — is in RTAB-Map's map frame. Control — the state
+// estimate, POS_SP, the tracked trajectory — is in OKVIS's world frame. RTAB-Map
+// publishes map->world as its drift correction, and the node hands it to the core
+// every tick (see the frame note on AutonomyCore). In USE_SIM_MODE there is no
+// RTAB-Map and the two are one frame.
+constexpr const char* kMapFrame = "map";
+constexpr const char* kWorldFrame = "world";
+
+// PRESET_WAYPOINTS one-shot preset (trajectory-generation + DFB controller test,
+// bypassing the planner). The waypoints themselves are written out literally in
+// firePresetSquare — edit the shape there, not here. Control is released back to
+// POS_SP once the preset completes.
+constexpr double kPresetMinAirborneZ = 0.8;   // reject a preset fired below this [m]
 
 // RTAB-Map publishes its octomap as a ColorOcTree (it stores voxel colour for
 // visualisation), but the core's map model — and DynamicEDTOctomap — needs a
@@ -76,6 +100,34 @@ std::shared_ptr<octomap::OcTree> toOcTree(const TreeT& in) {
   out->updateInnerOccupancy();
   return out;
 }
+
+// Burn a frontier point cloud into an OcTree as *occupied* voxels. The frontier
+// (RTAB-Map's octomap_global_frontier_space) is the shell of known-free voxels
+// that border unmapped space; stamping it occupied makes the planner's EDT treat
+// the edge of the known world as an obstacle, so paths stay inside explored-free
+// space instead of cutting through the unknown. Frontier cells are themselves
+// *free* voxels (negative log-odds), so a plain hit update would not necessarily
+// flip them — force the clamping-max occupied value so isNodeOccupied() is
+// unambiguous. lazy_eval defers the inner-node refresh to one final pass.
+// keep_out_r leaves a frontier-free ball of that radius around `drone` (the live
+// drone position) so a vehicle boxed in by unknown space can still root the
+// search; kept small (see kFrontierKeepOutRadius) so the surrounding frontier
+// margin reseals the gap and the planner can't route out into the unknown.
+void stampFrontierOccupied(octomap::OcTree& tree, const sensor_msgs::msg::PointCloud2& cloud,
+                           const octomap::point3d& drone, double keep_out_r) {
+  const float occ = tree.getClampingThresMaxLog();
+  const double r2 = keep_out_r * keep_out_r;
+  sensor_msgs::PointCloud2ConstIterator<float> ix(cloud, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> iy(cloud, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> iz(cloud, "z");
+  for (; ix != ix.end(); ++ix, ++iy, ++iz) {
+    if (!std::isfinite(*ix) || !std::isfinite(*iy) || !std::isfinite(*iz)) continue;
+    const octomap::point3d p(*ix, *iy, *iz);
+    if ((p - drone).norm_sq() <= r2) continue;  // start-escape carve-out
+    tree.setNodeValue(p, occ, /*lazy_eval=*/true);
+  }
+  tree.updateInnerOccupancy();
+}
 }  // namespace
 
 class AutonomyNode : public rclcpp::Node {
@@ -90,6 +142,11 @@ public:
       RCLCPP_INFO(get_logger(), "NORMAL MODE: using VIO (OKVIS2) for state estimation.");
     }
 
+    // TF before anything that can look a transform up (the control timer, the goal
+    // and octomap callbacks). The listener spins its own thread.
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
     core_ = std::make_unique<drone_core::autonomy::AutonomyCore>(configFromParameters());
     core_->setClock([this]() { return this->get_clock()->now().seconds(); });
     core_->startPlanner();
@@ -97,19 +154,46 @@ public:
     param_callback_ = add_on_set_parameters_callback(
         std::bind(&AutonomyNode::onParameterChange, this, std::placeholders::_1));
 
+    // Two mutually-exclusive callback groups, run by a MultiThreadedExecutor (see
+    // main). The FAST group carries the 50 Hz control tick and every estimator
+    // stream that feeds it; the SLOW group carries map ingest and debug
+    // visualisation, which block for 150-500 ms per octomap update. On the former
+    // single-threaded executor that map work sat in front of the control tick, so
+    // no odometry callback ran while it went on: the tick that followed saw all
+    // three estimator streams stale at the same instant and auto-landed the drone,
+    // while every one of them had in fact been publishing normally throughout.
+    //
+    // Both groups are MutuallyExclusive rather than Reentrant on purpose. A group
+    // never runs two of its own callbacks at once, so state reached only from the
+    // fast group (the estimator samples, the watchdog timestamps, all the control
+    // latches) keeps exactly the single-threaded semantics it had before and needs
+    // no locking at all. Only the handful of members genuinely read across the two
+    // groups is guarded -- see cross_mutex_.
+    cb_fast_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    cb_slow_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+    rclcpp::SubscriptionOptions fast_opts;
+    fast_opts.callback_group = cb_fast_;
+    rclcpp::SubscriptionOptions slow_opts;
+    slow_opts.callback_group = cb_slow_;
+
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
     auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
 
     sub_joy_ = create_subscription<sensor_msgs::msg::Joy>(
-        "/joy", 10, std::bind(&AutonomyNode::onJoy, this, std::placeholders::_1));
+        "/joy", 10, std::bind(&AutonomyNode::onJoy, this, std::placeholders::_1), fast_opts);
     sub_px4_odom_ = create_subscription<px4_msgs::msg::VehicleOdometry>(
-        "/fmu/out/vehicle_odometry", qos, std::bind(&AutonomyNode::onPx4Odom, this, std::placeholders::_1));
+        "/fmu/out/vehicle_odometry", qos, std::bind(&AutonomyNode::onPx4Odom, this, std::placeholders::_1),
+        fast_opts);
     sub_sensor_ = create_subscription<px4_msgs::msg::SensorCombined>(
-        "/fmu/out/sensor_combined", qos, std::bind(&AutonomyNode::onSensorCombined, this, std::placeholders::_1));
+        "/fmu/out/sensor_combined", qos, std::bind(&AutonomyNode::onSensorCombined, this, std::placeholders::_1),
+        fast_opts);
     sub_status_ = create_subscription<px4_msgs::msg::VehicleStatus>(
-        "/fmu/out/vehicle_status_v1", qos, std::bind(&AutonomyNode::onStatus, this, std::placeholders::_1));
+        "/fmu/out/vehicle_status_v1", qos, std::bind(&AutonomyNode::onStatus, this, std::placeholders::_1),
+        fast_opts);
     sub_vio_ = create_subscription<nav_msgs::msg::Odometry>(
-        "/okvis/okvis_odometry", 10, std::bind(&AutonomyNode::onVioOdom, this, std::placeholders::_1));
+        "/okvis/okvis_odometry", 10, std::bind(&AutonomyNode::onVioOdom, this, std::placeholders::_1),
+        fast_opts);
     // RTAB-Map publishes the assembled octomap only on map-graph updates (motion-gated)
     // but latches it TRANSIENT_LOCAL. A VOLATILE subscriber never receives that retained
     // sample, so on a static scene map_ would stay null and the planner would starve.
@@ -117,9 +201,17 @@ public:
     // updates. (Also compatible with octomap_server's latched publisher.)
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     sub_map_ = create_subscription<octomap_msgs::msg::Octomap>(
-        "/octomap_binary", map_qos, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1));
+        "/octomap_binary", map_qos, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1),
+        slow_opts);
+    // Frontier (known-free/unknown boundary) as a PointCloud2, latched like the
+    // octomap and published on the same motion-gated map updates. Cached and
+    // burned into each incoming octomap as occupied voxels (see onOctomap) when
+    // TREAT_FRONTIER_AS_OBSTACLE is on, so the planner won't route into unknown space.
+    sub_frontier_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        "/octomap_frontier", map_qos, std::bind(&AutonomyNode::onFrontier, this, std::placeholders::_1),
+        slow_opts);
     sub_goal_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/planner/goal", 10, std::bind(&AutonomyNode::onGoal, this, std::placeholders::_1));
+        "/planner/goal", 10, std::bind(&AutonomyNode::onGoal, this, std::placeholders::_1), fast_opts);
 
     pub_attitude_ = create_publisher<px4_msgs::msg::VehicleAttitudeSetpoint>(
         "/fmu/in/vehicle_attitude_setpoint_v1", 10);
@@ -131,9 +223,12 @@ public:
     pub_goal_marker_ = create_publisher<visualization_msgs::msg::Marker>("/planner/goal_marker", 10);
     pub_search_tree_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/search_tree", 10);
     pub_clearance_field_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/clearance_field", 10);
+    pub_occupancy_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/occupancy_map", 10);
+    pub_corridor_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/corridor", 10);
+    pub_pos_ff_marker_ = create_publisher<visualization_msgs::msg::Marker>("/control/pos_ff", 10);
 
-    control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this));
-    viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this));
+    control_timer_ = create_wall_timer(20ms, std::bind(&AutonomyNode::controlLoop, this), cb_fast_);
+    viz_timer_ = create_wall_timer(500ms, std::bind(&AutonomyNode::publishViz, this), cb_slow_);
 
     RCLCPP_INFO(get_logger(), "Autonomy node started.");
   }
@@ -145,20 +240,32 @@ public:
 private:
   void declareParameters() {
     declare_parameter<bool>("USE_SIM_MODE", false);
-    declare_parameter<bool>("ENABLE_FEEDFORWARD", false);
+    declare_parameter<bool>("ENABLE_FEEDFORWARD", true);
 
     declare_parameter("MPC_XY_P", 0.95);
     declare_parameter("MPC_Z_P", 1.0);
-    declare_parameter("MPC_XY_VEL_P", 1.8);
-    declare_parameter("MPC_XY_VEL_I", 0.4);
-    declare_parameter("MPC_XY_VEL_D", 0.2);
-    declare_parameter("MPC_Z_VEL_P", 2.0);
-    declare_parameter("MPC_Z_VEL_I", 0.5);
+    declare_parameter("MPC_XY_VEL_P", 2.0);
+    declare_parameter("MPC_XY_VEL_I", 0.9);
+    declare_parameter("MPC_XY_VEL_D", 0.5);
+    declare_parameter("MPC_Z_VEL_P", 2.6);
+    declare_parameter("MPC_Z_VEL_I", 0.8);
     declare_parameter("MPC_Z_VEL_D", 0.2);
-    declare_parameter("MPC_HOVER_THRUST", 0.35);
+    // Low-pass time constant on the D term [s]. The raw derivative is refreshed
+    // only when a new VIO/odom sample lands (~25 Hz), so this is what keeps the
+    // term smooth between measurements. Roughly one measurement period; raise it
+    // for less noise, lower it for less phase lag.
+    declare_parameter("MPC_VEL_D_TAU", 0.04);
+    // Position error [m] above which the velocity integrator is frozen (held,
+    // not reset), per horizontal (XY norm) and vertical axis. Stops a large move
+    // winding up the integrator and overshooting on arrival. <= 0 disables.
+    declare_parameter("MPC_INT_ERR_MAX", 0.2);
+    declare_parameter("MPC_HOVER_THRUST", 0.33);
 
-    declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.3});
-    declare_parameter("STALE_TIMEOUT", 0.5);
+    // Takeoff / hover setpoint. Held at 1.5 m to match the preset's altitude, so a
+    // PRESET_WAYPOINTS fire from this hover adds no altitude step to its first
+    // segment and the hand-back at completion is at the same height.
+    declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.5});
+    declare_parameter("STALE_TIMEOUT", 2.0);
     declare_parameter("SENSOR_TIMEOUT", 0.5);
     declare_parameter("SENSOR_WARMUP", 5.0);
     declare_parameter("RRT_MONITOR_PERIOD", 1.0);
@@ -169,19 +276,136 @@ private:
     // tunables live in geometric_planner.hpp (PlannerConfig).
     declare_parameter<std::string>("PLANNER_TYPE", "EITstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
-    declare_parameter("CLEARANCE_WEIGHT", 4.0);
+    declare_parameter("CLEARANCE_WEIGHT", 1.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
+    // Flat extra cost per metre of path routed through never-observed space.
+    // CLEARANCE_WEIGHT cannot do this job: the distance field saturates at
+    // CLEARANCE_THRESHOLD, so anything further than that from a mapped obstacle
+    // scores a proximity penalty of exactly zero — which is most of the unknown
+    // volume, plus everything outside the map's bounding box. Raise this if the
+    // planner still prefers leaving mapped space to detouring within it; set it
+    // to 0 for the old behaviour.
+    //
+    // Ignored entirely when TREAT_FRONTIER_AS_OBSTACLE is false, along with
+    // truncation's unobserved-space stop: that flag is the single switch for
+    // whether unmapped space is treated as a hazard at all.
+    //
+    // Keep this LOW. It defocuses the informed planners (BIT*/AIT*/EIT*), which
+    // sample only where ||start-x|| + ||x-goal|| <= best cost so far. Those are
+    // straight-line estimates that do not see this term, so raising the true
+    // cost without raising the estimate inflates the sampled region until it
+    // covers the whole state space and the search spreads everywhere. Measured
+    // with the goal beyond the frontier, fraction of tree nodes near the direct
+    // line: 0 -> 100%, 0.5 -> 91%, 1 -> 49%, 2 -> 17%, 10 -> 9%.
+    declare_parameter("UNKNOWN_WEIGHT", 0.5);
     declare_parameter("TRAJGEN_PERIOD", 1.0);
     // Geometry-first bring-up: with this false the planner only runs RRT* and
     // publishes the geometric path; it does not generate a trajectory or feed
     // the controller, which keeps following POS_SP. Flip to true to enable the
     // min-snap trajectory + tracking stage.
+    //
+    // Held FALSE for the PRESET_WAYPOINTS bring-up. The preset does not need it
+    // (runPreset sits at the top level of the worker loop, while this flag is
+    // checked inside the normal planning branch), and with it off the worker
+    // cannot stage a competing trajectory at all — which also keeps the takeoff
+    // ramp clear of the no-airborne-gate issue documented in CLAUDE.md. Set it
+    // back to true for planner-driven flights.
     declare_parameter("PLAN_TRAJECTORY", false);
+    // One-shot preset waypoints for isolating trajectory generation + the DFB
+    // controller from the planner. Flip false->true (airborne, hovering on POS_SP)
+    // to fly the shape hardcoded in firePresetSquare — as it stands a 2 m square
+    // centred on the current XY at 1.5 m; the node then sets it straight back to
+    // false — it is a momentary trigger, not a mode.
+    // The square is solved once (corridor QP) and flown rest-to-rest, after which
+    // control returns to POS_SP (pointed at the square's centre). See onParameterChange.
+    declare_parameter("PRESET_WAYPOINTS", false);
     // Single switch for the planner debug visualisation: publishes the RRT*
-    // search tree (/planner/search_tree) and the EDT clearance field
-    // (/planner/clearance_field). Off by default so regular flights pay nothing;
-    // flip true for a debugging/tuning run (live-reconfigurable).
+    // search tree (/planner/search_tree), the EDT clearance field
+    // (/planner/clearance_field) and the corridor stages (/planner/corridor).
+    // Normally off so regular flights pay nothing (live-reconfigurable).
+    //
+    // Held TRUE for the PRESET_WAYPOINTS bring-up: /planner/corridor is what
+    // separates a margin collapse from a failed validation from a QP
+    // infeasibility when a preset refuses to generate. Turn it off for a real
+    // flight so the NUC pays nothing for it.
     declare_parameter("DEBUG_PLANNER_VIZ", true);
+    // Single switch for the trajectory-tracking debug visualisation: publishes
+    // a sphere marker at pos_ff (/control/pos_ff), the reference point the
+    // controller is currently chasing on smooth_trajectory. Published from the
+    // 50 Hz control tick, so unlike the planner viz above it is NOT free when
+    // on — kept its own switch rather than folding into DEBUG_PLANNER_VIZ so
+    // toggling planner-search debugging doesn't silently add fast-path publish
+    // work. Held TRUE for the current trajectory-following bench tuning; turn
+    // it off for a real flight.
+    declare_parameter("DEBUG_CONTROL_VIZ", true);
+    // Treat frontier voxels (the known-free/unknown boundary from RTAB-Map's
+    // octomap_global_frontier_space) as obstacles, so the planner refuses to
+    // route through unmapped space and only flies through explored-free space.
+    // Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
+    // so with this on the drone is boxed in until it has mapped its surroundings
+    // (e.g. an initial 360deg scan) — flip it off for open-loop bench tests.
+    declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", false);
+    // Best-effort goal seeking. When true (default), a goal in unreachable or
+    // still-unmapped space no longer produces "no path": the planner routes to the
+    // reachable point closest to the goal (the frontier edge) and the worker keeps
+    // advancing that endpoint as new space is mapped and the frontier recedes, so
+    // the drone gets as close as it can and ratchets forward. Set false to make the
+    // planner insist on (near-)exact arrival and hold when the goal is unreachable.
+    // Live-reconfigurable.
+    declare_parameter("BEST_EFFORT_GOAL", true);
+    // Corridor-QP trajectory generation (Stage 1). When true, trajgen replaces
+    // plain min-snap with the safe-corridor pipeline: the geometric search runs
+    // on the raw (optimistic) map so goals beyond the mapped frontier are
+    // accepted, the committed path is truncated against the frontier-stamped
+    // conservative map (needs TREAT_FRONTIER_AS_OBSTACLE for the frontier to
+    // count), and the trajectory is a corridor-constrained min-snap QP that
+    // provably stays in known-free space within the per-axis limits below. Any
+    // stage failing stages nothing and the vehicle hovers rather than flying an
+    // obstacle-blind polynomial. Live-reconfigurable.
+    declare_parameter("USE_CORRIDOR_QP", true);
+    declare_parameter("VMAX", 1.0);   // per-axis velocity limit [m/s]
+    declare_parameter("AMAX", 1.5);   // per-axis acceleration limit [m/s^2]
+    declare_parameter("JMAX", 3.0);   // per-axis jerk limit [m/s^3]
+    // Clearance the committed trajectory must keep from unknown space [m];
+    // may exceed the 0.5 m collision margin (unknown is riskier than a wall).
+    declare_parameter("FRONTIER_MARGIN", 0.5);
+    // Clearance the corridor boxes keep from obstacles and unknown space [m].
+    // A strictly harder test than the planner's 0.5 m collision margin: the
+    // search only validates its centreline (and exempts a sphere at the start),
+    // while box growth needs this much room over a whole 3D region of the
+    // frontier-stamped map. So a path that only just passes the search can
+    // leave no room for a box, and this usually has to sit BELOW 0.5 for the
+    // corridor to be constructible in tight indoor space. Safety is not lost by
+    // lowering it — the trajectory is still provably confined to the boxes, so
+    // it keeps exactly this clearance from anything mapped or unknown.
+    declare_parameter("CORRIDOR_MARGIN", 0.4);
+    // Distance over which truncation's required clearance ramps from 0 at the
+    // drone up to the full FRONTIER_MARGIN [m]. Deliberately independent of the
+    // margin: ramping over the margin itself makes the requirement climb at
+    // 1 m/m, so on a thinly-mapped scene it meets the shrinking clearance within
+    // centimetres and the committed path collapses to nothing. Longer commits
+    // further before demanding full clearance; <= 0 disables the ramp.
+    declare_parameter("ESCAPE_RAMP_DIST", 1.0);
+    // Corridor resample cap: one free box is grown per path piece of at most
+    // this length [m].
+    declare_parameter("MAX_SEGMENT_LEN", 2.0);
+    // MINIMUM usable half-extents of the corridor region-growth window, in the
+    // SEGMENT-ALIGNED frame (0 = slack along the segment, 1/2 = lateral) — not
+    // world axes. Acts as a FLOOR on a window that is otherwise derived from
+    // the longest segment (lateral >= its length, along-track >= half of it),
+    // with the margin shrink added on top so the window planes never eat into
+    // the volume the trajectory can use.
+    //
+    // The default pins the floor at exactly what MAX_SEGMENT_LEN = 2.0 derives,
+    // so it changes nothing at the default settings but decouples the two knobs
+    // the moment MAX_SEGMENT_LEN is lowered. That matters: shortening segments
+    // is the right response to a convex region losing volume to one obstacle
+    // cutting across its whole length, but with a purely derived window it also
+    // narrows the window proportionally, and you give back in width what you
+    // gained in length. Raise a component to let regions grow wider than the
+    // segments themselves, at the cost of more obstacle points per
+    // decomposition. All zeros restores the purely derived behaviour.
+    declare_parameter<std::vector<double>>("CORRIDOR_BBOX", {1.0, 2.0, 2.0});
   }
 
   drone_core::autonomy::AutonomyCore::Config configFromParameters() {
@@ -201,6 +425,8 @@ private:
     const double xy_vd = get_parameter("MPC_XY_VEL_D").as_double();
     const double z_vd = get_parameter("MPC_Z_VEL_D").as_double();
     cfg.vel_d = Eigen::Vector3d(xy_vd, xy_vd, z_vd);
+    cfg.vel_d_tau = get_parameter("MPC_VEL_D_TAU").as_double();
+    cfg.int_err_limit = get_parameter("MPC_INT_ERR_MAX").as_double();
 
     cfg.hover_thrust = get_parameter("MPC_HOVER_THRUST").as_double();
     cfg.enable_feedforward = get_parameter("ENABLE_FEEDFORWARD").as_bool();
@@ -216,13 +442,49 @@ private:
     cfg.replan_improve_ratio = get_parameter("REPLAN_IMPROVE_RATIO").as_double();
     cfg.clearance_weight = get_parameter("CLEARANCE_WEIGHT").as_double();
     cfg.clearance_threshold = get_parameter("CLEARANCE_THRESHOLD").as_double();
+    cfg.unknown_weight = get_parameter("UNKNOWN_WEIGHT").as_double();
+    // Whether unmapped space is a hazard at all — drives the cost surcharge and
+    // truncation's refusal to commit into unobserved cells. Passed as its own
+    // flag rather than left for the core to infer from the presence of a
+    // conservative map view: that view only exists once a frontier cloud has
+    // arrived, and both guards work off the raw octree without one.
+    cfg.treat_unknown_as_hazard = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
     cfg.trajgen_period = get_parameter("TRAJGEN_PERIOD").as_double();
     cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
     cfg.debug_planner_viz = get_parameter("DEBUG_PLANNER_VIZ").as_bool();
+    cfg.best_effort_goal = get_parameter("BEST_EFFORT_GOAL").as_bool();
+    // With RTAB-Map correcting its map separately from OKVIS, planning without the
+    // map->world transform would put obstacles off by that correction, so the core
+    // must wait for it. In sim the map and the state share one frame.
+    cfg.require_map_to_world = !get_parameter("USE_SIM_MODE").as_bool();
+    cfg.use_corridor_qp = get_parameter("USE_CORRIDOR_QP").as_bool();
+    cfg.vmax = get_parameter("VMAX").as_double();
+    cfg.amax = get_parameter("AMAX").as_double();
+    cfg.jmax = get_parameter("JMAX").as_double();
+    cfg.frontier_margin = get_parameter("FRONTIER_MARGIN").as_double();
+    cfg.corridor_margin = get_parameter("CORRIDOR_MARGIN").as_double();
+    cfg.escape_ramp_dist = get_parameter("ESCAPE_RAMP_DIST").as_double();
+    cfg.max_segment_len = get_parameter("MAX_SEGMENT_LEN").as_double();
+    const auto bbox = get_parameter("CORRIDOR_BBOX").as_double_array();
+    if (bbox.size() == 3) {
+      cfg.corridor_bbox = Eigen::Vector3d(bbox[0], bbox[1], bbox[2]);
+    } else {
+      RCLCPP_WARN(get_logger(), "CORRIDOR_BBOX needs 3 elements, got %zu; keeping default.",
+                  bbox.size());
+    }
     return cfg;
   }
 
-  rcl_interfaces::msg::SetParametersResult onParameterChange(const std::vector<rclcpp::Parameter>&) {
+  rcl_interfaces::msg::SetParametersResult onParameterChange(
+      const std::vector<rclcpp::Parameter>& params) {
+    // A false->true edge on PRESET_WAYPOINTS is a momentary fire request. Only
+    // latch a flag here (on the executor thread); the actual capture-and-fire runs
+    // in the control tick, where a fresh state estimate is in hand and we know the
+    // vehicle is armed, offboard and airborne. The tick sets the parameter back to
+    // false once consumed.
+    for (const auto& p : params) {
+      if (p.get_name() == "PRESET_WAYPOINTS" && p.as_bool()) preset_fire_requested_ = true;
+    }
     // The control loop reads parameters live, so just push a refreshed config.
     if (core_) core_->applyConfig(configFromParameters());
     rcl_interfaces::msg::SetParametersResult result;
@@ -270,14 +532,28 @@ private:
     const Eigen::Vector3d vel_ned(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
     const Eigen::Quaterniond q(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
 
-    px4_pos_enu_ = drone_core::frames::pxNedToEnu(pos_ned);
+    // Only the POSITION is guarded: it is the one member of this callback that the
+    // slow group reads (onOctomap, as the frontier keep-out centre). Everything
+    // else here is written and read entirely within the fast group, which is
+    // mutually exclusive, so it needs no lock. The fast group's own reads of
+    // px4_pos_enu_ (in controlLoop) are likewise unguarded — they cannot run
+    // concurrently with this writer, and a reader racing another reader is fine.
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      px4_pos_enu_ = drone_core::frames::pxNedToEnu(pos_ned);
+    }
     px4_vel_enu_ = drone_core::frames::pxNedToEnu(vel_ned);
     yaw_px4_enu_ = drone_core::frames::pxAttitudeToEnuYaw(q);
     t_px4_odom_ = get_clock()->now().seconds();
   }
 
   void onVioOdom(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    vio_pos_enu_ = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    {
+      // Guarded for the same reason as px4_pos_enu_ in onPx4Odom above.
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      vio_pos_enu_ =
+          Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+    }
     const Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                                msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
     const Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
@@ -287,10 +563,29 @@ private:
   }
 
   void onSensorCombined(const px4_msgs::msg::SensorCombined::SharedPtr msg) {
-    Eigen::Vector3d acc_ned(msg->accelerometer_m_s2[0], msg->accelerometer_m_s2[1], msg->accelerometer_m_s2[2]);
-    acc_enu_ = drone_core::frames::pxNedToEnu(acc_ned);
-    acc_enu_.z() -= 9.81;  // remove gravity to recover dynamic acceleration
+    // accelerometer_m_s2 is specific force in the FRD *body* frame, so no frame
+    // conversion applies here. pxNedToEnu is an axis relabel defined for world
+    // vectors; feeding it a body vector was only ever right by coincidence.
+    // Body z points down and thrust pushes up, hence the negation. The result is
+    // thrust per unit mass along the vehicle's own up axis (9.81 in hover), which
+    // is the whole of what a quadrotor's accelerometer can report — see the note
+    // on drone_core::common::State::thrust_accel.
+    //
+    // Accumulated, not overwritten: this arrives at ~100 Hz against the 50 Hz
+    // control tick, and keeping only the newest sample would fold the vibration
+    // above the tick's Nyquist into slow error. controlLoop folds the sum into
+    // thrust_accel_ once per tick. Same (mutually exclusive) fast group as the
+    // tick, so no lock.
+    accel_sum_ += -msg->accelerometer_m_s2[2];
+    ++accel_count_;
     t_sensor_ = get_clock()->now().seconds();
+  }
+
+  void onFrontier(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    // Just cache the latest frontier cloud; it is applied when the next octomap
+    // arrives (onOctomap). Both callbacks are in the slow group, which is mutually
+    // exclusive, so they never run concurrently and no lock is needed.
+    frontier_cloud_ = msg;
   }
 
   void onOctomap(const octomap_msgs::msg::Octomap::SharedPtr msg) {
@@ -317,18 +612,185 @@ private:
       return;
     }
 
+    // Dual-map feed. The raw map is the core's OPTIMISTIC view (unknown reads
+    // as free — what the corridor pipeline's geometric search runs on so goals
+    // beyond the frontier are accepted). When frontier treatment is on, a
+    // stamped deep copy becomes the CONSERVATIVE view (frontier voxels read as
+    // occupied) used for truncation, corridor growth — and, with the corridor
+    // QP off, as the legacy single search map. Read live (map rate is sparse),
+    // matching the loop's live-parameter pattern; before the first frontier
+    // cloud arrives only the raw map is fed.
+    std::shared_ptr<octomap::OcTree> conservative;
+    const bool want_frontier = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
+    if (want_frontier && frontier_cloud_) {
+      // Snapshot the drone position under the lock rather than referencing it: this
+      // is the slow group reading a member the fast group's odometry callbacks
+      // write, and the copy below takes long enough that a reference could be
+      // rewritten underneath us mid-use.
+      Eigen::Vector3d p;
+      {
+        std::lock_guard<std::mutex> lock(cross_mutex_);
+        p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
+      }
+      // The octree and the frontier cloud are map-frame, and the drone position is
+      // world-frame, so the keep-out ball has to be centred on the drone expressed in
+      // map. Without a transform it stays unconverted, but planning is paused then
+      // anyway (the core requires one).
+      Eigen::Isometry3d world_from_map;
+      if (lookupWorldFromMap(world_from_map)) p = world_from_map.inverse() * p;
+      conservative = std::make_shared<octomap::OcTree>(*map);
+      stampFrontierOccupied(*conservative, *frontier_cloud_,
+                            octomap::point3d(p.x(), p.y(), p.z()),
+                            drone_core::planning::GeometricPlanner::frontierKeepOutRadius());
+    } else if (want_frontier) {
+      // Asked for but not available: no shell is stamped, so the search gets no
+      // gradient steering it away from the frontier and the corridor's regions
+      // are bounded only by real obstacles. The octree-based guards (the cost
+      // surcharge and truncation's unobserved-space stop) still hold, so this is
+      // a degradation rather than a hole — but it is invisible from the plan
+      // log, which is why it is said out loud. Names the resolved topic and its
+      // publisher count so "wrong remap" and "RTAB-Map is not publishing it" are
+      // distinguishable.
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "TREAT_FRONTIER_AS_OBSTACLE is on but no frontier cloud has arrived on '%s' "
+          "(%zu publishers) - no frontier shell is being stamped",
+          sub_frontier_->get_topic_name(),
+          count_publishers(sub_frontier_->get_topic_name()));
+    }
+
     // One-time confirmation the core is actually being fed a map (and how dense).
     RCLCPP_INFO_ONCE(get_logger(), "First octomap received: %zu nodes", map->size());
-    core_->setMap(map);
+    got_octomap_ = true;
+    core_->setMap(map, conservative);
+    publishOccupancyMap(conservative ? *conservative : *map);
   }
 
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+    // The core plans goals in the map frame, which stays attached to the room as
+    // RTAB-Map corrects. A goal given in world is converted once, here, so it is
+    // fixed in map from then on; an empty frame_id is taken as map.
+    const std::string frame = msg->header.frame_id.empty() ? kMapFrame : msg->header.frame_id;
+    Eigen::Vector3d p(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    if (frame == kWorldFrame) {
+      Eigen::Isometry3d world_from_map;
+      if (!lookupWorldFromMap(world_from_map)) {
+        RCLCPP_WARN(get_logger(), "Goal in '%s' ignored: no %s->%s transform yet (is RTAB-Map running?).",
+                    kWorldFrame, kMapFrame, kWorldFrame);
+        return;
+      }
+      p = world_from_map.inverse() * p;
+    } else if (frame != kMapFrame) {
+      RCLCPP_WARN(get_logger(), "Goal ignored: frame '%s' is not supported, use '%s' or '%s'.",
+                  frame.c_str(), kMapFrame, kWorldFrame);
+      return;
+    }
     drone_core::common::Goal goal;
-    goal.pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    goal.pos = p;
     core_->setGoal(goal);
-    goal_pos_ = goal.pos;
-    has_goal_ = true;
-    RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f, %.2f)", goal.pos.x(), goal.pos.y(), goal.pos.z());
+    {
+      // Marker state only: written here and in firePresetSquare (fast group), read
+      // by publishGoalMarker on the viz timer (slow group).
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      goal_pos_ = goal.pos;
+      has_goal_ = true;
+    }
+    RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f, %.2f) in %s (given in %s)", goal.pos.x(),
+                goal.pos.y(), goal.pos.z(), kMapFrame, frame.c_str());
+  }
+
+  // Build and fire the one-shot preset square, centred on the drone's current XY
+  // at kPresetAltitude. Called from the control tick with a fresh `state`. The
+  // parameter is reverted to false regardless of outcome (momentary trigger).
+  //
+  // In flight (controller_running_) it rejects a ground fire — that would pre-empt
+  // the takeoff ramp — and points POS_SP at the square's centre so control lands
+  // cleanly back on it when the square completes. On the bench (not controlling)
+  // neither applies: the fire is allowed on the ground for a generation-only test,
+  // and POS_SP is left untouched since there is no hand-back.
+  void firePresetSquare(const drone_core::common::State& state) {
+    // Momentary trigger: revert the parameter whatever happens below.
+    set_parameter(rclcpp::Parameter("PRESET_WAYPOINTS", false));
+
+    const bool flying = controller_running_;
+    if (flying && state.pos.z() < kPresetMinAirborneZ) {
+      RCLCPP_WARN(get_logger(),
+                  "PRESET_WAYPOINTS ignored: airborne test but z=%.2f < %.2f m. Take off to a hover "
+                  "on POS_SP first, then flip it.",
+                  state.pos.z(), kPresetMinAirborneZ);
+      return;
+    }
+
+    // The square is planned in the map frame like everything else the corridor
+    // checks, so build it around the drone's position expressed there. POS_SP below
+    // stays in world: it is a control setpoint.
+    Eigen::Isometry3d world_from_map;
+    if (!lookupWorldFromMap(world_from_map)) {
+      RCLCPP_WARN(get_logger(),
+                  "PRESET_WAYPOINTS ignored: no %s->%s transform yet (is RTAB-Map running?).",
+                  kMapFrame, kWorldFrame);
+      return;
+    }
+    const Eigen::Vector3d c = world_from_map.inverse() * state.pos;
+    const double cx = c.x();
+    const double cy = c.y();
+    const double cz = c.z();
+
+    // The preset shape, one waypoint per line so it can be edited directly here:
+    // offsets [m] from the drone's XY at the flip, absolute map-frame altitude. As it
+    // stands, centre first, round the four corners of a 2 m square once, back to
+    // centre — ends where it started (rest-to-rest) and visits each corner once,
+    // which is clean for the corridor QP. Keep the first and last points equal if
+    // you want that rest-to-rest property; the first is also where control is
+    // handed back to POS_SP (below).
+    const std::vector<Eigen::Vector3d> square = {
+        {cx, cy, cz},
+        {cx + 0.5, cy, 1.3},
+        {cx + 1.5, cy + 0.5, 2.0},
+        {cx + 2.5, cy + 0.0, 1.3},
+    };
+
+    if (flying) {
+      // Point POS_SP at the preset's first waypoint — where a rest-to-rest shape
+      // also ends — so the kDirect hand-back at completion is continuous (no
+      // reposition). Read off the list rather than restated, so editing the
+      // waypoints above keeps the hand-back correct, and converted to world since
+      // POS_SP is a control setpoint. Skipped on the bench: no hand-back happens
+      // there, so don't silently move the operator's POS_SP.
+      const Eigen::Vector3d home = world_from_map * square.front();
+      set_parameter(
+          rclcpp::Parameter("POS_SP", std::vector<double>{home.x(), home.y(), home.z()}));
+    }
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      has_goal_ = false;  // stop drawing any old goal marker
+    }
+
+    core_->firePreset(square);
+    RCLCPP_INFO(get_logger(),
+                "PRESET_WAYPOINTS fired: %zu waypoints from (%.2f, %.2f, %.2f) in %s [%s].",
+                square.size(), square.front().x(), square.front().y(), square.front().z(),
+                kMapFrame, flying ? "in flight; POS_SP moved to the first waypoint, returns to POS_SP "
+                         "when done"
+                       : "bench: generation only, not flying");
+  }
+
+  // map->world (p_world = world_from_map * p_map): RTAB-Map's current drift
+  // correction, latest available. Identity in sim, where there is no RTAB-Map and
+  // the map and the state share one frame. False until TF has delivered it.
+  // Safe from any callback group: tf2_ros::Buffer is thread-safe.
+  bool lookupWorldFromMap(Eigen::Isometry3d& world_from_map) {
+    if (use_sim_mode_) {
+      world_from_map = Eigen::Isometry3d::Identity();
+      return true;
+    }
+    try {
+      world_from_map = tf2::transformToEigen(
+          tf_buffer_->lookupTransform(kWorldFrame, kMapFrame, tf2::TimePointZero));
+      return true;
+    } catch (const tf2::TransformException&) {
+      return false;
+    }
   }
 
   // --- Control loop --------------------------------------------------------
@@ -347,6 +809,33 @@ private:
     return streamHealthy(t_px4_odom_, now, timeout) &&
            streamHealthy(t_sensor_, now, timeout) &&
            streamHealthy(t_vio_odom_, now, timeout);
+  }
+
+  // Names every required stream that is currently unhealthy, with its topic and
+  // how long it has been silent (or "never received"). Without this the timeout
+  // report says only that *something* went quiet, and the three streams point at
+  // completely different faults: px4_odom/sensor_combined at the uXRCE-DDS link or
+  // the flight controller, vio_odom at OKVIS losing tracking. Returns "none" when
+  // everything is healthy, so the string is safe to log unconditionally.
+  std::string staleStreamReport(double now, double timeout) const {
+    std::string out;
+    const auto add = [&](const char* name, const char* topic, double t) {
+      if (streamHealthy(t, now, timeout)) return;
+      if (!out.empty()) out += ", ";
+      char buf[128];
+      if (t <= 0.0) {
+        std::snprintf(buf, sizeof(buf), "%s [%s]: never received", name, topic);
+      } else {
+        std::snprintf(buf, sizeof(buf), "%s [%s]: silent %.2fs", name, topic, now - t);
+      }
+      out += buf;
+    };
+    add("px4_odom", "/fmu/out/vehicle_odometry", t_px4_odom_);
+    if (!use_sim_mode_) {
+      add("sensor_combined", "/fmu/out/sensor_combined", t_sensor_);
+      add("vio_odom", "/okvis/okvis_odometry", t_vio_odom_);
+    }
+    return out.empty() ? "none" : out;
   }
 
   void controlLoop() {
@@ -384,6 +873,14 @@ private:
     const bool position_fresh = use_sim_mode_
         ? streamHealthy(t_px4_odom_, now_s, sensor_timeout)
         : streamHealthy(t_vio_odom_, now_s, sensor_timeout);
+    // Mean of every accelerometer sample since the last tick (see onSensorCombined).
+    // Folded every tick, not only when position is fresh, so the window never
+    // spans more than one tick. No new sample: hold the previous mean.
+    if (accel_count_ > 0) {
+      thrust_accel_ = accel_sum_ / accel_count_;
+      accel_sum_ = 0.0;
+      accel_count_ = 0;
+    }
     drone_core::common::State state;
     double yaw_used = 0.0;
     if (position_fresh) {
@@ -396,10 +893,63 @@ private:
         state.vel = vio_vel_enu_;
         state.yaw = yaw_vio_enu_;
       }
-      state.acc = acc_enu_;
-      state.stamp = now_s;
+      state.thrust_accel = thrust_accel_;
+      // When the POSITION SAMPLE was taken, NOT the tick time. The estimate is
+      // re-sent every tick whether or not a new sample arrived, so this is the only
+      // thing that lets the D term tell a fresh measurement from a held one — see
+      // PositionControl::setStateStamp. Writing now_s here silently defeats that:
+      // the stamp advances every tick, so every tick looks fresh and the held ticks
+      // difference a velocity against itself, which is the zero-out this fixed.
+      // These are arrival times (set in the odom callbacks) rather than the sensor's
+      // own header stamp, so they stay in one clock domain across sim and flight.
+      state.stamp = use_sim_mode_ ? t_px4_odom_ : t_vio_odom_;
       yaw_used = state.yaw;
-      core_->setState(state);
+      core_->setVehicleState(state);
+    }
+
+    // RTAB-Map's map->world correction, for the planner. Pushed every tick because it
+    // changes in jumps; the core snapshots it once per planning cycle.
+    {
+      Eigen::Isometry3d world_from_map;
+      if (lookupWorldFromMap(world_from_map)) {
+        core_->setMapToWorld(world_from_map);
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                             "No %s->%s transform yet (is RTAB-Map running?) - planning and "
+                             "presets are paused until it arrives.",
+                             kMapFrame, kWorldFrame);
+      }
+    }
+
+    // Consume a pending PRESET_WAYPOINTS fire (momentary trigger). Deliberately
+    // ABOVE the warmup and arm/offboard gates below, and gated only on a fresh
+    // position: on the battery-off bench (VIO-only, flight controller unpowered)
+    // those gates never open, but the point there is to validate trajectory
+    // generation without flying. The airborne guard inside applies only while
+    // actively controlling, so a bench fire on the ground is allowed. A bench-fired
+    // trajectory is harmless — stepControl only runs armed+offboard, and reset() on
+    // the real engage clears it.
+    if (position_fresh && preset_fire_requested_.exchange(false)) {
+      firePresetSquare(state);
+    }
+
+    // Announce the warmup completing, exactly once per streak (rising edge of
+    // warmed_up). The throttled hold warning below simply stops printing when the
+    // gate opens, and silence is indistinguishable from a dead control loop — so
+    // the operator gets a positive "you may arm now" instead of an absence. Rearmed
+    // whenever health lapses (or an interruption resets the streak), so a re-engage
+    // announces again.
+    if (!warmed_up) {
+      warmup_announced_ = false;
+    } else if (!warmup_announced_) {
+      warmup_announced_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "Estimator streams px4=%d sensor=%d vio=%d. All healthy for %.1f/%.1fs, "
+                  "warmup complete. READY TO FLY (arm + offboard to engage).",
+                  streamHealthy(t_px4_odom_, now_s, sensor_timeout),
+                  streamHealthy(t_sensor_, now_s, sensor_timeout),
+                  streamHealthy(t_vio_odom_, now_s, sensor_timeout),
+                  now_s - all_healthy_since_, sensor_warmup);
     }
 
     // Pre-takeoff gate: refuse to engage until every required stream is healthy AND
@@ -459,8 +1009,8 @@ private:
     // below) so the engage transition itself never trips it.
     if (controller_running_ && !streams_healthy) {
       RCLCPP_ERROR(get_logger(),
-                   "SENSOR TIMEOUT (> %.2fs): estimator stream stale in flight -> commanding LAND",
-                   sensor_timeout);
+                   "SENSOR TIMEOUT (> %.2fs) in flight -> commanding LAND. Stale: %s",
+                   sensor_timeout, staleStreamReport(now_s, sensor_timeout).c_str());
       land();
       failsafe_landing_ = true;
       return;
@@ -508,13 +1058,20 @@ private:
     d.yaw = state.yaw;
     d.yaw_px4 = yaw_px4_enu_;
     d.vel.x = state.vel.x(); d.vel.y = state.vel.y(); d.vel.z = state.vel.z();
-    d.acc.x = state.acc.x(); d.acc.y = state.acc.y(); d.acc.z = state.acc.z();
+    d.thrust_accel = state.thrust_accel;
     const Eigen::Vector3d psp = c.getPositionSetpoint();
     d.pos_sp.x = psp.x(); d.pos_sp.y = psp.y(); d.pos_sp.z = psp.z();
     const Eigen::Vector3d vsp = c.getVelocitySetpoint();
     d.vel_sp.x = vsp.x(); d.vel_sp.y = vsp.y(); d.vel_sp.z = vsp.z();
     const Eigen::Vector3d asp = c.getAccelerationSetpoint();
     d.acc_sp.x = asp.x(); d.acc_sp.y = asp.y(); d.acc_sp.z = asp.z();
+    const Eigen::Vector3d perr = psp - state.pos;
+    d.pos_err.x = perr.x(); d.pos_err.y = perr.y(); d.pos_err.z = perr.z();
+    const Eigen::Vector3d pff = c.getPositionFeedforward();
+    const Eigen::Vector3d vff = c.getVelocityFeedforward();
+    d.vel_ff.x = vff.x(); d.vel_ff.y = vff.y(); d.vel_ff.z = vff.z();
+    const Eigen::Vector3d aff = c.getAccelerationFeedforward();
+    d.acc_ff.x = aff.x(); d.acc_ff.y = aff.y(); d.acc_ff.z = aff.z();
     d.thrust_cmd = c.getThrustSetpoint();
     d.hover_thrust = c.getHoverThrust();
     const Eigen::Vector3d p = c.getVelocityPTerm();
@@ -524,31 +1081,84 @@ private:
     const Eigen::Vector3d dd = c.getVelocityDTerm();
     d.pid_vel_d_term.x = dd.x(); d.pid_vel_d_term.y = dd.y(); d.pid_vel_d_term.z = dd.z();
     pub_debug_->publish(d);
+
+    if (get_parameter("DEBUG_CONTROL_VIZ").as_bool()) {
+      visualization_msgs::msg::Marker m;
+      // The controller's reference: world frame (map in sim, where they are one).
+      m.header.frame_id = use_sim_mode_ ? kMapFrame : kWorldFrame;
+      m.header.stamp = now();
+      m.ns = "pos_ff";
+      m.id = 0;
+      m.type = visualization_msgs::msg::Marker::SPHERE;
+      m.action = visualization_msgs::msg::Marker::ADD;
+      m.pose.position.x = pff.x();
+      m.pose.position.y = pff.y();
+      m.pose.position.z = pff.z();
+      m.pose.orientation.w = 1.0;
+      m.scale.x = m.scale.y = m.scale.z = 0.15;  // sphere diameter [m]
+      m.color.r = 0.1f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 1.0f;
+      pub_pos_ff_marker_->publish(m);
+    }
   }
 
   void publishViz() {
+    warnIfNoMap();
     publishGoalMarker();
     publishGeometricPath();
     publishPlannedPath();
     publishSearchTree();
     publishClearanceField();
+    publishCorridor();
+  }
+
+  // Until the first octomap arrives the planner cannot run at all (the core's
+  // worker idles), so say why rather than letting the node look healthy while
+  // nothing plans. The publisher count separates the two very different causes:
+  // zero publishers means the map source itself is not emitting — RTAB-Map only
+  // republishes its octomap on motion-gated map-graph updates, so it stays
+  // silent until the camera has moved AND odometry is good enough to add graph
+  // nodes. A non-zero count with nothing arriving instead points at the
+  // subscription (QoS or a wrong remap). Reports the resolved topic name, so a
+  // bad remap is visible directly. Stops entirely once a map has been received.
+  void warnIfNoMap() {
+    if (got_octomap_) return;
+    const char* topic = sub_map_->get_topic_name();
+    const size_t npub = count_publishers(topic);
+    RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "No octomap received yet on '%s' (%zu publisher(s)) — the planner cannot run "
+        "without a map. %s",
+        topic, npub,
+        npub == 0
+            ? "Nothing is publishing it: check RTAB-Map is up, and move the camera — "
+              "it only emits on map-graph updates, which need good odometry."
+            : "Someone is publishing but nothing arrives: suspect a QoS mismatch or "
+              "the wrong topic remap.");
   }
 
   // The active goal as a single sphere marker, so it renders as a point in RViz
   // regardless of display type (unlike the raw /planner/goal PoseStamped, which
   // RViz draws as an orientation arrow).
   void publishGoalMarker() {
-    if (!has_goal_) return;
+    // Snapshot both under one lock so the flag and the position it describes cannot
+    // disagree (a goal cleared between the two reads would otherwise draw a marker
+    // at a stale position).
+    Eigen::Vector3d goal_pos;
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      if (!has_goal_) return;
+      goal_pos = goal_pos_;
+    }
     visualization_msgs::msg::Marker m;
-    m.header.frame_id = "map";
+    m.header.frame_id = kMapFrame;
     m.header.stamp = now();
     m.ns = "goal";
     m.id = 0;
     m.type = visualization_msgs::msg::Marker::SPHERE;
     m.action = visualization_msgs::msg::Marker::ADD;
-    m.pose.position.x = goal_pos_.x();
-    m.pose.position.y = goal_pos_.y();
-    m.pose.position.z = goal_pos_.z();
+    m.pose.position.x = goal_pos.x();
+    m.pose.position.y = goal_pos.y();
+    m.pose.position.z = goal_pos.z();
     m.pose.orientation.w = 1.0;
     m.scale.x = m.scale.y = m.scale.z = 0.3;  // sphere diameter [m]
     m.color.r = 1.0f; m.color.g = 0.1f; m.color.b = 0.1f; m.color.a = 1.0f;
@@ -565,14 +1175,14 @@ private:
 
     // Clear stale markers first so an empty/failed plan removes the old path.
     visualization_msgs::msg::Marker clear;
-    clear.header.frame_id = "map";
+    clear.header.frame_id = kMapFrame;
     clear.header.stamp = now();
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
 
     if (wps.size() >= 2) {
       visualization_msgs::msg::Marker line;
-      line.header.frame_id = "map";
+      line.header.frame_id = kMapFrame;
       line.header.stamp = now();
       line.ns = "geometric_path";
       line.id = 0;
@@ -605,6 +1215,110 @@ private:
     pub_geom_path_->publish(arr);
   }
 
+  // Debug-only (gated by DEBUG_PLANNER_VIZ): the corridor-QP pipeline's
+  // intermediate products, in one MarkerArray on /planner/corridor:
+  //   - "boxes": the free axis-aligned boxes the trajectory is confined to, as
+  //     semi-transparent CUBEs (alpha 0.2) so the map and trajectory stay
+  //     readable through them;
+  //   - "committed": the TRUNCATED prefix as a white line strip. Where it stops
+  //     short of the green /planner/geometric_path is exactly where truncation
+  //     cut the optimistic path against unknown space;
+  //   - "committed_goal": an orange sphere at the truncation endpoint — the
+  //     intermediate goal inside known-safe space, which should ratchet toward
+  //     the red final goal marker as the drone maps more of the room.
+  // Empty when the corridor QP is off, when a tick truncates to nothing, or
+  // when corridor construction failed — in all of those the array is just the
+  // DELETEALL, which erases the previous drawing rather than leaving a stale
+  // corridor on screen. Returns before touching the core when the debug flag
+  // is off (the core does not populate the snapshot then either).
+  void publishCorridor() {
+    if (!get_parameter("DEBUG_PLANNER_VIZ").as_bool()) return;
+    const auto snap = core_->corridorSnapshot();
+
+    visualization_msgs::msg::MarkerArray arr;
+    visualization_msgs::msg::Marker clear;
+    clear.header.frame_id = kMapFrame;
+    clear.header.stamp = now();
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+
+    // Two overlays so a failed tick explains itself. RAW (grey) is what the
+    // decomposition produced before the margin; SHRUNK is the same regions
+    // after CORRIDOR_MARGIN was pulled off every face — cyan when the corridor
+    // was accepted, red when it was rejected. The usual failure is then
+    // obvious on sight: grey outlines present, coloured ones missing, means
+    // the margin collapsed the regions to nothing. Face outlines rather than
+    // filled hulls because regions overlap by construction and stacked
+    // translucent solids turn to mush.
+    const auto drawRegions = [&](const std::vector<drone_core::planning::ConvexRegion>& regions,
+                                 const char* ns, float r, float g, float b, float a,
+                                 double width, int& id) {
+      for (const auto& region : regions) {
+        for (const auto& loop : drone_core::planning::regionFaceLoops(region)) {
+          if (loop.size() < 3) continue;
+          visualization_msgs::msg::Marker face;
+          face.header.frame_id = kMapFrame;
+          face.header.stamp = now();
+          face.ns = ns;
+          face.id = id++;
+          face.type = visualization_msgs::msg::Marker::LINE_STRIP;
+          face.action = visualization_msgs::msg::Marker::ADD;
+          face.pose.orientation.w = 1.0;
+          face.scale.x = width;
+          face.color.r = r; face.color.g = g; face.color.b = b; face.color.a = a;
+          for (const auto& v : loop) {
+            geometry_msgs::msg::Point p;
+            p.x = v.x(); p.y = v.y(); p.z = v.z();
+            face.points.push_back(p);
+          }
+          face.points.push_back(face.points.front());  // close the ring
+          arr.markers.push_back(face);
+        }
+      }
+    };
+
+    int raw_id = 0, shrunk_id = 0;
+    drawRegions(snap.raw, "regions_raw", 0.6f, 0.6f, 0.6f, 0.25f, 0.008, raw_id);
+    if (snap.accepted) {
+      drawRegions(snap.shrunk, "regions", 0.2f, 0.8f, 1.0f, 0.45f, 0.014, shrunk_id);
+    } else {
+      drawRegions(snap.shrunk, "regions", 1.0f, 0.2f, 0.2f, 0.55f, 0.014, shrunk_id);
+    }
+
+    if (snap.committed.size() >= 2) {
+      visualization_msgs::msg::Marker line;
+      line.header.frame_id = kMapFrame;
+      line.header.stamp = now();
+      line.ns = "committed";
+      line.id = 0;
+      line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      line.action = visualization_msgs::msg::Marker::ADD;
+      line.pose.orientation.w = 1.0;
+      line.scale.x = 0.04;  // line width [m]
+      line.color.r = 1.0f; line.color.g = 1.0f; line.color.b = 1.0f; line.color.a = 0.9f;
+      for (const auto& w : snap.committed) {
+        geometry_msgs::msg::Point p;
+        p.x = w.x(); p.y = w.y(); p.z = w.z();
+        line.points.push_back(p);
+      }
+      arr.markers.push_back(line);
+
+      visualization_msgs::msg::Marker end;
+      end.header = line.header;
+      end.ns = "committed_goal";
+      end.id = 0;
+      end.type = visualization_msgs::msg::Marker::SPHERE;
+      end.action = visualization_msgs::msg::Marker::ADD;
+      end.pose.position = line.points.back();
+      end.pose.orientation.w = 1.0;
+      end.scale.x = end.scale.y = end.scale.z = 0.25;  // sphere diameter [m]
+      end.color.r = 1.0f; end.color.g = 0.6f; end.color.b = 0.0f; end.color.a = 1.0f;
+      arr.markers.push_back(end);
+    }
+
+    pub_corridor_->publish(arr);
+  }
+
   // Debug-only (gated by DEBUG_PLANNER_VIZ): the search tree from the most recent
   // solve as a MarkerArray — a faint LINE_LIST of edges plus small POINTS for the
   // nodes. Lets you watch where the planner explored and A/B PLANNER_TYPE /
@@ -615,14 +1329,14 @@ private:
 
     visualization_msgs::msg::MarkerArray arr;
     visualization_msgs::msg::Marker clear;
-    clear.header.frame_id = "map";
+    clear.header.frame_id = kMapFrame;
     clear.header.stamp = now();
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
 
     if (!tree.nodes.empty()) {
       visualization_msgs::msg::Marker edges;
-      edges.header.frame_id = "map";
+      edges.header.frame_id = kMapFrame;
       edges.header.stamp = now();
       edges.ns = "search_tree";
       edges.id = 0;
@@ -673,7 +1387,7 @@ private:
     if (samples.empty()) return;
 
     sensor_msgs::msg::PointCloud2 cloud;
-    cloud.header.frame_id = "map";
+    cloud.header.frame_id = kMapFrame;
     cloud.header.stamp = now();
     cloud.height = 1;
     cloud.is_dense = true;
@@ -701,12 +1415,48 @@ private:
     pub_clearance_field_->publish(cloud);
   }
 
+  // Publishes exactly what the safety side of the pipeline sees as an obstacle:
+  // every occupied leaf of the conservative map handed to core_->setMap() (the
+  // raw octomap plus, when TREAT_FRONTIER_AS_OBSTACLE is on, the frontier
+  // voxels stamped occupied in onOctomap; the raw map alone otherwise). Not
+  // gated by DEBUG_PLANNER_VIZ — it fires once per octomap
+  // update (sparse, motion-gated), not per control tick, so it costs nothing on
+  // the flight-critical path.
+  void publishOccupancyMap(const octomap::OcTree& map) {
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.frame_id = kMapFrame;
+    cloud.header.stamp = now();
+    cloud.height = 1;
+    cloud.is_dense = true;
+    cloud.is_bigendian = false;
+
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2FieldsByString(1, "xyz");
+    mod.resize(map.size());
+
+    sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iy(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iz(cloud, "z");
+    std::size_t n = 0;
+    for (auto it = map.begin_leafs(), end = map.end_leafs(); it != end; ++it) {
+      if (!map.isNodeOccupied(*it)) continue;
+      *ix = static_cast<float>(it.getX());
+      *iy = static_cast<float>(it.getY());
+      *iz = static_cast<float>(it.getZ());
+      ++ix; ++iy; ++iz;
+      ++n;
+    }
+    mod.resize(n);
+    pub_occupancy_map_->publish(cloud);
+  }
+
   void publishPlannedPath() {
     const auto sampled = core_->sampledPlannedPath();
     if (sampled.empty()) return;
     nav_msgs::msg::Path path;
     path.header.stamp = now();
-    path.header.frame_id = "map";
+    // The trajectory as handed to the tracker: world frame (map in sim).
+    path.header.frame_id = use_sim_mode_ ? kMapFrame : kWorldFrame;
     for (const auto& p : sampled) {
       geometry_msgs::msg::PoseStamped pose;
       pose.header = path.header;
@@ -721,7 +1471,23 @@ private:
   // --- Members -------------------------------------------------------------
 
   std::unique_ptr<drone_core::autonomy::AutonomyCore> core_;
+  // TF, for RTAB-Map's map->world correction (lookupWorldFromMap). Set once in the
+  // constructor before any callback can run; the buffer is thread-safe.
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   OnSetParametersCallbackHandle::SharedPtr param_callback_;
+
+  // Fast group: control tick + estimator streams. Slow group: map ingest + viz.
+  // See the constructor for why the split exists and what it does to locking.
+  rclcpp::CallbackGroup::SharedPtr cb_fast_;
+  rclcpp::CallbackGroup::SharedPtr cb_slow_;
+
+  // Guards ONLY the members read across the two callback groups: px4_pos_enu_ /
+  // vio_pos_enu_ (fast writes, onOctomap reads) and goal_pos_ / has_goal_ (fast
+  // writes, publishGoalMarker reads). Deliberately not a general node lock —
+  // everything else stays inside one group and needs no synchronisation. Never
+  // held across anything slow, so it cannot delay the control tick.
+  std::mutex cross_mutex_;
 
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_joy_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr sub_px4_odom_;
@@ -729,7 +1495,15 @@ private:
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr sub_status_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_vio_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr sub_map_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_frontier_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_goal_;
+
+  // Latest frontier cloud (octomap_global_frontier_space), applied to each
+  // incoming octomap in onOctomap. Null until the first frontier arrives.
+  sensor_msgs::msg::PointCloud2::SharedPtr frontier_cloud_;
+  // Written by onOctomap, read by warnIfNoMap on the viz timer — both slow group,
+  // so unguarded like frontier_cloud_ above.
+  bool got_octomap_{false};  // has onOctomap ever fired? (see warnIfNoMap)
 
   rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
   rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_;
@@ -740,11 +1514,18 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_goal_marker_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_search_tree_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_clearance_field_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_occupancy_map_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_corridor_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_pos_ff_marker_;
 
   rclcpp::TimerBase::SharedPtr control_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;
 
-  bool use_sim_mode_{false};
+  // Refreshed every control tick (fast group) and read by onOctomap (slow group)
+  // to pick which position source centres the frontier keep-out, so it crosses the
+  // groups. Atomic rather than under cross_mutex_ because it is a single bool with
+  // no invariant tying it to anything else.
+  std::atomic<bool> use_sim_mode_{false};
   px4_msgs::msg::VehicleStatus vehicle_status_;
   std::vector<int> last_buttons_;
 
@@ -752,7 +1533,11 @@ private:
   Eigen::Vector3d px4_vel_enu_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d vio_pos_enu_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d vio_vel_enu_{Eigen::Vector3d::Zero()};
-  Eigen::Vector3d acc_enu_{Eigen::Vector3d::Zero()};
+  // Thrust per unit mass along body up [m/s^2]; 9.81 = hover. NOT an acceleration.
+  double thrust_accel_{9.81};
+  // Accel samples accumulated between control ticks; see onSensorCombined.
+  double accel_sum_{0.0};
+  int accel_count_{0};
   double yaw_px4_enu_{0.0};
   double yaw_vio_enu_{0.0};
 
@@ -771,14 +1556,46 @@ private:
   // (fresh within SENSOR_TIMEOUT). Negative == not currently all-healthy. Drives
   // the pre-takeoff warmup gate; reset on any interruption.
   double all_healthy_since_{-1.0};
+  // Edge latch so the "warmup complete / READY TO FLY" line prints once per healthy
+  // streak instead of at 50 Hz. Cleared whenever the warmup gate closes again.
+  bool warmup_announced_{false};
 
   Eigen::Vector3d goal_pos_{Eigen::Vector3d::Zero()};
   bool has_goal_{false};
+
+  // Set on a false->true edge of PRESET_WAYPOINTS (executor thread), consumed in
+  // the control tick. Atomic because the two run on different threads.
+  std::atomic<bool> preset_fire_requested_{false};
 };
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<AutonomyNode>());
+
+  // Bridge the ROS-free core's diagnostics into ROS logging so the planner /
+  // trajgen / preset lines reach /rosout (and thus the flight recording),
+  // instead of only the terminal. RCLCPP still prints to stderr, so the console
+  // is unchanged; this only adds the /rosout path. Set once, before the node (and
+  // its core worker thread) is constructed. To decouple from ROS again, delete
+  // this block — the core reverts to its std::cerr default on its own.
+  drone_core::setLogSink([](drone_core::LogLevel level, const std::string& msg) {
+    static const rclcpp::Logger logger = rclcpp::get_logger("drone_core");
+    if (level == drone_core::LogLevel::Error) {
+      RCLCPP_ERROR(logger, "%s", msg.c_str());
+    } else {
+      RCLCPP_INFO(logger, "%s", msg.c_str());
+    }
+  });
+
+  // Multi-threaded so the map ingest and the debug visualisation cannot stand in
+  // front of the 50 Hz control tick (see the callback groups in the constructor).
+  // Three threads is the most that can ever be busy: the fast group, the slow
+  // group, and the node's default group, which here holds only the parameter
+  // services. Both work groups are mutually exclusive, so neither re-enters itself
+  // and extra threads would only sit idle.
+  auto node = std::make_shared<AutonomyNode>();
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+  executor.add_node(node);
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }
