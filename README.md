@@ -594,7 +594,11 @@ trajectory staged: L m / T s` or `[preset] trajectory generation FAILED — stay
 core. On failure nothing is staged and the vehicle keeps hovering — there is no fallback to an
 unchecked polynomial. Leaving offboard is the abort; there is no in-flight cancel.
 
-**Send a navigation goal** (`/planner/goal`, position only — yaw is ignored):
+**Send a navigation goal** (`/planner/goal`, position only — yaw is ignored). Goals are planned in
+RTAB-Map's `map` frame: `frame_id: map` (or empty) is used as is, `frame_id: world` (OKVIS
+coordinates) is converted to `map` once on arrival, anything else is rejected. Planning waits for
+RTAB-Map's `map→world` transform, so a goal sent before RTAB-Map is up logs `[plan] idle: … no
+map->world transform yet` until it arrives:
 ```bash
 ros2 topic pub --once /planner/goal geometry_msgs/msg/PoseStamped \
     "{header: {frame_id: map}, pose: {position: {x: 1.0, y: 1.0, z: 1.3}}}"

@@ -108,7 +108,7 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
   Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
   OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (fast, map-free corridor-QP checks
   against analytic oracles — run it with `ctest -R corridor` on every planning edit),
-  `goal_projection` (invalid-goal → nearest-valid-state projection; analytic clearance fields and
+  `rigid_transform` (the `map`↔`world` trajectory/state conversion, instant), `goal_projection` (invalid-goal → nearest-valid-state projection; analytic clearance fields and
   0.5 s solve budgets, ~3 s total, so it also runs on every planning edit),
   `unknown_cost` (unknown-space surcharge + truncation's hard stop; analytic predicates, ~0.5 s,
   also on every planning edit), `autonomy_core` (plan→track→watchdog).
@@ -577,6 +577,54 @@ corollaries: `preset_end_` is computed from the restamped `t0`, so a preset no l
 its own solve time; and the engaging-late log now fires only for splices, the only starts that can
 still be late.
 
+**Planning runs in `map`, control in `world` (fixed 2026-09-16, NOT yet flown).** RTAB-Map's `map`
+frame (the octomap, the frontier cloud) and OKVIS's `world` frame (the state estimate) only coincide
+while RTAB-Map's `map→world` drift correction is identity. The node used to use no TF and treat them
+as one frame; in the 2026-09-16 flight (`~/flight_logs/rosbag2_2026_09_16-10_56_44_recovered`) the
+correction was identity for ~35 s and then settled around **(−0.37, +0.02, −0.15) m with a ~2° tilt**,
+so every obstacle the planner, truncation and the corridor saw was ~37 cm off relative to the vehicle
+against a 0.4 m `CORRIDOR_MARGIN`. It was noticed because `/control/pos_ff` (stamped `map`, carrying
+`world` numbers) drifted ~37 cm in RViz while the vehicle held `POS_SP` correctly.
+
+How it works now — keep all of it, the parts depend on each other:
+- **Control stays in `world`.** State, `POS_SP`, the tracked trajectory. Do not switch the controller
+  to RTAB-Map's pose: RTAB-Map runs with `visual_odometry:=false` on `/okvis/okvis_odometry`, so its
+  pose *is* OKVIS plus a correction that arrives in jumps of tens of cm at ≤1 Hz, and feeding that to
+  the PID would make it lurch.
+- **Planning is in `map`.** Goals (`setGoal`), preset waypoints (`firePreset`), the search, truncation,
+  the corridor and the QP. The node looks up `world←map` from TF every control tick
+  (`lookupWorldFromMap`, identity in `USE_SIM_MODE`) and pushes it with `AutonomyCore::setMapToWorld`.
+- **One transform per planning cycle.** The worker snapshots it with the state, map and goal, converts
+  the vehicle position into `map` for the search start and the remaining-cost baseline, and converts
+  the solved trajectory back into `world` with the *same* snapshot (`stagePlanned`). A different
+  snapshot on the way out would move the trajectory's start off the splice point.
+- **The splice state is sampled in `world`, then converted.** `last_planned_` is stored in `world`
+  (it is what the tracker flies); `spliceAnchor` samples it there and converts the `MotionState` into
+  `map`. Sampling a `map`-frame copy would splice at wherever the map *used to* say the vehicle was.
+- **Trajectory conversion is exact** (`common/rigid_transform`): every coefficient vector is rotated
+  and the translation goes on the constant term only; velocity, acceleration and jerk take the
+  rotation only. The tilt matters — RTAB-Map's corrections carry a couple of degrees.
+- **No transform, no planning** when `Config::require_map_to_world` is set (the node sets it outside
+  sim): the worker logs `[plan] idle: … no map->world transform yet`, a preset fire is refused with its
+  own line, and the node warns (throttled) while TF has not delivered it. Assuming identity instead
+  would silently reintroduce the bug.
+- **Node details:** a goal on `/planner/goal` stamped `world` is converted to `map` once on arrival
+  (empty `frame_id` = `map`, anything else is rejected); the preset square is built around the drone's
+  `map` position, with the `POS_SP` hand-back converted back to `world`; the frontier keep-out ball is
+  centred on the drone's `map` position. `/control/pos_ff` and `/smooth_trajectory` are stamped
+  `world`; every planner/map/goal output stays `map`.
+
+Verified: `ctest -R rigid_transform` (trajectory, motion and state conversion against sampled ground
+truth, including a tilt), the frame block in `ctest -R autonomy_core` (no plan without a transform;
+trajectory starts at the world position and ends at the goal converted to world; a replan while
+tracking starts exactly on the outgoing world trajectory — mutation-checked: skipping the output
+conversion fails four checks, skipping the splice conversion fails exactly the splice check), and a
+bench replay of the 2026-09-16 bag from 60 s in, where a preset square's three map-frame corners landed
+3–4 cm from their correctly converted world positions and 42–68 cm from a reversed lookup. **What is
+still open:** a trajectory planned just before a correction lands is flown in `world` on the old map
+until the next replan (≤ `TRAJGEN_PERIOD`) — the same "tracked trajectory is not re-validated" gap as
+before.
+
 **Four known gaps in this area — read before flying tracked trajectories:**
 
 1. **No airborne gate: a trajectory can pre-empt the takeoff ramp.** The worker plans and stages
@@ -693,6 +741,9 @@ also straddling PX4's own 500 ms offboard-loss threshold. After the split, repla
   grow it into a general node lock.
 - `use_sim_mode_` is `std::atomic<bool>` (written every tick, read by `onOctomap`); a lone bool with
   no invariant tying it to anything else.
+- `tf_buffer_` (the `map→world` lookup) is read from both groups — the control tick, `onGoal` and
+  `onOctomap` — and needs no lock of ours: `tf2_ros::Buffer` is thread-safe, and the pointer is set
+  once in the constructor before any callback exists.
 - `AutonomyCore` is already fully internally locked (`io_mutex_` / `traj_mutex_`, both short-held)
   and was already being called from the planner worker thread, so `setMap` from the slow group
   alongside `setVehicleState`/`stepControl` from the fast group is safe as-is.
@@ -814,8 +865,9 @@ so the state it reads is always populated.
   LINE_STRIP + blue SPHERE_LIST, frame `map`. Populated even when `PLAN_TRAJECTORY=false`.
 - `/planner/goal_marker` (`visualization_msgs/Marker`) — red sphere at the active goal position.
   Published every viz tick so late-joining RViz sessions see it immediately.
-- `/smooth_trajectory` (`nav_msgs/Path`) — sampled min-snap trajectory. Dormant while
-  `PLAN_TRAJECTORY=false`.
+- `/smooth_trajectory` (`nav_msgs/Path`) — sampled trajectory as handed to the tracker, frame
+  **`world`** (the only planner output that is; see *Planning runs in `map`, control in `world`*).
+  Dormant while `PLAN_TRAJECTORY=false` unless a preset is playing.
 
 **Debug-only planner visualisation** (gated by `DEBUG_PLANNER_VIZ`, default off — see below). These
 publish nothing and cost nothing when the flag is off:
@@ -1120,10 +1172,11 @@ Required at runtime, referenced by path/command in the launch files:
   longer used — RTAB-Map publishes the octomap itself; see *Map source*.)
 - The OKVIS config (`ros2/third_party/okvis2/config/realsense_D435i.yaml`) and the cpu monitor are
   referenced by expanded `$HOME` paths in the launch files — update those paths if the workspace moves.
-- **Map-frame consistency (verify before flying planned trajectories)**: the octomap/RTAB-Map "map"
-  frame must share an origin with the controller's VIO-rooted ENU. The TF tree is patched by a
-  `body→camera_link` static transform (`--pitch -1.5708 --roll 1.5708`), now folded into
-  `autonomy_vision_launch.py` rather than run by hand.
+- **Map-frame consistency**: the octomap/RTAB-Map `map` frame and the controller's VIO-rooted `world`
+  frame are reconciled through RTAB-Map's `map→world` TF (see *Planning runs in `map`, control in
+  `world`*), so planning pauses until RTAB-Map publishes it. The TF tree also needs the
+  `body→camera_link` static transform (`--pitch -1.5708 --roll 1.5708`), folded into
+  `autonomy_vision_launch.py`.
 
 ### NUC resource constraints
 

@@ -7,6 +7,8 @@
 #include <thread>
 #include <vector>
 
+#include <Eigen/Geometry>
+
 #include "drone_core/common/types.hpp"
 #include "drone_core/control/trajectory_tracker.hpp"
 #include "drone_core/planning/corridor.hpp"
@@ -20,6 +22,16 @@ class DynamicEDTOctomapBase;
 
 namespace drone_core::autonomy {
 
+// Frames. Two frames meet in here and must not be mixed. Planning — the goal, the
+// geometric search, truncation, the corridor and the trajectory solve — works in
+// the MAP frame the occupancy map is built in, which RTAB-Map corrects for drift
+// in jumps. Control — the vehicle state, the direct setpoint and the tracked
+// trajectory — works in the WORLD frame of the state estimate (OKVIS), which is
+// smooth but drifts. The host supplies the transform between them
+// (setMapToWorld); the worker converts the vehicle state into the map frame on
+// the way into planning and the finished trajectory into the world frame on the
+// way out, both with the same snapshot. See rigid_transform.hpp.
+//
 // Top-level autonomy object. It owns the whole guidance-to-control pipeline and
 // runs it at three cadences: RRT* geometric replanning (slow) and minimum-snap
 // trajectory generation (mid) on a background worker thread, and the trajectory
@@ -135,6 +147,13 @@ public:
     // nothing: with it false the planner never extracts the OMPL tree and the
     // field is never sampled. Safe to flip live for a debugging run.
     bool debug_planner_viz{false};
+    // Refuse to plan until the host has supplied a map->world transform
+    // (setMapToWorld). A host with a SLAM map corrected separately from its state
+    // estimate must set this: assuming identity there is exactly the bug it
+    // prevents, obstacles offset from the vehicle by the SLAM correction. A host
+    // whose map and state share one frame (simulation, tests) leaves it false and
+    // gets identity.
+    bool require_map_to_world{false};
   };
 
   explicit AutonomyCore(const Config& config);
@@ -155,7 +174,13 @@ public:
   // reading as the same call obscured which layer a call site was talking to.
   // This one stores the whole snapshot; TrajectoryTracker::update is what
   // unpacks it down into the controller's narrower setters.
+  // WORLD frame.
   void setVehicleState(const common::State& state);
+  // The transform taking map-frame points into the world frame
+  // (p_world = world_from_map * p_map). Call whenever it changes; the worker
+  // snapshots it once per planning cycle. Until the first call the core plans
+  // with identity, or not at all when cfg.require_map_to_world is set.
+  void setMapToWorld(const Eigen::Isometry3d& world_from_map);
   // Feed the occupancy map(s) — the dual-map view of the corridor pipeline.
   // `map` is the raw (optimistic) map: unknown space reads as free, so the
   // geometric search can chase a goal beyond the mapped frontier (informed
@@ -169,13 +194,14 @@ public:
   // TREAT_FRONTIER_AS_OBSTACLE.
   void setMap(const planning::MapHandle& map,
               const planning::MapHandle& conservative = nullptr);
+  // MAP frame.
   void setGoal(const common::Goal& goal);
 
-  // Direct position/yaw setpoint for takeoff and manual hover. A fresh planner
+  // Direct position/yaw setpoint for takeoff and manual hover, WORLD frame. A fresh planner
   // trajectory (from setGoal) takes precedence over it.
   void setSetpoint(const Eigen::Vector3d& pos, double yaw);
 
-  // Fire a one-shot preset trajectory through `waypoints` (world/ENU), bypassing
+  // Fire a one-shot preset trajectory through `waypoints` (MAP frame), bypassing
   // the geometric planner entirely. The worker builds the corridor-QP trajectory
   // ONCE against the current map, splice-anchored at rest on the current state,
   // and stages it; it is then kept fresh for its whole duration (the control step
@@ -214,10 +240,12 @@ public:
   const control::PositionControl& controller() const { return tracker_.controller(); }
 
   // Sampled copy of the most recently planned trajectory, for visualisation.
+  // WORLD frame: this is the trajectory as handed to the tracker.
   std::vector<std::vector<double>> sampledPlannedPath(double sample_dt = 0.1) const;
 
   // Raw waypoints of the most recent RRT* geometric plan (start..goal), for
-  // visualisation. Independent of trajectory generation, so it is populated even
+  // visualisation, MAP frame (as are the search tree, clearance samples and
+  // corridor snapshot below). Independent of trajectory generation, so it is populated even
   // when plan_trajectory is false.
   std::vector<std::vector<double>> geometricPath() const;
 
@@ -296,14 +324,15 @@ private:
   // keep-alive (preset_active_/preset_end_) that stepControl uses to hold it for
   // its full duration. No-op with an empty map or fewer than two waypoints.
   // Worker thread only.
-  void runPreset(const common::State& state, const planning::MapHandle& map,
+  void runPreset(const common::State& state, const Eigen::Isometry3d& world_from_map,
+                 const planning::MapHandle& map,
                  const planning::MapHandle& conservative,
                  const std::vector<Eigen::Vector3d>& waypoints);
   void plannerLoop();
 
   // Where a replan must begin, so that engaging it does not step the reference.
   struct SpliceAnchor {
-    common::MotionState start;   // boundary condition handed to the optimiser
+    common::MotionState start;   // boundary condition handed to the optimiser, MAP frame
     double t0{0.0};              // wall-clock instant the new trajectory engages
     bool from_trajectory{false};  // false => fell back to rest at the measured position
   };
@@ -320,7 +349,15 @@ private:
   // trajectory to splice onto (first plan of a flight) or when the tracker has
   // stopped following the last one (stale -> hover-hold), since matching a curve
   // the vehicle is no longer on would command a jump. Worker thread only.
-  SpliceAnchor spliceAnchor(const common::State& state, double t_now) const;
+  //
+  // Frames: `state` is the WORLD-frame vehicle state and the outgoing trajectory
+  // is stored in the WORLD frame (it is what the tracker flies), so both are
+  // sampled there and the result converted into the MAP frame with this cycle's
+  // `world_from_map`. Sampling a map-frame copy instead would place the splice
+  // wherever the map said the vehicle was when that copy was planned, which is not
+  // where it is once a correction has landed since.
+  SpliceAnchor spliceAnchor(const common::State& state, double t_now,
+                            const Eigen::Isometry3d& world_from_map) const;
 
   // Re-anchor a solved trajectory's start time to after the solve, for a start
   // at rest only (anchor.from_trajectory false). The lead exists so a splice
@@ -332,6 +369,13 @@ private:
   // stepping the reference ahead of the vehicle. Call before stagePending, which
   // records the trajectory for later splices by absolute time.
   void restampRestStart(const SpliceAnchor& anchor, common::Trajectory& traj) const;
+
+  // Hand a MAP-frame trajectory to the tracker: convert it into the WORLD frame
+  // with the same `world_from_map` its inputs were converted with (a different
+  // snapshot would move its start off the splice point), re-anchor a rest start,
+  // and stage it. Returns the staged world-frame trajectory. Worker thread only.
+  common::Trajectory stagePlanned(const SpliceAnchor& anchor, const common::Trajectory& map_traj,
+                                  const Eigen::Isometry3d& world_from_map);
 
   // Configure `planner` with the shared clearance-aware objective used by BOTH
   // the monitor and improve passes, so a forced replan and an improvement
@@ -387,7 +431,9 @@ private:
   control::TrajectoryTracker tracker_;
 
   mutable std::mutex io_mutex_;
-  common::State state_;
+  common::State state_;                   // WORLD frame
+  Eigen::Isometry3d world_from_map_{Eigen::Isometry3d::Identity()};
+  bool has_map_to_world_{false};          // set by the first setMapToWorld
   planning::MapHandle map_;               // optimistic view (unknown = free)
   planning::MapHandle conservative_map_;  // frontier-stamped view; may be null
   common::Goal goal_;
@@ -411,7 +457,7 @@ private:
   mutable std::mutex traj_mutex_;
   common::Trajectory pending_;
   bool has_pending_{false};
-  common::Trajectory last_planned_;  // retained for visualisation and as the splice source
+  common::Trajectory last_planned_;  // WORLD frame; retained for visualisation and as the splice source
   double last_planned_at_{0.0};      // when it was staged, for the staleness check
   bool has_last_planned_{false};     // cleared on reset() — see spliceAnchor
   std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz

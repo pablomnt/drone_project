@@ -26,6 +26,11 @@
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
 
+#include <tf2/exceptions.h>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -51,6 +56,15 @@ using namespace std::chrono_literals;
 namespace {
 constexpr double kControlDt = 0.02;       // 50 Hz
 constexpr double kDefaultYaw = M_PI_2;    // ENU heading for direct/hover setpoints
+
+// Frame names. Planning — goals, the octomap and frontier cloud, the preset
+// square, the planner viz — is in RTAB-Map's map frame. Control — the state
+// estimate, POS_SP, the tracked trajectory — is in OKVIS's world frame. RTAB-Map
+// publishes map->world as its drift correction, and the node hands it to the core
+// every tick (see the frame note on AutonomyCore). In USE_SIM_MODE there is no
+// RTAB-Map and the two are one frame.
+constexpr const char* kMapFrame = "map";
+constexpr const char* kWorldFrame = "world";
 
 // PRESET_WAYPOINTS one-shot preset (trajectory-generation + DFB controller test,
 // bypassing the planner). The waypoints themselves are written out literally in
@@ -127,6 +141,11 @@ public:
     } else {
       RCLCPP_INFO(get_logger(), "NORMAL MODE: using VIO (OKVIS2) for state estimation.");
     }
+
+    // TF before anything that can look a transform up (the control timer, the goal
+    // and octomap callbacks). The listener spins its own thread.
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     core_ = std::make_unique<drone_core::autonomy::AutonomyCore>(configFromParameters());
     core_->setClock([this]() { return this->get_clock()->now().seconds(); });
@@ -434,6 +453,10 @@ private:
     cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
     cfg.debug_planner_viz = get_parameter("DEBUG_PLANNER_VIZ").as_bool();
     cfg.best_effort_goal = get_parameter("BEST_EFFORT_GOAL").as_bool();
+    // With RTAB-Map correcting its map separately from OKVIS, planning without the
+    // map->world transform would put obstacles off by that correction, so the core
+    // must wait for it. In sim the map and the state share one frame.
+    cfg.require_map_to_world = !get_parameter("USE_SIM_MODE").as_bool();
     cfg.use_corridor_qp = get_parameter("USE_CORRIDOR_QP").as_bool();
     cfg.vmax = get_parameter("VMAX").as_double();
     cfg.amax = get_parameter("AMAX").as_double();
@@ -609,6 +632,12 @@ private:
         std::lock_guard<std::mutex> lock(cross_mutex_);
         p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
       }
+      // The octree and the frontier cloud are map-frame, and the drone position is
+      // world-frame, so the keep-out ball has to be centred on the drone expressed in
+      // map. Without a transform it stays unconverted, but planning is paused then
+      // anyway (the core requires one).
+      Eigen::Isometry3d world_from_map;
+      if (lookupWorldFromMap(world_from_map)) p = world_from_map.inverse() * p;
       conservative = std::make_shared<octomap::OcTree>(*map);
       stampFrontierOccupied(*conservative, *frontier_cloud_,
                             octomap::point3d(p.x(), p.y(), p.z()),
@@ -638,8 +667,26 @@ private:
   }
 
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+    // The core plans goals in the map frame, which stays attached to the room as
+    // RTAB-Map corrects. A goal given in world is converted once, here, so it is
+    // fixed in map from then on; an empty frame_id is taken as map.
+    const std::string frame = msg->header.frame_id.empty() ? kMapFrame : msg->header.frame_id;
+    Eigen::Vector3d p(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    if (frame == kWorldFrame) {
+      Eigen::Isometry3d world_from_map;
+      if (!lookupWorldFromMap(world_from_map)) {
+        RCLCPP_WARN(get_logger(), "Goal in '%s' ignored: no %s->%s transform yet (is RTAB-Map running?).",
+                    kWorldFrame, kMapFrame, kWorldFrame);
+        return;
+      }
+      p = world_from_map.inverse() * p;
+    } else if (frame != kMapFrame) {
+      RCLCPP_WARN(get_logger(), "Goal ignored: frame '%s' is not supported, use '%s' or '%s'.",
+                  frame.c_str(), kMapFrame, kWorldFrame);
+      return;
+    }
     drone_core::common::Goal goal;
-    goal.pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    goal.pos = p;
     core_->setGoal(goal);
     {
       // Marker state only: written here and in firePresetSquare (fast group), read
@@ -648,7 +695,8 @@ private:
       goal_pos_ = goal.pos;
       has_goal_ = true;
     }
-    RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f, %.2f)", goal.pos.x(), goal.pos.y(), goal.pos.z());
+    RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f, %.2f) in %s (given in %s)", goal.pos.x(),
+                goal.pos.y(), goal.pos.z(), kMapFrame, frame.c_str());
   }
 
   // Build and fire the one-shot preset square, centred on the drone's current XY
@@ -673,12 +721,23 @@ private:
       return;
     }
 
-    const double cx = state.pos.x();
-    const double cy = state.pos.y();
-    const double cz = state.pos.z();
+    // The square is planned in the map frame like everything else the corridor
+    // checks, so build it around the drone's position expressed there. POS_SP below
+    // stays in world: it is a control setpoint.
+    Eigen::Isometry3d world_from_map;
+    if (!lookupWorldFromMap(world_from_map)) {
+      RCLCPP_WARN(get_logger(),
+                  "PRESET_WAYPOINTS ignored: no %s->%s transform yet (is RTAB-Map running?).",
+                  kMapFrame, kWorldFrame);
+      return;
+    }
+    const Eigen::Vector3d c = world_from_map.inverse() * state.pos;
+    const double cx = c.x();
+    const double cy = c.y();
+    const double cz = c.z();
 
     // The preset shape, one waypoint per line so it can be edited directly here:
-    // offsets [m] from the drone's XY at the flip, absolute ENU altitude. As it
+    // offsets [m] from the drone's XY at the flip, absolute map-frame altitude. As it
     // stands, centre first, round the four corners of a 2 m square once, back to
     // centre — ends where it started (rest-to-rest) and visits each corner once,
     // which is clean for the corridor QP. Keep the first and last points equal if
@@ -695,9 +754,10 @@ private:
       // Point POS_SP at the preset's first waypoint — where a rest-to-rest shape
       // also ends — so the kDirect hand-back at completion is continuous (no
       // reposition). Read off the list rather than restated, so editing the
-      // waypoints above keeps the hand-back correct. Skipped on the bench: no
-      // hand-back happens there, so don't silently move the operator's POS_SP.
-      const Eigen::Vector3d& home = square.front();
+      // waypoints above keeps the hand-back correct, and converted to world since
+      // POS_SP is a control setpoint. Skipped on the bench: no hand-back happens
+      // there, so don't silently move the operator's POS_SP.
+      const Eigen::Vector3d home = world_from_map * square.front();
       set_parameter(
           rclcpp::Parameter("POS_SP", std::vector<double>{home.x(), home.y(), home.z()}));
     }
@@ -708,11 +768,29 @@ private:
 
     core_->firePreset(square);
     RCLCPP_INFO(get_logger(),
-                "PRESET_WAYPOINTS fired: %zu waypoints from (%.2f, %.2f, %.2f) [%s].",
+                "PRESET_WAYPOINTS fired: %zu waypoints from (%.2f, %.2f, %.2f) in %s [%s].",
                 square.size(), square.front().x(), square.front().y(), square.front().z(),
-                flying ? "in flight; POS_SP moved to the first waypoint, returns to POS_SP "
+                kMapFrame, flying ? "in flight; POS_SP moved to the first waypoint, returns to POS_SP "
                          "when done"
                        : "bench: generation only, not flying");
+  }
+
+  // map->world (p_world = world_from_map * p_map): RTAB-Map's current drift
+  // correction, latest available. Identity in sim, where there is no RTAB-Map and
+  // the map and the state share one frame. False until TF has delivered it.
+  // Safe from any callback group: tf2_ros::Buffer is thread-safe.
+  bool lookupWorldFromMap(Eigen::Isometry3d& world_from_map) {
+    if (use_sim_mode_) {
+      world_from_map = Eigen::Isometry3d::Identity();
+      return true;
+    }
+    try {
+      world_from_map = tf2::transformToEigen(
+          tf_buffer_->lookupTransform(kWorldFrame, kMapFrame, tf2::TimePointZero));
+      return true;
+    } catch (const tf2::TransformException&) {
+      return false;
+    }
   }
 
   // --- Control loop --------------------------------------------------------
@@ -827,6 +905,20 @@ private:
       state.stamp = use_sim_mode_ ? t_px4_odom_ : t_vio_odom_;
       yaw_used = state.yaw;
       core_->setVehicleState(state);
+    }
+
+    // RTAB-Map's map->world correction, for the planner. Pushed every tick because it
+    // changes in jumps; the core snapshots it once per planning cycle.
+    {
+      Eigen::Isometry3d world_from_map;
+      if (lookupWorldFromMap(world_from_map)) {
+        core_->setMapToWorld(world_from_map);
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                             "No %s->%s transform yet (is RTAB-Map running?) - planning and "
+                             "presets are paused until it arrives.",
+                             kMapFrame, kWorldFrame);
+      }
     }
 
     // Consume a pending PRESET_WAYPOINTS fire (momentary trigger). Deliberately
@@ -992,7 +1084,8 @@ private:
 
     if (get_parameter("DEBUG_CONTROL_VIZ").as_bool()) {
       visualization_msgs::msg::Marker m;
-      m.header.frame_id = "map";
+      // The controller's reference: world frame (map in sim, where they are one).
+      m.header.frame_id = use_sim_mode_ ? kMapFrame : kWorldFrame;
       m.header.stamp = now();
       m.ns = "pos_ff";
       m.id = 0;
@@ -1057,7 +1150,7 @@ private:
       goal_pos = goal_pos_;
     }
     visualization_msgs::msg::Marker m;
-    m.header.frame_id = "map";
+    m.header.frame_id = kMapFrame;
     m.header.stamp = now();
     m.ns = "goal";
     m.id = 0;
@@ -1082,14 +1175,14 @@ private:
 
     // Clear stale markers first so an empty/failed plan removes the old path.
     visualization_msgs::msg::Marker clear;
-    clear.header.frame_id = "map";
+    clear.header.frame_id = kMapFrame;
     clear.header.stamp = now();
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
 
     if (wps.size() >= 2) {
       visualization_msgs::msg::Marker line;
-      line.header.frame_id = "map";
+      line.header.frame_id = kMapFrame;
       line.header.stamp = now();
       line.ns = "geometric_path";
       line.id = 0;
@@ -1144,7 +1237,7 @@ private:
 
     visualization_msgs::msg::MarkerArray arr;
     visualization_msgs::msg::Marker clear;
-    clear.header.frame_id = "map";
+    clear.header.frame_id = kMapFrame;
     clear.header.stamp = now();
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
@@ -1164,7 +1257,7 @@ private:
         for (const auto& loop : drone_core::planning::regionFaceLoops(region)) {
           if (loop.size() < 3) continue;
           visualization_msgs::msg::Marker face;
-          face.header.frame_id = "map";
+          face.header.frame_id = kMapFrame;
           face.header.stamp = now();
           face.ns = ns;
           face.id = id++;
@@ -1194,7 +1287,7 @@ private:
 
     if (snap.committed.size() >= 2) {
       visualization_msgs::msg::Marker line;
-      line.header.frame_id = "map";
+      line.header.frame_id = kMapFrame;
       line.header.stamp = now();
       line.ns = "committed";
       line.id = 0;
@@ -1236,14 +1329,14 @@ private:
 
     visualization_msgs::msg::MarkerArray arr;
     visualization_msgs::msg::Marker clear;
-    clear.header.frame_id = "map";
+    clear.header.frame_id = kMapFrame;
     clear.header.stamp = now();
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(clear);
 
     if (!tree.nodes.empty()) {
       visualization_msgs::msg::Marker edges;
-      edges.header.frame_id = "map";
+      edges.header.frame_id = kMapFrame;
       edges.header.stamp = now();
       edges.ns = "search_tree";
       edges.id = 0;
@@ -1294,7 +1387,7 @@ private:
     if (samples.empty()) return;
 
     sensor_msgs::msg::PointCloud2 cloud;
-    cloud.header.frame_id = "map";
+    cloud.header.frame_id = kMapFrame;
     cloud.header.stamp = now();
     cloud.height = 1;
     cloud.is_dense = true;
@@ -1331,7 +1424,7 @@ private:
   // the flight-critical path.
   void publishOccupancyMap(const octomap::OcTree& map) {
     sensor_msgs::msg::PointCloud2 cloud;
-    cloud.header.frame_id = "map";
+    cloud.header.frame_id = kMapFrame;
     cloud.header.stamp = now();
     cloud.height = 1;
     cloud.is_dense = true;
@@ -1362,7 +1455,8 @@ private:
     if (sampled.empty()) return;
     nav_msgs::msg::Path path;
     path.header.stamp = now();
-    path.header.frame_id = "map";
+    // The trajectory as handed to the tracker: world frame (map in sim).
+    path.header.frame_id = use_sim_mode_ ? kMapFrame : kWorldFrame;
     for (const auto& p : sampled) {
       geometry_msgs::msg::PoseStamped pose;
       pose.header = path.header;
@@ -1377,6 +1471,10 @@ private:
   // --- Members -------------------------------------------------------------
 
   std::unique_ptr<drone_core::autonomy::AutonomyCore> core_;
+  // TF, for RTAB-Map's map->world correction (lookupWorldFromMap). Set once in the
+  // constructor before any callback can run; the buffer is thread-safe.
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   OnSetParametersCallbackHandle::SharedPtr param_callback_;
 
   // Fast group: control tick + estimator streams. Slow group: map ingest + viz.

@@ -122,6 +122,79 @@ int main() {
     check(!core.inHoverHold(), "rest start engages once its re-anchored t0 has passed");
   }
 
+  // Map/world frames. The core plans in the map frame and hands the tracker a
+  // world-frame trajectory, converting with the host's map->world transform. A
+  // transform with a real offset, heading change and tilt makes every missed
+  // conversion visible as a position error of a metre or more:
+  //  - without a transform (and require_map_to_world set) nothing is planned;
+  //  - the staged trajectory starts at the vehicle's WORLD position (a missing
+  //    conversion on the way in or out would start it somewhere else) and ends at
+  //    the MAP-frame goal expressed in the world frame;
+  //  - a replan while tracking starts exactly where the outgoing world-frame
+  //    trajectory is at the splice instant, which only holds if the splice state
+  //    is sampled in world and converted into map before solving.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.stale_timeout = 2.0;
+    cfg.rrt_solve_time = 0.2;
+    cfg.require_map_to_world = true;
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    core.setMap(octree);
+    const Eigen::Vector3d p_world(0.2, -0.1, 1.0);
+    core.setVehicleState(airborneAt(p_world));
+    core.reset();
+
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(2.0, 0.5, 1.0);  // map frame
+    core.setGoal(goal);
+
+    check(!core.planOnce(), "frames: no plan before a map->world transform arrives");
+
+    Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
+    world_from_map.rotate(Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ()));
+    world_from_map.rotate(Eigen::AngleAxisd(0.03, Eigen::Vector3d::UnitY()));
+    world_from_map.pretranslate(Eigen::Vector3d(1.0, -0.5, 0.2));
+    core.setMapToWorld(world_from_map);
+
+    check(core.planOnce(), "frames: plans once the transform is set");
+    const auto first = core.sampledPlannedPath(0.01);
+    check(first.size() > 60, "frames: trajectory long enough to splice into");
+    if (first.size() > 60) {
+      const Eigen::Vector3d start(first.front()[0], first.front()[1], first.front()[2]);
+      const Eigen::Vector3d end(first.back()[0], first.back()[1], first.back()[2]);
+      check((start - p_world).norm() < 1e-4,
+            "frames: trajectory starts at the vehicle's world position");
+      check((end - world_from_map * goal.pos).norm() < 0.35,
+            "frames: trajectory ends at the map-frame goal expressed in world");
+      check((end - goal.pos).norm() > 0.8,
+            "frames: trajectory end is NOT the raw map-frame goal (conversion applied)");
+    }
+
+    // Engage it (rest start: t0 = 100.04), then replan half a second in while
+    // it is being tracked. The new t0 is 100.54, i.e. 0.50 s into the old one.
+    core.stepControl(0.02);
+    fake_time += 0.1;
+    core.setVehicleState(airborneAt(p_world));
+    core.stepControl(0.02);
+    check(!core.inHoverHold(), "frames: tracking the first trajectory");
+    fake_time += 0.4;
+    core.setVehicleState(airborneAt(p_world));
+
+    check(core.planOnce(), "frames: replan while tracking");
+    const auto second = core.sampledPlannedPath(0.01);
+    if (first.size() > 60 && !second.empty()) {
+      const Eigen::Vector3d old_at_splice(first[50][0], first[50][1], first[50][2]);
+      const Eigen::Vector3d new_start(second.front()[0], second.front()[1], second.front()[2]);
+      check((new_start - old_at_splice).norm() < 1e-4,
+            "frames: replan starts where the outgoing world trajectory is at the splice");
+    }
+  }
+
   // Corridor-QP mode: planOnce must route trajgen through the corridor
   // pipeline (truncation + box corridor + QP against the conservative EDT) and
   // still stage a trajectory. A mapped floor gives the distance field real

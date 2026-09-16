@@ -13,6 +13,7 @@
 #include <ompl/util/Console.h>
 
 #include "drone_core/common/logging.hpp"
+#include "drone_core/common/rigid_transform.hpp"
 #include "drone_core/common/trajectory_eval.hpp"
 #include "drone_core/control/flatness_mapper.hpp"
 #include "drone_core/planning/corridor.hpp"
@@ -160,6 +161,12 @@ void AutonomyCore::setMap(const planning::MapHandle& map,
   std::lock_guard<std::mutex> lock(io_mutex_);
   map_ = map;
   conservative_map_ = conservative;
+}
+
+void AutonomyCore::setMapToWorld(const Eigen::Isometry3d& world_from_map) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
+  world_from_map_ = world_from_map;
+  has_map_to_world_ = true;
 }
 
 void AutonomyCore::setGoal(const common::Goal& goal) {
@@ -310,6 +317,8 @@ bool AutonomyCore::planOnce() {
   planning::MapHandle conservative;
   common::Goal goal;
   bool has_goal = false;
+  Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
+  bool has_frame = false;
   {
     std::lock_guard<std::mutex> lock(io_mutex_);
     state = state_;
@@ -317,15 +326,21 @@ bool AutonomyCore::planOnce() {
     conservative = conservative_map_;
     goal = goal_;
     has_goal = has_goal_;
+    world_from_map = world_from_map_;
+    has_frame = has_map_to_world_;
   }
 
   if (!has_goal || !map) return false;
+  if (cfg_.require_map_to_world && !has_frame) return false;
 
+  // Plan in the map frame (see the frame note on the class), from the vehicle's
+  // position expressed there.
+  const common::State state_map = common::transformState(world_from_map.inverse(), state);
   std::vector<std::vector<double>> path;
-  if (!runGlobalPlan(state, goal, map, path)) return false;
+  if (!runGlobalPlan(state_map, goal, map, path)) return false;
 
   // Same splice anchoring as the worker's trajgen tick — see spliceAnchor.
-  const SpliceAnchor anchor = spliceAnchor(state, now());
+  const SpliceAnchor anchor = spliceAnchor(state, now(), world_from_map);
   if (!path.empty()) {
     path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
   }
@@ -341,8 +356,7 @@ bool AutonomyCore::planOnce() {
                   traj))
     return false;
 
-  restampRestStart(anchor, traj);
-  stagePending(traj);
+  stagePlanned(anchor, traj, world_from_map);
   return true;
 }
 
@@ -698,7 +712,8 @@ void AutonomyCore::stagePending(const common::Trajectory& traj) {
   has_pending_ = true;
 }
 
-void AutonomyCore::runPreset(const common::State& state, const planning::MapHandle& map,
+void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d& world_from_map,
+                             const planning::MapHandle& map,
                              const planning::MapHandle& conservative,
                              const std::vector<Eigen::Vector3d>& waypoints) {
   if (waypoints.size() < 2) {
@@ -722,7 +737,7 @@ void AutonomyCore::runPreset(const common::State& state, const planning::MapHand
   // clean rest-to-rest start this test wants. Re-root the first waypoint onto the
   // anchor like any committed path.
   const double t_gen = now();
-  const SpliceAnchor anchor = spliceAnchor(state, t_gen);
+  const SpliceAnchor anchor = spliceAnchor(state, t_gen, world_from_map);
   std::vector<std::vector<double>> path;
   path.reserve(waypoints.size());
   for (const auto& w : waypoints) path.push_back({w.x(), w.y(), w.z()});
@@ -758,20 +773,20 @@ void AutonomyCore::runPreset(const common::State& state, const planning::MapHand
                            path[i][2] - path[i - 1][2]);
   }
 
-  // A preset starts at rest, so this moves t0 to after the solve; preset_end_
+  // A preset starts at rest, so staging moves t0 to after the solve; preset_end_
   // below then follows it rather than cutting the one-shot short by the solve time.
-  restampRestStart(anchor, traj);
-  stagePending(traj);
+  const common::Trajectory staged = stagePlanned(anchor, traj, world_from_map);
   // Hold the one-shot for its whole duration, then release (see stepControl). The
-  // trajectory plays in absolute time from traj.t0, so its end is t0 + duration.
-  preset_end_.store(traj.t0 + traj.total_duration);
+  // trajectory plays in absolute time from its t0, so its end is t0 + duration.
+  preset_end_.store(staged.t0 + staged.total_duration);
   preset_active_.store(true);
   DRONE_LOG_INFO("[preset] trajectory staged: " << path_len << " m / "
-                 << traj.total_duration << " s — holding kTracking until it completes");
+                 << staged.total_duration << " s — holding kTracking until it completes");
 }
 
-AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state,
-                                                      double t_now) const {
+AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state, double t_now,
+                                                      const Eigen::Isometry3d& world_from_map) const {
+  const Eigen::Isometry3d map_from_world = world_from_map.inverse();
   SpliceAnchor anchor;
   anchor.t0 = t_now + trajgen_lead_;
 
@@ -793,13 +808,15 @@ AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state
   const bool still_tracked = have && !outgoing.empty() &&
                              (t_now - staged_at) <= cfg_.stale_timeout;
   if (still_tracked) {
-    anchor.start = common::sampleMotion(outgoing, anchor.t0);
+    // The outgoing trajectory is world-frame (it is what the tracker flies), so
+    // sample it there and only then express the result in the map frame.
+    anchor.start = common::transformMotion(map_from_world, common::sampleMotion(outgoing, anchor.t0));
     anchor.from_trajectory = true;
   } else {
     // Rest at the measured position. Note sampleMotion would also return rest if
     // the outgoing trajectory had simply run out (it ends at rest by
     // construction) — this branch is for having no usable outgoing curve at all.
-    anchor.start.pos = state.pos;
+    anchor.start.pos = map_from_world * state.pos;
     anchor.from_trajectory = false;
   }
   return anchor;
@@ -810,6 +827,15 @@ void AutonomyCore::restampRestStart(const SpliceAnchor& anchor, common::Trajecto
   // kLeadMin (two control ticks) rather than now() itself, so the tracker
   // promotes it at its own beginning instead of a tick in.
   traj.t0 = now() + kLeadMin;
+}
+
+common::Trajectory AutonomyCore::stagePlanned(const SpliceAnchor& anchor,
+                                              const common::Trajectory& map_traj,
+                                              const Eigen::Isometry3d& world_from_map) {
+  common::Trajectory traj = common::transformTrajectory(world_from_map, map_traj);
+  restampRestStart(anchor, traj);
+  stagePending(traj);
+  return traj;
 }
 
 std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
@@ -917,7 +943,7 @@ void AutonomyCore::plannerLoop() {
   // quiet: log on every change of reason, then periodically so a persistent
   // stall stays visible without spamming at the tick rate. Worker-thread
   // locals, so this costs nothing once planning is running.
-  enum class Idle { kNone, kNoGoal, kNoMap };
+  enum class Idle { kNone, kNoGoal, kNoMap, kNoFrame };
   Idle idle = Idle::kNone;
   double last_idle_log = -1.0e9;
 
@@ -932,9 +958,15 @@ void AutonomyCore::plannerLoop() {
     bool new_goal = false;
     bool preset_pending = false;
     std::vector<Eigen::Vector3d> preset_waypoints;
+    // One snapshot per cycle, used both to bring the state into the map frame and
+    // to take the finished trajectory back out (see stagePlanned).
+    Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
+    bool has_frame = false;
     {
       std::lock_guard<std::mutex> lock(io_mutex_);
       state = state_;
+      world_from_map = world_from_map_;
+      has_frame = has_map_to_world_;
       map = map_;
       conservative = conservative_map_;
       goal = goal_;
@@ -953,19 +985,30 @@ void AutonomyCore::plannerLoop() {
     // the new goal.
     if (new_goal) cached_path_.clear();
 
+    // Without the map->world transform, map-frame obstacles and the world-frame
+    // vehicle cannot be put side by side, and assuming identity is exactly the
+    // offset this exists to prevent. Hold off; the idle branch says why.
+    const bool frame_ok = has_frame || !cfg_.require_map_to_world;
+
     // One-shot preset trajectory: bypass the geometric search entirely and solve
     // the corridor-QP trajectory once through the given waypoints, then hold it
     // (kept fresh by stepControl) until it completes. Handled before — and to the
     // exclusion of — normal planning: firePreset dropped any goal, and while the
     // preset is playing the planner must not fight it.
-    if (preset_pending) {
-      runPreset(state, map, conservative, preset_waypoints);
+    if (preset_pending && !frame_ok) {
+      DRONE_LOG_INFO("[preset] ignored: no map->world transform yet — the preset square is in "
+                     "the map frame and cannot be placed without it (is RTAB-Map publishing?)");
+    } else if (preset_pending) {
+      runPreset(state, world_from_map, map, conservative, preset_waypoints);
       // Fall through to the idle branch below only if nothing else runs this tick.
     }
 
-    if (!preset_active_.load() && has_goal && map) {
+    if (!preset_active_.load() && has_goal && map && frame_ok) {
       ++run;
-      const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
+      // The search, the committed-path cost from the drone and every other
+      // planning quantity use the vehicle position in the map frame.
+      const Eigen::Vector3d pos_map = world_from_map.inverse() * state.pos;
+      const std::vector<double> start = {pos_map.x(), pos_map.y(), pos_map.z()};
       const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
 
       // Commit a path: keep it on the worker and republish for visualisation.
@@ -1171,7 +1214,7 @@ void AutonomyCore::plannerLoop() {
         // point outside region 0 whenever there is tracking error, and the QP's
         // start equality would then be infeasible against region 0's faces.
         const double t_gen = now();
-        const SpliceAnchor anchor = spliceAnchor(state, t_gen);
+        const SpliceAnchor anchor = spliceAnchor(state, t_gen, world_from_map);
         std::vector<std::vector<double>> path = cached_path_;
         path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
         common::Trajectory traj;
@@ -1212,20 +1255,22 @@ void AutonomyCore::plannerLoop() {
         }
 
         if (ok) {
-          restampRestStart(anchor, traj);
-          stagePending(traj);
+          stagePlanned(anchor, traj, world_from_map);
           last_trajgen_ = t;
         }
       }
       idle = Idle::kNone;  // planning again; a later stall re-reports immediately
     } else if (!preset_active_.load()) {
-      const Idle reason = !has_goal ? Idle::kNoGoal : Idle::kNoMap;
+      const Idle reason = !has_goal ? Idle::kNoGoal : !map ? Idle::kNoMap : Idle::kNoFrame;
       if (reason != idle || t - last_idle_log >= kIdleLogPeriod) {
         if (reason == Idle::kNoGoal) {
           DRONE_LOG_INFO("[plan] idle: no goal set — nothing to plan toward");
-        } else {
+        } else if (reason == Idle::kNoMap) {
           DRONE_LOG_INFO("[plan] idle: goal set but no map yet — waiting for the first "
                          "octomap; the planner cannot run without one");
+        } else {
+          DRONE_LOG_INFO("[plan] idle: goal and map set but no map->world transform yet — "
+                         "planning is paused until the host supplies one (is RTAB-Map publishing?)");
         }
         idle = reason;
         last_idle_log = t;

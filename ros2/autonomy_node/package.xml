@@ -21,6 +21,8 @@
   <depend>octomap</depend>
   <depend>eigen</depend>
   <depend>drone_interfaces</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_eigen</depend>
 
   <exec_depend>ros2launch</exec_depend>
 
