@@ -261,8 +261,18 @@ void PositionControl::_velocityControl(double dt) {
   _vel_deriv_filt += deriv_alpha * (_vel_deriv_raw - _vel_deriv_filt);
 
   _vel_p_term = vel_error.cwiseProduct(_gain_vel_p);
-  // Negated: d(vel_sp - vel)/dt with the setpoint half dropped is -d(vel)/dt.
-  _vel_d_term = -_vel_deriv_filt.cwiseProduct(_gain_vel_d);
+  // Damp the vehicle's acceleration relative to what the trajectory asks for,
+  // not its raw acceleration. Measured -d(vel)/dt alone resists every speed-up,
+  // including the planned ones: in flight (2026-09-16) it cancelled 30-45% of the
+  // acceleration feed-forward and the drone ran 0.2-0.4 s behind the reference.
+  // The trajectory's acceleration stands in for the setpoint half of the
+  // derivative, which is smooth (no setpoint-step kick). Outside tracking acc_ff
+  // is not applied, so this is the plain measurement form used in hover.
+  Eigen::Vector3d accel_ref = Eigen::Vector3d::Zero();
+  if (_feedforward_enabled && !_is_taking_off) {
+    accel_ref = _acc_ff;
+  }
+  _vel_d_term = (accel_ref - _vel_deriv_filt).cwiseProduct(_gain_vel_d);
 
   // Integrate only near the setpoint. Far from it the velocity error is the
   // transient of a large move, not a steady bias, and integrating it winds up a

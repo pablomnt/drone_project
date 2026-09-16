@@ -489,6 +489,14 @@ it, and they are independent:
 - **Derivative on measurement, not error.** `d(vel_sp − vel)/dt` with the setpoint half dropped is
   `−d(vel)/dt`, hence the minus sign on `_vel_d_term`. Identical in steady state; what it removes is
   the one-tick kick that a stepped `POS_SP` used to inject through the setpoint's own derivative.
+- **While tracking, the setpoint half is `acc_ff`, not zero (2026-09-16, NOT yet flown).**
+  `_vel_d_term = Kd·(acc_ff − d(vel)/dt)` when feed-forward is applied (same three gates), plain
+  `−Kd·d(vel)/dt` otherwise — so hover and `POS_SP` are unchanged. With the pure measurement form the
+  D term opposed every *planned* acceleration too: in the 2026-09-16 12:31 flight it cancelled
+  30–45% of the horizontal `acc_ff` (fit of D against `acc_ff`), and the vehicle ran 0.2–0.4 s behind
+  the reference (11–21 cm RMS horizontal error per preset). `acc_ff` is a smooth polynomial sample,
+  so this reintroduces no setpoint kick. The other contributors to that lag, not addressed: OKVIS
+  state ~150–180 ms old at the controller, and PX4's attitude response ~190 ms behind the command.
 
 `test_position_control` pins the fixed behaviour: 25 Hz samples into a 50 Hz loop must give the true
 constant `dv/dt` on every tick, not an alternating impulse train.

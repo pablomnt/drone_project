@@ -85,6 +85,46 @@ int main() {
     }
   }
 
+  // While tracking, the D term damps acceleration relative to the trajectory's:
+  // a vehicle accelerating exactly as planned gets no D opposition, so the
+  // acceleration feed-forward reaches the output undiminished. With feed-forward
+  // off (hover), the same motion is damped as before.
+  {
+    auto run = [](bool feedforward) {
+      PositionControl d;
+      d.setVelocityGains(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                         Eigen::Vector3d(1.0, 0.0, 0.0));  // isolate D on x, Kd = 1
+      d.setDerivativeTau(0.0);
+      d.setState(Eigen::Vector3d(0.0, 0.0, 2.0), Eigen::Vector3d::Zero(), 0.0);
+      d.reset();
+      d.enableFeedforward(feedforward);
+
+      drone_core::common::Reference ref;
+      ref.pos = Eigen::Vector3d(0.0, 0.0, 2.0);
+      ref.acc_ff = Eigen::Vector3d(1.0, 0.0, 0.0);
+      double vx = 0.0;
+      for (int k = 0; k < 10; ++k) {
+        vx += 1.0 * 0.02;  // accelerating at exactly the planned 1 m/s^2
+        d.setState(Eigen::Vector3d(0.0, 0.0, 2.0), Eigen::Vector3d(vx, 0.0, 0.0), 0.0);
+        d.setStateStamp(0.02 * (k + 1));
+        d.setReference(ref);
+        d.update(0.02);
+      }
+      return d.getVelocityDTerm().x();
+    };
+    const double tracking = run(true);
+    const double hover = run(false);
+    if (std::abs(tracking) > 1e-9) {
+      std::cerr << "FAIL: D term opposes planned acceleration while tracking: " << tracking
+                << ", expected 0\n";
+      ++failures;
+    }
+    if (std::abs(hover + 1.0) > 1e-9) {
+      std::cerr << "FAIL: D term without feed-forward is " << hover << ", expected -1.0\n";
+      ++failures;
+    }
+  }
+
   // Integrator gate: the velocity integrator accumulates only while the position
   // error is within the limit, judged separately for XY (norm) and z, and a
   // large error FREEZES it at its current value rather than resetting it.
