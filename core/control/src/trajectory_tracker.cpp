@@ -1,5 +1,8 @@
 #include "drone_core/control/trajectory_tracker.hpp"
 
+#include "drone_core/common/logging.hpp"
+#include "drone_core/common/trajectory_eval.hpp"
+
 namespace drone_core::control {
 
 void TrajectoryTracker::setPositionGains(const Eigen::Vector3d& P) {
@@ -38,6 +41,8 @@ void TrajectoryTracker::reset() {
   has_next_ = false;
   traj_ = common::Trajectory{};
   next_ = common::Trajectory{};
+  diverged_ = false;
+  divergence_event_ = false;
 }
 
 void TrajectoryTracker::setDirectSetpoint(const Eigen::Vector3d& pos, double yaw) {
@@ -61,6 +66,8 @@ void TrajectoryTracker::clearTrajectory() {
   next_ = common::Trajectory{};
   has_traj_ = false;
   has_next_ = false;
+  diverged_ = false;
+  divergence_event_ = false;
 }
 
 common::Command TrajectoryTracker::update(const common::State& state, double now, double dt) {
@@ -77,6 +84,9 @@ common::Command TrajectoryTracker::update(const common::State& state, double now
     traj_ = next_;
     has_traj_ = true;
     has_next_ = false;
+    // A new plan gets a fresh chance; it is checked against the vehicle below
+    // before a single reference from it is used.
+    diverged_ = false;
     // Seed the held yaw to the vehicle's heading so the commanded yaw does not
     // jump when the new trajectory engages.
     mapper_needs_reset_ = true;
@@ -85,8 +95,37 @@ common::Command TrajectoryTracker::update(const common::State& state, double now
   const bool has_fresh_traj =
       has_traj_ && !traj_.empty() && (now - last_arrival_ <= stale_timeout_);
 
-  if (has_fresh_traj) {
-    // A planner trajectory is available and fresh: track it.
+  // A trajectory can be fresh by the clock and still be the wrong thing to
+  // fly: stale_timeout only catches a planner that stopped producing, not a
+  // vehicle that has ended up far from where an on-time reference says it
+  // should be (a gust, a snag, a bad state estimate). Chasing that reference
+  // commands a large correction toward a point the vehicle is not near, so
+  // abandon the trajectory instead. Checked before any reference is set, so a
+  // diverged trajectory never produces a command. Sampled raw rather than
+  // through the flatness mapper, which latches yaw as a side effect.
+  if (has_fresh_traj && !diverged_ && max_tracking_error_ > 0.0) {
+    const double error = (common::sampleMotion(traj_, now).pos - state.pos).norm();
+    if (error > max_tracking_error_) {
+      diverged_ = true;
+      divergence_event_ = true;
+      // Staged onto the reference that just proved wrong: do not engage it.
+      has_next_ = false;
+      next_ = common::Trajectory{};
+      // Hold HERE. Latched explicitly rather than by the hover-hold branch's
+      // mode check, which would keep an older hold point if the tracker was
+      // already holding when this trajectory was promoted.
+      hold_pos_ = state.pos;
+      hold_yaw_ = state.yaw;
+      mode_ = Mode::kHoverHold;
+      DRONE_LOG_ERROR("[track] vehicle " << error << " m from the trajectory reference (limit "
+                      << max_tracking_error_ << " m): abandoning the trajectory and holding "
+                      "position until a replan from here arrives");
+    }
+  }
+  const bool trust_traj = has_fresh_traj && !diverged_;
+
+  if (trust_traj) {
+    // A planner trajectory is available, fresh and being tracked: track it.
     mode_ = Mode::kTracking;
     if (mapper_needs_reset_) {
       mapper_.reset(state.yaw);
@@ -96,8 +135,10 @@ common::Command TrajectoryTracker::update(const common::State& state, double now
     controller_.enableFeedforward(feedforward_);
     controller_.setReference(ref);
   } else if (has_traj_) {
-    // We were tracking but guidance went stale (planner stalled or dead):
-    // latch the current position and hold.
+    // We were tracking but guidance went stale (planner stalled or dead) or
+    // the reference has diverged too far from the measured position: latch
+    // the current position and hold rather than chase a reference that is
+    // either out of date or physically wrong.
     if (mode_ != Mode::kHoverHold) {
       hold_pos_ = state.pos;
       hold_yaw_ = state.yaw;

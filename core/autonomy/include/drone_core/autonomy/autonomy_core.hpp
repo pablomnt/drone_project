@@ -51,6 +51,15 @@ public:
     double hover_thrust{0.35};
     bool enable_feedforward{false};
     double stale_timeout{1.5};        // hover-hold fallback threshold [s]
+    // Distance between the tracked reference and the measured position above
+    // which the trajectory is abandoned, even though it is still fresh by
+    // stale_timeout: the tracker holds the vehicle's current position and the
+    // worker replans from there, starting at rest. stale_timeout only catches a
+    // planner that stopped producing, not a vehicle a gust, a snag or a bad
+    // state estimate has put far from an on-time reference — and a replan
+    // splices onto the reference, not the vehicle, so without this the corridor
+    // would keep being grown around a point the vehicle is not at. <= 0 disables.
+    double max_tracking_error{1.0};   // [m]
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
     double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
     double rrt_solve_time{3.0};       // planner optimisation budget per solve [s]
@@ -451,6 +460,9 @@ private:
   bool preset_pending_{false};
   std::atomic<bool> preset_active_{false};
   std::atomic<double> preset_end_{0.0};
+  // Raised by stepControl when the tracker abandons a trajectory for divergence,
+  // consumed by the worker to replan from the vehicle's position.
+  std::atomic<bool> replan_requested_{false};
   Config pending_config_;
   bool config_dirty_{false};
 

@@ -125,8 +125,12 @@ int checkDeferredEngage() {
   tracker.setVelocityGains(Eigen::Vector3d(1.8, 1.8, 2.0), Eigen::Vector3d(0.4, 0.4, 0.5),
                            Eigen::Vector3d(0.2, 0.2, 0.2));
 
+  // The vehicle sits where the staged trajectories start, as a real plan would,
+  // while the direct setpoint is 7 m away — so engaging early is still a large,
+  // visible step in the reference, and the divergence check stays at its
+  // default without tripping.
   State state;
-  state.pos = Eigen::Vector3d(0.0, 0.0, 1.5);
+  state.pos = Eigen::Vector3d(5.0, 5.0, 1.5);
   state.yaw = 0.0;
 
   // Airborne reset so the open-loop takeoff ramp does not engage and mask the
@@ -217,10 +221,99 @@ int checkDeferredEngage() {
   return failures;
 }
 
+// A trajectory that is still fresh by the clock must be abandoned once the
+// vehicle is further than the limit from its reference — the case the stale
+// timeout cannot catch, since nothing has stopped arriving — and abandoned for
+// good: hover where the vehicle is, drop anything staged onto that reference,
+// and resume only on a newly promoted trajectory.
+int checkDivergence() {
+  int failures = 0;
+  auto fail = [&failures](const char* what) {
+    std::cerr << "FAIL: " << what << "\n";
+    ++failures;
+  };
+
+  TrajectoryTracker tracker;
+  tracker.setStaleTimeout(5.0);  // generous: only distance can trip this
+  tracker.setMaxTrackingError(1.0);
+  tracker.setHoverThrust(0.35);
+  tracker.reset();
+
+  // Stationary reference at (0, 0, 1.5), engaged immediately.
+  const Trajectory traj = makeTraj(200.0, 10.0, poly({0.0}), poly({0.0}), poly({1.5}));
+  tracker.setTrajectory(traj, 200.0);
+
+  State near;
+  near.pos = Eigen::Vector3d(0.9, 0.0, 1.5);  // inside the 1.0 m limit
+  tracker.update(near, 200.01, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kTracking) fail("0.9 m off should still track");
+  if (tracker.isDiverged() || tracker.takeDivergence()) fail("diverged inside the limit");
+
+  // A trajectory staged onto this reference, waiting for its t0.
+  tracker.setTrajectory(makeTraj(200.5, 5.0, poly({0.0, 0.2}), poly({0.0}), poly({1.5})), 200.02);
+
+  State far;
+  far.pos = Eigen::Vector3d(2.0, 0.0, 1.5);  // 2 m off
+  tracker.update(far, 200.03, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) fail("2 m off did not hover-hold");
+  if (!tracker.isDiverged()) fail("isDiverged() false past the limit");
+  if ((tracker.controller().getPositionSetpoint() - far.pos).norm() > kTol) {
+    fail("hover-hold is not at the vehicle's position");
+  }
+  if (tracker.hasPendingTrajectory()) fail("trajectory staged onto the bad reference kept");
+  if (!tracker.takeDivergence()) fail("takeDivergence() missed the divergence");
+  if (tracker.takeDivergence()) fail("takeDivergence() fired twice for one divergence");
+
+  // Latched: back within the limit of the abandoned reference, and past the
+  // staged trajectory's t0, it still holds where it diverged.
+  tracker.update(near, 200.6, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) {
+    fail("resumed the abandoned trajectory when the vehicle came back near it");
+  }
+  if ((tracker.controller().getPositionSetpoint() - far.pos).norm() > kTol) {
+    fail("hold point moved after divergence");
+  }
+
+  // A replan from the vehicle's position releases it.
+  tracker.setTrajectory(makeTraj(200.7, 5.0, poly({0.9}), poly({0.0}), poly({1.5})), 200.65);
+  tracker.update(near, 200.71, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kTracking) fail("recovery trajectory not tracked");
+  if (tracker.isDiverged()) fail("latch not released by a new trajectory");
+
+  // A new trajectory that is itself far from the vehicle is refused before it
+  // produces a single reference, and the hold is where the vehicle is now.
+  tracker.setTrajectory(makeTraj(200.8, 5.0, poly({5.0}), poly({0.0}), poly({1.5})), 200.75);
+  tracker.update(near, 200.81, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) fail("far new trajectory was tracked");
+  if ((tracker.controller().getPositionSetpoint() - near.pos).norm() > kTol) {
+    fail("refused trajectory still drove the reference, or held the wrong point");
+  }
+
+  // clearTrajectory() releases the latch too (the preset's hand-back to POS_SP).
+  tracker.setDirectSetpoint(Eigen::Vector3d(0.0, 0.0, 1.5), 0.0);
+  tracker.clearTrajectory();
+  tracker.update(near, 200.9, 0.02);
+  if (tracker.isDiverged() || tracker.mode() != TrajectoryTracker::Mode::kDirect) {
+    fail("clearTrajectory() did not release to the direct setpoint");
+  }
+
+  // <= 0 disables the check.
+  TrajectoryTracker disabled;
+  disabled.setStaleTimeout(5.0);
+  disabled.setMaxTrackingError(0.0);
+  disabled.setHoverThrust(0.35);
+  disabled.reset();
+  disabled.setTrajectory(traj, 200.0);
+  disabled.update(far, 200.01, 0.02);
+  if (disabled.mode() != TrajectoryTracker::Mode::kTracking) fail("limit 0 did not disable the check");
+
+  return failures;
+}
+
 }  // namespace
 
 int main() {
-  const int failures = checkSpliceContinuity() + checkDeferredEngage();
+  const int failures = checkSpliceContinuity() + checkDeferredEngage() + checkDivergence();
   if (failures != 0) {
     std::cerr << "test_trajectory_tracker: " << failures << " check(s) failed\n";
     return 1;

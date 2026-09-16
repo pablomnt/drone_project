@@ -542,6 +542,29 @@ presence as evidence that a staleness check exists.
   `reset()` did not clear trajectories either, so `POS_SP` was dead for the rest of the process once
   the first trajectory landed. It now clears them, so an interruption genuinely restores it.)
 
+**Divergence also drops to `kHoverHold` (`MAX_TRACKING_ERROR`, default 1 m; 2026-09-16, NOT yet
+flown).** A trajectory fresh by `STALE_TIMEOUT` is abandoned the moment the measured position is
+further than the limit from its reference, checked before that tick's reference is set, so a
+diverged trajectory never produces a command. The reason it exists is the splice: replans sample the
+*outgoing reference*, not the vehicle, and only the time-based stale check ever overrode that, so a
+vehicle knocked off course kept having corridors grown around where the reference said it was.
+The parts, all load-bearing:
+- **Latched** (`TrajectoryTracker::isDiverged`): holds the position at detection and never resumes
+  that trajectory, even if the reference later passes near the vehicle. Released only by a newly
+  promoted trajectory (itself checked on its first tick), `clearTrajectory()` or `reset()`.
+- **A trajectory staged at that moment is dropped** — it was spliced onto the reference that just
+  proved wrong. `stepControl` also drops `pending_`.
+- **Acted on once** (`takeDivergence`, an edge): `stepControl` clears `last_planned_` so the next plan
+  starts at rest at the measured position, and raises `replan_requested_`; the worker then clears
+  `cached_path_` (as for a new goal) and resets `last_trajgen_` so the search and trajectory run that
+  tick. Acting on the latch every held tick instead would also clear the *recovery* trajectory
+  between staging and its `t0`, and the plan after it would start from rest while moving.
+- **Presets are not replanned**: a diverged preset holds until `preset_end_`, then `clearTrajectory()`
+  hands back to `POS_SP`.
+Covered by `checkDivergence` in `test_trajectory_tracker` and the divergence block in
+`test_autonomy_core`, mutation-checked (un-latching, keeping the staged trajectory, acting every
+tick, and not clearing the splice source each fail their check).
+
 So `POS_SP` is a **pre-takeoff / no-goal setpoint only**. There is no "return to setpoint" or abort
 path through it, and **there is no goal-cancel API at all**: `AutonomyCore::has_goal_` is set by
 `setGoal` and never cleared, so once a goal is published the worker replans toward it forever. If an

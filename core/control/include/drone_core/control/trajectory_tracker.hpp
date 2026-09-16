@@ -31,6 +31,11 @@ public:
   // Seconds without a new trajectory before falling back to hover-hold.
   void setStaleTimeout(double seconds) { stale_timeout_ = seconds; }
 
+  // Distance [m] between the tracked reference and the measured position above
+  // which the trajectory is abandoned for a hover-hold, even though it is still
+  // fresh by setStaleTimeout — see isDiverged(). <= 0 disables the check.
+  void setMaxTrackingError(double meters) { max_tracking_error_ = meters; }
+
   // Re-arm the controller (and takeoff logic) on (re)engagement.
   void reset();
 
@@ -82,6 +87,26 @@ public:
   // True while a trajectory has been installed but its t0 has not arrived yet.
   bool hasPendingTrajectory() const { return has_next_; }
 
+  // True while the installed trajectory has been abandoned because the vehicle
+  // got further than setMaxTrackingError() from its reference. LATCHED: the
+  // tracker holds position and never goes back to that trajectory, even if the
+  // reference later passes near the vehicle again. Only a newly promoted
+  // trajectory, clearTrajectory() or reset() releases it. Any trajectory staged
+  // at the moment of divergence is dropped too, since it was spliced onto the
+  // reference that has just proved wrong.
+  bool isDiverged() const { return diverged_; }
+
+  // True exactly once per divergence, on the update() that detected it, then
+  // false until the next one. The caller uses it to act once: stop splicing onto
+  // the abandoned trajectory and request a replan from the vehicle's position.
+  // Acting on isDiverged() every tick instead would also discard the recovery
+  // trajectory staged while the latch is still set. Control thread only.
+  bool takeDivergence() {
+    const bool edge = divergence_event_;
+    divergence_event_ = false;
+    return edge;
+  }
+
 private:
   PositionControl controller_;
   FlatnessMapper mapper_;
@@ -94,6 +119,9 @@ private:
   bool mapper_needs_reset_{false};
   double last_arrival_{0.0};
   double stale_timeout_{0.5};
+  double max_tracking_error_{1.0};
+  bool diverged_{false};          // latched; see isDiverged()
+  bool divergence_event_{false};  // one-shot; see takeDivergence()
   bool feedforward_{false};
 
   Mode mode_{Mode::kHoverHold};

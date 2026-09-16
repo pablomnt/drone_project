@@ -137,6 +137,7 @@ AutonomyCore::AutonomyCore(const Config& config)
   tracker_.setHoverThrust(cfg_.hover_thrust);
   tracker_.enableFeedforward(cfg_.enable_feedforward);
   tracker_.setStaleTimeout(cfg_.stale_timeout);
+  tracker_.setMaxTrackingError(cfg_.max_tracking_error);
 
   // Quiet OMPL's own console (the per-solve "RRTstar: ..." INFO/DEBUG spam) so the
   // terminal shows our planner summary; warnings and errors still come through.
@@ -267,6 +268,7 @@ common::Command AutonomyCore::stepControl(double dt) {
     if (hover_thrust_changed) tracker_.setHoverThrust(cfg_.hover_thrust);
     tracker_.enableFeedforward(cfg_.enable_feedforward);
     tracker_.setStaleTimeout(cfg_.stale_timeout);
+    tracker_.setMaxTrackingError(cfg_.max_tracking_error);
   }
 
   // The tracker is only ever touched from this control thread, so apply the
@@ -298,7 +300,29 @@ common::Command AutonomyCore::stepControl(double dt) {
     }
   }
 
-  return tracker_.update(state, t, dt);
+  const common::Command cmd = tracker_.update(state, t, dt);
+
+  // The tracker has just abandoned its trajectory because the vehicle got too far
+  // from the reference (see TrajectoryTracker::isDiverged). Once, on that edge:
+  // forget the trajectory as a splice source, so the next plan starts at rest at
+  // the vehicle's real position like a fresh engage rather than at wherever the
+  // abandoned reference has got to; drop any trajectory the worker already
+  // staged against it; and ask the worker for a new geometric path from here,
+  // since the committed one was laid out from where the vehicle no longer is.
+  // Edge-triggered on purpose: clearing on every held tick would also discard
+  // the recovery trajectory staged while the tracker is still holding, and the
+  // plan after that would then start from rest while the vehicle is moving.
+  if (tracker_.takeDivergence()) {
+    {
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      has_pending_ = false;
+      has_last_planned_ = false;
+      last_planned_ = common::Trajectory{};
+    }
+    replan_requested_.store(true);
+  }
+
+  return cmd;
 }
 
 void AutonomyCore::startPlanner() {
@@ -984,6 +1008,20 @@ void AutonomyCore::plannerLoop() {
     // thread so the tick below replans from the drone's current position toward
     // the new goal.
     if (new_goal) cached_path_.clear();
+
+    // The tracker abandoned the trajectory (the vehicle got too far from its
+    // reference) and is holding position. Same treatment as a new goal: drop the
+    // committed path so this tick searches again from where the vehicle actually
+    // is, and generate the trajectory this tick rather than waiting out
+    // TRAJGEN_PERIOD. stepControl has already cleared the splice source, so it
+    // starts from rest at the measured position.
+    if (replan_requested_.exchange(false)) {
+      cached_path_.clear();
+      last_trajgen_ = -1.0e9;
+      if (has_goal) {
+        DRONE_LOG_INFO("[plan] tracking diverged: replanning from the vehicle's position");
+      }
+    }
 
     // Without the map->world transform, map-frame obstacles and the world-frame
     // vehicle cannot be put side by side, and assuming identity is exactly the

@@ -77,6 +77,67 @@ int main() {
     check(core.inHoverHold(), "watchdog fell back to hover-hold when guidance went stale");
   }
 
+  // Divergence: the reference stays fresh by the clock, but the vehicle has
+  // been knocked far away from it. This must trip hover-hold on its own
+  // (independent of stale_timeout, set generously large here so only the
+  // distance check can fire) and, critically, must make the NEXT plan root at
+  // the vehicle's real position rather than splicing onto the abandoned
+  // trajectory's reference.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.stale_timeout = 5.0;
+    cfg.max_tracking_error = 1.0;
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    core.setMap(octree);
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+    check(core.planOnce(), "planOnce produced a trajectory");
+
+    fake_time += 0.1;
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.stepControl(0.02);
+    check(!core.inHoverHold(), "tracking right after engaging, undiverged");
+
+    // Knock the vehicle 5 m sideways of the reference without advancing time,
+    // so stale_timeout cannot be what trips this.
+    const Eigen::Vector3d diverged_pos(0.0, 5.0, 1.0);
+    core.setVehicleState(airborneAt(diverged_pos));
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "divergence alone falls back to hover-hold");
+
+    // The next plan must root at the vehicle's ACTUAL position, not wherever
+    // the abandoned trajectory's reference had got to (near the original
+    // start, (0,0,1)) — that would be exactly the bug this fix closes.
+    check(core.planOnce(), "replan after divergence still produces a trajectory");
+    const auto path = core.sampledPlannedPath();
+    check(!path.empty(), "replanned path is sampleable");
+    if (!path.empty()) {
+      const Eigen::Vector3d front(path.front()[0], path.front()[1], path.front()[2]);
+      check((front - diverged_pos).norm() < 0.2,
+            "replan after divergence starts at the real position, not the stale reference");
+    }
+
+    // Still holding before the recovery trajectory's t0: the divergence must be
+    // acted on once, not on every held tick, or this would discard the recovery
+    // trajectory it is waiting for.
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "still holding before the recovery trajectory engages");
+    check(!core.sampledPlannedPath().empty(), "recovery trajectory kept while holding");
+
+    fake_time += 0.1;
+    core.stepControl(0.02);
+    check(!core.inHoverHold(), "recovery trajectory from the real position is tracked");
+  }
+
   // A start at rest is re-anchored to after the solve. The clock jumps 2 s
   // straight after its first read inside planOnce (the splice anchor), as if the
   // solve took that long: with t0 fixed at the anchor, the trajectory would be

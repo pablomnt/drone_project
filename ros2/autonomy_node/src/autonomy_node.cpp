@@ -266,6 +266,11 @@ private:
     // segment and the hand-back at completion is at the same height.
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.5});
     declare_parameter("STALE_TIMEOUT", 2.0);
+    // Distance [m] from the tracked reference at which the vehicle gives up on
+    // the trajectory: it holds its current position and the planner replans
+    // from there. Catches a vehicle knocked off course, which STALE_TIMEOUT (a
+    // planner that stopped producing) cannot. <= 0 disables the check.
+    declare_parameter("MAX_TRACKING_ERROR", 1.0);
     declare_parameter("SENSOR_TIMEOUT", 0.5);
     declare_parameter("SENSOR_WARMUP", 5.0);
     declare_parameter("RRT_MONITOR_PERIOD", 1.0);
@@ -431,6 +436,7 @@ private:
     cfg.hover_thrust = get_parameter("MPC_HOVER_THRUST").as_double();
     cfg.enable_feedforward = get_parameter("ENABLE_FEEDFORWARD").as_bool();
     cfg.stale_timeout = get_parameter("STALE_TIMEOUT").as_double();
+    cfg.max_tracking_error = get_parameter("MAX_TRACKING_ERROR").as_double();
     cfg.rrt_monitor_period = get_parameter("RRT_MONITOR_PERIOD").as_double();
     cfg.rrt_improve_period = get_parameter("RRT_IMPROVE_PERIOD").as_double();
     cfg.rrt_solve_time = get_parameter("RRT_SOLVE_TIME").as_double();

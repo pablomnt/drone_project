@@ -379,6 +379,7 @@ flight; they are marked ⚑ and listed again at the end of this section.
 |---|---|---|
 | `STALE_TIMEOUT` | double, `2.0` s | How long after a trajectory's *arrival* the tracker keeps tracking it before falling to `kHoverHold`. Guards against a dead planner, not a stale map. |
 | `SENSOR_TIMEOUT` | double, `0.5` s | A stream counts as healthy if it produced a sample within this window. Drives both guards below. |
+| `MAX_TRACKING_ERROR` | double, `1.0` m | If the vehicle gets further than this from the trajectory's reference, it gives up on that trajectory: it holds its current position, drops anything planned against the old reference, and the planner searches again and generates a new trajectory from there, starting at rest. Latched — it never resumes the abandoned trajectory. Catches what `STALE_TIMEOUT` cannot: guidance still arriving on time while the vehicle has been knocked off course. Logged as `[track] vehicle … m from the trajectory reference`. During a preset it holds until the preset's scheduled end, then returns to `POS_SP` (presets are never replanned). `≤ 0` disables. |
 | `SENSOR_WARMUP` | double, `5.0` s | Continuous stream health required before the controller will *engage*. Any lapse resets the streak, so every takeoff re-proves it. |
 
 Two guards use these. Before takeoff, the controller refuses to engage until every required stream
