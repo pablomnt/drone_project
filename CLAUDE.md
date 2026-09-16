@@ -419,8 +419,14 @@ requires it; validate any change in `USE_SIM_MODE`/SITL first. Notable behavior:
 - **Open-loop takeoff override**: on a ground `reset()` it primes a takeoff; when a setpoint above
   0.5 m arrives it ramps thrust open-loop (flat attitude) until liftoff, then hands to the PID —
   because closed-loop control near the ground with noisy VIO causes skidding.
-- **Online hover-thrust estimation**: back-calculates hover thrust from filtered command + measured
-  vertical accel, de-weighting the estimate at high vertical speed; overridable via `MPC_HOVER_THRUST`.
+- **Online hover-thrust estimation**: filters the thrust gain — measured `thrust_accel` (thrust per
+  unit mass along body up, *not* a vertical acceleration) divided by the motor-lag-filtered command —
+  and takes hover thrust as `9.81 / gain`, clamped to [0.2, 0.5]. The learning rate (2.5 s) is
+  de-weighted at high vertical speed; overridable via `MPC_HOVER_THRUST`. The accel stays on top of
+  that fraction on purpose: see *Noise* in the autonomy_node section. **This form replaced the old
+  per-sample `cmd·9.81/accel` in `2deb93a` (2026-09-14) and flew on 2026-09-16**: the estimate now
+  tracks the true hover thrust and the vehicle holds its commanded altitude, so the ~20 cm sag the
+  biased estimate used to cause is gone. The constants are unchanged.
 - **Integrator gate (`MPC_INT_ERR_MAX`, default 0.2 m)**: the velocity integrator only accumulates
   while the position error is within the limit, judged separately for XY (norm) and z. Outside it
   the integrator is **frozen, not reset** — it carries the standing trim (hover-thrust mismatch,
@@ -496,9 +502,10 @@ and `stepControl` passes it down to `TrajectoryTracker::update`. The tracker is 
 
 - `setState(pos, vel, yaw)` — the feedback quantities, re-supplied every tick because the PID closes
   on them.
-- `setThrustAccel(thrust_accel)` — the hover-thrust calibration, a separate setter because it is a
-  slowly-varying scale factor for the thrust map, not part of the feedback state, and so does not
-  have to move in lockstep with pose.
+- `setThrustAccel(thrust_accel)` — the input to the hover-thrust calibration, a separate setter
+  because what it calibrates is a slowly-varying scale factor for the thrust map, not part of the
+  feedback state, and so does not have to move in lockstep with pose. The input itself is the
+  noisiest signal in the loop (±3.5 m/s² of vibration per tick); the estimator does the averaging.
 
 The core method is `setVehicleState`, **not** `setState`, purely to keep those two apart:
 `PositionControl::setState` is an unrelated method at the bottom of the stack, and when both were
@@ -554,6 +561,21 @@ overshooting the lead costs nothing (bias it high), while overrunning it only st
 slightly past its own beginning and logs a line saying so. Note the corollary: a trajectory does
 **not** take effect on the tick that produced it, which is what `test_autonomy_core` and
 `test_trajectory_tracker` pin.
+
+**A start from rest waits for the solve instead (`f90a888`).** The lead exists so a splice can meet
+the outgoing trajectory at an instant fixed *before* solving. A trajectory with nothing to meet — a
+preset, the first plan of a flight, a replan out of hover-hold, all of which `spliceAnchor` already
+marks `from_trajectory = false` — carries no such constraint, and the vehicle is holding still
+(POS_SP or hover-hold) while the solve runs. So `restampRestStart` sets `t0 = now + kLeadMin` *after*
+the solve returns, immediately before `stagePending` — that order matters, since `stagePending` also
+records the trajectory for later splices to sample by absolute time. This is what stops a slow solve
+engaging a trajectory partway along: presets never update the measured lead, so they always ran on
+the 0.04 s floor while their solves take **1-3 s** (39 logged presets: min 0.23 s, median 1.1 s, max
+4.4 s, and they grow over a session), which put the reference up to 0.99 m ahead of the vehicle and
+already moving at 0.76 m/s on the first tracked tick — the drone then chased it and caught up. Two
+corollaries: `preset_end_` is computed from the restamped `t0`, so a preset no longer ends early by
+its own solve time; and the engaging-late log now fires only for splices, the only starts that can
+still be late.
 
 **Four known gaps in this area — read before flying tracked trajectories:**
 
@@ -721,7 +743,7 @@ and add it as a **separate** field. Do not route the hover-thrust estimator thro
 derivative of an EKF velocity state driven largely by the same accelerometer, and the EKF's own
 accel-z bias state overlaps physically with hover thrust, so the two would chase each other.
 
-**Noise, and why the estimator averages before dividing.** `sensor_combined` is PX4's rawest IMU
+**Noise, and why the estimator filters accel ÷ command.** `sensor_combined` is PX4's rawest IMU
 topic, bridged with **no rate limit** (~100 Hz received), and in flight its z reads **±3.5 m/s²** of
 vibration around 9.81 (2026-09-14 flights; the average itself agrees with VIO to <1%). Two defences:
 

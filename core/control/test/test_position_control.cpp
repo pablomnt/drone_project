@@ -125,9 +125,10 @@ int main() {
   // Hover-thrust estimator under flight-level vibration. The accel in flight reads
   // about ±3.5 m/s² of heavy-tailed noise around 9.81. The estimator must keep the
   // accel on top of the fraction it filters (thrust gain a/T): averaging the
-  // per-sample ratio T·g/a puts the noise underneath and is biased high (it read 0.31 against a true 0.29 on the
-  // 2026-09-14 flights). Closed loop: with zero gains the command is the
-  // estimate itself, and the simulated vehicle's thrust accel follows from it.
+  // per-sample ratio T·g/a puts the noise underneath and is biased high (it read
+  // 0.31 against a true 0.29 on the 2026-09-14 flights). Closed loop: with zero
+  // gains the command is the estimate itself, and the simulated vehicle's thrust
+  // accel follows from it.
   {
     constexpr double kTrueHover = 0.29;
     constexpr double kDt = 0.02;

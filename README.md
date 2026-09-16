@@ -153,14 +153,14 @@ flight; do not touch the gains or control math unless a task specifically requir
 - **Open-loop takeoff override**: on a ground `reset()` it primes a takeoff; when a setpoint above
   0.5 m arrives it ramps thrust open-loop (flat attitude) until liftoff, then hands to the PID,
   because closed-loop control near the ground with noisy VIO causes skidding.
-- **Online hover-thrust estimation**: back-calculates hover thrust from the filtered command and
-  `State::thrust_accel` (measured thrust per unit mass along body up — *not* a vertical
-  acceleration, see `common/`), de-weighting the estimate at high vertical speed. It filters the thrust gain
-  (accel ÷ command) and takes hover thrust as 9.81 ÷ gain, keeping the noisy accel on top of the
-  fraction — the old per-sample `command·9.81/accel` was biased high under flight vibration (read
-  0.31 vs a true 0.29); overridable via
-  `MPC_HOVER_THRUST`. This is the only consumer of a measured IMU quantity anywhere in the
-  controller.
+- **Online hover-thrust estimation**: filters the thrust gain — `State::thrust_accel` (measured
+  thrust per unit mass along body up, *not* a vertical acceleration, see `common/`) divided by the
+  motor-lag-filtered command — and takes hover thrust as 9.81 ÷ gain, clamped to [0.2, 0.5], with
+  the learning rate de-weighted at high vertical speed; overridable via `MPC_HOVER_THRUST`. The
+  noisy accel is kept on top of the fraction on purpose: the old per-sample `command·9.81/accel` put
+  the noise underneath and read 0.31 against a true 0.29 under flight vibration. That change
+  (`2deb93a`, 2026-09-14) flew on 2026-09-16 and holds altitude correctly. This is the only consumer of a measured IMU quantity
+  anywhere in the controller.
 - **Differential-flatness feed-forward** (added on top, default OFF): `setReference()` accepts
   `vel_ff`/`acc_ff`; with feed-forward disabled the controller is byte-identical to the baseline (a
   unit test asserts this), and it is suppressed during the takeoff ramp. The accel→attitude/thrust
@@ -177,7 +177,8 @@ whole struct to `AutonomyCore::setVehicleState()`, which stores it under a lock;
 reads it for its start state, and `stepControl()` passes it to `TrajectoryTracker::update()`. The
 tracker is what unpacks it into the controller's two setters: `PositionControl::setState(pos, vel,
 yaw)` for the feedback quantities the PID closes on, and `setThrustAccel()` for the hover-thrust
-calibration, which is a slowly-varying scale factor rather than feedback and so gets its own door.
+calibration, which calibrates a slowly-varying scale factor rather than feedback and so gets its own
+door (the input itself is very noisy; the estimator averages it).
 The core method is named `setVehicleState` rather than `setState` specifically so it does not read
 like a call to the controller's unrelated `setState` one layer down. `State::stamp` is the time the
 position sample was taken (not the tick time) and feeds the D term's measurement clock (below);
@@ -643,6 +644,19 @@ node actually subscribes to (PX4 v1.17); the standard set's `/fmu/out/vehicle_st
 name and can land in the bag with zero messages — if `ros2 bag info` shows that, record the `_v1`
 topic instead (or add the `qos_overrides.yaml` flag noted in `record_flight.sh`, since a best-effort
 QoS mismatch produces the same empty result).
+
+**Record per-thread CPU while flying** (optional, for chasing slow trajectory solves). A preset solve
+takes 1-3 s on the NUC and gets slower as the map grows, and there are two very different reasons it
+could: the solve is doing more work (more obstacle points, more corridor faces), or the planning
+thread is simply getting less CPU because RTAB-Map and OKVIS have grown heavier. Per-thread CPU tells
+them apart — during a slow solve, a planning thread near 100% means more work, while one well below
+means it is being starved. Start it in its own tmux pane once the stack is up, and Ctrl-C it after
+landing:
+```bash
+top -H -b -d 1 -p $(pgrep -f autonomy_node | head -1) > ~/flight_logs/top_threads_$(date +%F-%H%M%S).txt
+```
+Line it up afterwards with the `[preset] firing` / `trajectory staged` timestamps in `/rosout` (the
+gap between them is the solve time) and with `/telemetry/cpu_usage_total` in the bag.
 
 **Review afterwards.** Playback is storage-agnostic — the same command works for sqlite3 or mcap bags:
 ```bash
