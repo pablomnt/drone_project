@@ -47,8 +47,7 @@ public:
 
   ompl::base::Cost stateCost(const ompl::base::State* state) const override {
     if (!clearance_ && !unknown_) return ompl::base::Cost(1.0);
-    const auto* se3 = state->as<ompl::base::SE3StateSpace::StateType>();
-    const auto* pos = se3->as<ompl::base::RealVectorStateSpace::StateType>(0);
+    const auto* pos = state->as<ompl::base::RealVectorStateSpace::StateType>();
     const double x = pos->values[0], y = pos->values[1], z = pos->values[2];
 
     double penalty = 0.0;
@@ -87,9 +86,14 @@ private:
 
 GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time)
     : octree_ptr_(octree), planning_time_(planning_time) {
-  // SE(3) state space leaves room for orientation should the vehicle footprint
-  // ever become asymmetric, even though the current collision check is radial.
-  space_ = std::make_shared<ompl::base::SE3StateSpace>();
+  // Position only. An SE(3) space was used before, but nothing reads orientation
+  // (the collision check is a sphere, the trajectory takes positions) and OMPL
+  // counts the rotation angle between two states as distance. Random samples get
+  // random rotations while start and goal have none, so every detour through a
+  // sample paid ~2 m of phantom length, and the informed planners pruned nearly
+  // all samples as unable to improve a solution — a short query came back as the
+  // bare start-goal edge even when a cheaper bend existed.
+  space_ = std::make_shared<ompl::base::RealVectorStateSpace>(3);
 
   // Bounds tuned for the office test environment.
   ompl::base::RealVectorBounds bounds(3);
@@ -102,7 +106,7 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
   bounds.setLow(2, -1.5);
   bounds.setHigh(2, 2.5);
 
-  space_->as<ompl::base::SE3StateSpace>()->setBounds(bounds);
+  space_->as<ompl::base::RealVectorStateSpace>()->setBounds(bounds);
 
   si_ = std::make_shared<ompl::base::SpaceInformation>(space_);
   si_->setStateValidityChecker([this](const ompl::base::State* state) {
@@ -113,8 +117,7 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
 }
 
 bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
-  const auto* se3state = state->as<ompl::base::SE3StateSpace::StateType>();
-  const auto* pos = se3state->as<ompl::base::RealVectorStateSpace::StateType>(0);
+  const auto* pos = state->as<ompl::base::RealVectorStateSpace::StateType>();
   return positionValid(pos->values[0], pos->values[1], pos->values[2]);
 }
 
@@ -167,7 +170,7 @@ bool GeometricPlanner::positionValid(double x, double y, double z) const {
 
 bool GeometricPlanner::projectGoal(const std::vector<double>& goal,
                                    std::array<double, 3>& out) const {
-  const auto& bounds = space_->as<ompl::base::SE3StateSpace>()->getBounds();
+  const auto& bounds = space_->as<ompl::base::RealVectorStateSpace>()->getBounds();
   // Nudge inside the bounds rather than onto them: OMPL's bounds test is
   // inclusive, but a goal sitting exactly on the ceiling plane leaves the search
   // no room on one side, and the inset is far below the map resolution.
@@ -273,9 +276,10 @@ bool GeometricPlanner::isPathValid(const std::vector<std::vector<double>>& path)
   start_pos_ = {path.front()[0], path.front()[1], path.front()[2]};
 
   auto makeState = [this](const std::vector<double>& p) {
-    ompl::base::ScopedState<ompl::base::SE3StateSpace> s(space_);
-    s->setXYZ(p[0], p[1], p[2]);
-    s->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
+    ompl::base::ScopedState<ompl::base::RealVectorStateSpace> s(space_);
+    s->values[0] = p[0];
+    s->values[1] = p[1];
+    s->values[2] = p[2];
     return s;
   };
 
@@ -393,11 +397,10 @@ ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective(
 bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
                               const std::vector<double>& goal_vec,
                               std::vector<std::vector<double>>& result_path) {
-  ompl::base::ScopedState<ompl::base::SE3StateSpace> start(space_);
-  ompl::base::ScopedState<ompl::base::SE3StateSpace> goal(space_);
+  ompl::base::ScopedState<ompl::base::RealVectorStateSpace> start(space_);
+  ompl::base::ScopedState<ompl::base::RealVectorStateSpace> goal(space_);
 
-  start->setXYZ(start_vec[0], start_vec[1], start_vec[2]);
-  start->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
+  for (int i = 0; i < 3; ++i) start->values[i] = start_vec[i];
 
   // Anchor the start-state collision exemption at this solve's start. Must
   // precede projectGoal, which validates candidates under the same exemption.
@@ -420,8 +423,7 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
                                     std::pow(planning_goal[1] - goal_vec[1], 2) +
                                     std::pow(planning_goal[2] - goal_vec[2], 2));
 
-  goal->setXYZ(planning_goal[0], planning_goal[1], planning_goal[2]);
-  goal->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
+  for (int i = 0; i < 3; ++i) goal->values[i] = planning_goal[i];
 
   auto pdef = std::make_shared<ompl::base::ProblemDefinition>(si_);
   pdef->setStartAndGoalStates(start, goal);
@@ -444,9 +446,8 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
     const unsigned int n = data.numVertices();
     last_tree_.nodes.reserve(n);
     for (unsigned int i = 0; i < n; ++i) {
-      const auto* st =
-          data.getVertex(i).getState()->as<ompl::base::SE3StateSpace::StateType>();
-      const auto* pos = st->as<ompl::base::RealVectorStateSpace::StateType>(0);
+      const auto* pos =
+          data.getVertex(i).getState()->as<ompl::base::RealVectorStateSpace::StateType>();
       last_tree_.nodes.push_back({pos->values[0], pos->values[1], pos->values[2]});
     }
     for (unsigned int i = 0; i < n; ++i) {
@@ -473,9 +474,8 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   // point. Recorded before post-processing, which never moves the endpoint.
   last_goal_gap_ = std::numeric_limits<double>::infinity();
   if (path->getStateCount() > 0) {
-    const auto* end = path->getState(path->getStateCount() - 1)
-                          ->as<ompl::base::SE3StateSpace::StateType>();
-    const auto* epos = end->as<ompl::base::RealVectorStateSpace::StateType>(0);
+    const auto* epos = path->getState(path->getStateCount() - 1)
+                           ->as<ompl::base::RealVectorStateSpace::StateType>();
     last_goal_gap_ = std::sqrt(std::pow(epos->values[0] - goal_vec[0], 2) +
                                std::pow(epos->values[1] - goal_vec[1], 2) +
                                std::pow(epos->values[2] - goal_vec[2], 2));
@@ -503,8 +503,7 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   }
 
   for (std::size_t i = 0; i < path->getStateCount(); ++i) {
-    const auto* state = path->getState(i)->as<ompl::base::SE3StateSpace::StateType>();
-    const auto* pos = state->as<ompl::base::RealVectorStateSpace::StateType>(0);
+    const auto* pos = path->getState(i)->as<ompl::base::RealVectorStateSpace::StateType>();
     result_path.push_back({pos->values[0], pos->values[1], pos->values[2]});
   }
 
@@ -522,9 +521,10 @@ void GeometricPlanner::shortcutClearanceAware(
   if (waypoints.size() < 3) return;
 
   auto makeState = [this](const std::vector<double>& p) {
-    ompl::base::ScopedState<ompl::base::SE3StateSpace> s(space_);
-    s->setXYZ(p[0], p[1], p[2]);
-    s->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
+    ompl::base::ScopedState<ompl::base::RealVectorStateSpace> s(space_);
+    s->values[0] = p[0];
+    s->values[1] = p[1];
+    s->values[2] = p[2];
     return s;
   };
   auto motionValid = [&](const std::vector<double>& a, const std::vector<double>& b) {
@@ -573,9 +573,10 @@ GeometricPlanner::costBreakdown(const std::vector<std::vector<double>>& path) co
 
   ompl::geometric::PathGeometric geo(si_);
   for (const auto& p : path) {
-    ompl::base::ScopedState<ompl::base::SE3StateSpace> s(space_);
-    s->setXYZ(p[0], p[1], p[2]);
-    s->as<ompl::base::SO3StateSpace::StateType>(1)->setIdentity();
+    ompl::base::ScopedState<ompl::base::RealVectorStateSpace> s(space_);
+    s->values[0] = p[0];
+    s->values[1] = p[1];
+    s->values[2] = p[2];
     geo.append(s.get());
   }
   // The objective's per-state cost is 1 + proximity penalty + unknown surcharge,

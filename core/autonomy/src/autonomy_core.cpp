@@ -1063,7 +1063,7 @@ void AutonomyCore::plannerLoop() {
     }
 
     if (!preset_active_.load() && has_goal && map && frame_ok) {
-      ++run;
+      run++;
       // The search, the committed-path cost from the drone and every other
       // planning quantity use the vehicle position in the map frame.
       const Eigen::Vector3d pos_map = world_from_map.inverse() * state.pos;

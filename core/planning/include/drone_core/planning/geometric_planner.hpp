@@ -10,7 +10,7 @@
 #include <ompl/base/OptimizationObjective.h>
 #include <ompl/base/Planner.h>
 #include <ompl/base/SpaceInformation.h>
-#include <ompl/base/spaces/SE3StateSpace.h>
+#include <ompl/base/spaces/RealVectorStateSpace.h>
 #include <octomap/octomap.h>
 
 namespace drone_core::planning {
@@ -94,7 +94,7 @@ struct PlannerConfig {
   } eitstar;
 };
 
-// Geometric global planner: searches an SE(3) state space with a selectable OMPL
+// Geometric global planner: searches a 3D position space with a selectable OMPL
 // optimal planner (see PlannerType) against an occupancy octree and returns a
 // collision-free, clearance-aware waypoint list.
 class GeometricPlanner {
