@@ -315,20 +315,21 @@ private:
     // the controller, which keeps following POS_SP. Flip to true to enable the
     // min-snap trajectory + tracking stage.
     //
-    // Held FALSE for the PRESET_WAYPOINTS bring-up. The preset does not need it
-    // (runPreset sits at the top level of the worker loop, while this flag is
-    // checked inside the normal planning branch), and with it off the worker
-    // cannot stage a competing trajectory at all — which also keeps the takeoff
-    // ramp clear of the no-airborne-gate issue documented in CLAUDE.md. Set it
-    // back to true for planner-driven flights.
+    // Set true for planner bench testing (2026-09-17). PRESET_WAYPOINTS does not
+    // need this either way — runPreset sits at the top level of the worker loop,
+    // while this flag is checked inside the normal planning branch — but with a
+    // goal live and this true there is no airborne gate (see CLAUDE.md): do not
+    // arm with a goal already set.
     declare_parameter("PLAN_TRAJECTORY", true);
     // One-shot preset waypoints for isolating trajectory generation + the DFB
     // controller from the planner. Flip false->true (airborne, hovering on POS_SP)
-    // to fly the shape hardcoded in firePresetSquare — as it stands a 2 m square
-    // centred on the current XY at 1.5 m; the node then sets it straight back to
-    // false — it is a momentary trigger, not a mode.
-    // The square is solved once (corridor QP) and flown rest-to-rest, after which
-    // control returns to POS_SP (pointed at the square's centre). See onParameterChange.
+    // to fly the shape hardcoded in firePresetSquare — as it stands four waypoints
+    // from the drone's position, ending 2.5 m away, not the square it started as
+    // (see the waypoints themselves for the current shape); the node then sets it
+    // straight back to false — it is a momentary trigger, not a mode.
+    // Solved once (corridor QP); on completion POS_SP is pointed at the first
+    // waypoint (set on fire, before the shape flies) so the hand-back is
+    // continuous. See onParameterChange and firePresetSquare.
     declare_parameter("PRESET_WAYPOINTS", false);
     // Single switch for the planner debug visualisation: publishes the RRT*
     // search tree (/planner/search_tree), the EDT clearance field
