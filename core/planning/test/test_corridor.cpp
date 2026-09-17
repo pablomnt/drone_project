@@ -6,9 +6,11 @@
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/corridor_trajectory.hpp"
 
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <vector>
 
 using drone_core::common::Trajectory;
@@ -409,8 +411,9 @@ int main() {
     const std::vector<Eigen::Vector3d> path = {{0, 0, 1}, {0, 3, 1}};
     std::vector<Eigen::Vector3d> resampled;
     std::vector<ConvexRegion> corridor;
-    if (!drone_core::planning::buildCorridor(obs, path, params, resampled, corridor)) {
-      std::cerr << "FAIL: straight corridor between walls produced no regions\n";
+    std::string why;
+    if (!drone_core::planning::buildCorridor(obs, path, params, resampled, corridor, &why)) {
+      std::cerr << "FAIL: straight corridor between walls produced no regions (" << why << ")\n";
       ++failures;
     } else {
       if (corridor.size() != resampled.size() - 1) {
@@ -668,6 +671,157 @@ int main() {
     const auto t = drone_core::planning::truncatePath(floor, path, 0.5);
     if (t.size() < 2 || (t.back() - path.back()).norm() > kTol) {
       std::cerr << "FAIL: floor-parked start truncated its climb-out\n";
+      ++failures;
+    }
+  }
+
+  // ----------------------------------------------------- region overlap -----
+  // regionOverlapDepth is exact: the radius of the largest ball inside both.
+  {
+    using drone_core::planning::regionOverlapDepth;
+    const ConvexRegion unit = boxRegion({0, 0, 0}, {1, 1, 1});
+    const double slab = regionOverlapDepth(unit, boxRegion({0.5, 0, 0}, {1.5, 1, 1}));
+    if (std::abs(slab - 0.25) > kTol) {
+      std::cerr << "FAIL: overlap of a 0.5 m slab should be a 0.25 m ball, got " << slab << "\n";
+      ++failures;
+    }
+    const double apart = regionOverlapDepth(unit, boxRegion({2, 0, 0}, {3, 1, 1}));
+    if (std::abs(apart + 0.5) > kTol) {
+      std::cerr << "FAIL: boxes 1 m apart should read -0.5, got " << apart << "\n";
+      ++failures;
+    }
+    // Open along z (no z faces at all): a redundant row in the LP. The overlap
+    // is limited by x and y only.
+    auto prism = [](double x0, double x1) {
+      ConvexRegion r;
+      r.A.resize(4, 3);
+      r.b.resize(4);
+      r.A << 1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1, 0;
+      r.b << x1, -x0, 1.0, 0.0;
+      return r;
+    };
+    const double open_z = regionOverlapDepth(prism(0.0, 1.0), prism(0.5, 1.5));
+    if (std::abs(open_z - 0.25) > kTol) {
+      std::cerr << "FAIL: prisms open along z should share a 0.25 m ball, got " << open_z << "\n";
+      ++failures;
+    }
+    const double touching = regionOverlapDepth(unit, boxRegion({1, 0, 0}, {2, 1, 1}));
+    if (std::abs(touching) > kTol) {
+      std::cerr << "FAIL: boxes sharing only a face should read 0, got " << touching << "\n";
+      ++failures;
+    }
+
+    // Regression from the bench, 2026-09-17: the first two shrunk regions of a
+    // real corridor (half-spaces recovered from /planner/corridor). They share
+    // a ball of radius 0.8148 m (checked independently by enumerating every
+    // 4-face vertex of the LP), but away from the path, and the junction
+    // waypoint lies 9 cm outside the first region — so the old check, which only
+    // sampled the lines from that waypoint to the segment midpoints, rejected
+    // the corridor. The exact check must find the overlap.
+    auto region = [](std::initializer_list<std::array<double, 4>> faces) {
+      ConvexRegion r;
+      r.A.resize(static_cast<int>(faces.size()), 3);
+      r.b.resize(static_cast<int>(faces.size()));
+      int i = 0;
+      for (const auto& f : faces) {
+        r.A.row(i) << f[0], f[1], f[2];
+        r.b(i++) = f[3];
+      }
+      return r;
+    };
+    const ConvexRegion bench0 = region({
+        {0.253633, 0.964975, -0.067031, 0.385608},
+        {-0.819543, 0.496981, -0.285237, 0.370587},
+        {0.934736, 0.355342, 0.0, 1.984638},
+        {-0.934736, -0.355342, 0.0, 2.015362},
+        {-0.241592, 0.635515, 0.733317, 1.985221},
+        {0.241592, -0.635515, -0.733317, 1.014779},
+        {0.260578, -0.685458, 0.679887, 2.014106},
+    });
+    const ConvexRegion bench1 = region({
+        {0.438368, 0.395336, -0.807182, -0.371501},
+        {-0.548961, -0.136269, -0.824665, -0.316022},
+        {-0.365535, 0.656330, -0.660011, 0.473293},
+        {0.934736, 0.355342, 0.0, 1.984638},
+        {-0.934736, -0.355342, 0.0, 2.015362},
+        {-0.241592, 0.635515, 0.733317, 2.365489},
+        {0.241592, -0.635515, -0.733317, 0.014779},
+        {0.260578, -0.685458, 0.679887, 2.014106},
+    });
+    const Eigen::Vector3d junction(-0.249, 0.611, 0.732);
+    if (bench0.contains(junction)) {
+      std::cerr << "FAIL: bench regression fixture no longer has the junction outside region 0\n";
+      ++failures;
+    }
+    const double bench = regionOverlapDepth(bench0, bench1);
+    if (std::abs(bench - 0.8148) > 2e-3) {
+      std::cerr << "FAIL: bench regions should share a 0.8148 m ball, got " << bench << "\n";
+      ++failures;
+    }
+  }
+
+  // The LP inside regionOverlapDepth is a hand-written simplex, so check it
+  // against brute force on random polyhedra: the optimum of a 4-variable LP sits
+  // where 4 constraints are active, so enumerating every 4-face combination and
+  // keeping the best feasible one is exact (just too slow for the flight path).
+  // Covers overlapping, touching-ish and disjoint pairs, degenerate faces included.
+  {
+    using drone_core::planning::regionOverlapDepth;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> unif(-1.0, 1.0);
+    auto randomRegion = [&](const Eigen::Vector3d& centre, int faces) {
+      ConvexRegion r;
+      r.A.resize(faces, 3);
+      r.b.resize(faces);
+      for (int f = 0; f < faces; ++f) {
+        Eigen::Vector3d nrm(unif(rng), unif(rng), unif(rng));
+        if (f < 6) nrm = Eigen::Vector3d::Unit(f / 2) * (f % 2 ? -1.0 : 1.0);  // keep it bounded
+        nrm.normalize();
+        r.A.row(f) = nrm;
+        r.b(f) = nrm.dot(centre) + 0.3 + 0.7 * (unif(rng) + 1.0);
+      }
+      return r;
+    };
+    auto bruteForce = [](const ConvexRegion& a, const ConvexRegion& b) {
+      const int m = static_cast<int>(a.A.rows() + b.A.rows());
+      Eigen::MatrixXd M(m, 4);
+      Eigen::VectorXd rhs(m);
+      M << a.A, Eigen::VectorXd::Ones(a.A.rows()), b.A, Eigen::VectorXd::Ones(b.A.rows());
+      rhs << a.b, b.b;
+      double best = -std::numeric_limits<double>::infinity();
+      for (int i = 0; i < m; ++i)
+        for (int j = i + 1; j < m; ++j)
+          for (int k = j + 1; k < m; ++k)
+            for (int l = k + 1; l < m; ++l) {
+              Eigen::Matrix4d S;
+              S << M.row(i), M.row(j), M.row(k), M.row(l);
+              if (std::abs(S.determinant()) < 1e-10) continue;
+              const Eigen::Vector4d z = S.inverse() * Eigen::Vector4d(rhs(i), rhs(j), rhs(k), rhs(l));
+              if (((M * z - rhs).array() <= 1e-9).all()) best = std::max(best, z(3));
+            }
+      return best;
+    };
+    int mismatches = 0;
+    for (int trial = 0; trial < 200; ++trial) {
+      const Eigen::Vector3d ca(unif(rng), unif(rng), unif(rng));
+      const Eigen::Vector3d cb = ca + 2.5 * Eigen::Vector3d(unif(rng), unif(rng), unif(rng));
+      const ConvexRegion ra = randomRegion(ca, 6 + trial % 5);
+      ConvexRegion rb = randomRegion(cb, 6 + (trial / 5) % 5);
+      if (trial % 7 == 0) {  // duplicate a face of `a` into `b`: parallel, coincident rows
+        rb.A.row(0) = ra.A.row(0);
+        rb.b(0) = ra.b(0);
+      }
+      const double expected = bruteForce(ra, rb);
+      const double got = regionOverlapDepth(ra, rb);
+      if (std::abs(got - expected) > 1e-6) {
+        if (mismatches++ < 3) {
+          std::cerr << "FAIL: overlap LP " << got << " vs brute force " << expected << " (trial "
+                    << trial << ")\n";
+        }
+      }
+    }
+    if (mismatches > 0) {
+      std::cerr << "FAIL: overlap LP disagreed with brute force on " << mismatches << "/200 pairs\n";
       ++failures;
     }
   }

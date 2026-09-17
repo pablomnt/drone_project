@@ -87,6 +87,17 @@ struct CorridorParams {
 // visualisation rates, but not something to call on the flight path.
 std::vector<std::vector<Eigen::Vector3d>> regionFaceLoops(const ConvexRegion& region);
 
+// How deeply two regions overlap: the radius [m] of the largest ball inside
+// both, from a small exact LP (maximise r subject to n·x + |n| r <= b over the
+// faces of both regions). Negative when the regions are disjoint, by roughly how
+// far apart they are; zero when they only touch. Exact rather than sampled, so it
+// finds an overlap wherever it lies — the C0 handover between consecutive
+// corridor segments only needs the junction somewhere in the intersection, not
+// near the waypoint. A region with no faces is unbounded and overlaps anything
+// (+infinity); a solve that fails returns -infinity, the safe side for a caller
+// reading this as overlap depth. Microseconds for corridor-sized regions.
+double regionOverlapDepth(const ConvexRegion& a, const ConvexRegion& b);
+
 // Subdivide any path segment longer than max_segment_len into equal pieces so
 // every output segment respects the cap. Keeps the original waypoints; never
 // produces consecutive duplicates. A degenerate input (<2 points, cap <= 0)

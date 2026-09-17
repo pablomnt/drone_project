@@ -361,7 +361,17 @@ Module roles:
   are pulled in by `CORRIDOR_MARGIN` + the voxel half-diagonal (obstacle points are voxel *centres*),
   then each region is validated for a non-empty overlap with its neighbour, since C0 continuity pins
   the junction into that intersection and shrinking can empty it. **The first region is the
-  exception** — see the start relaxation below. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
+  exception** — see the start relaxation below. The overlap test is **exact**
+  (`regionOverlapDepth`: the radius of the largest ball inside both regions, via a small dual
+  simplex, microseconds) and requires at least 2 cm (`kMinRegionOverlap`). It replaced sampling 11
+  points on the lines from the junction waypoint to the two segment midpoints, which missed overlaps
+  lying off those lines: on the bench (2026-09-17) it rejected every tick a corridor whose regions
+  shared a 0.81 m ball, because the junction sat 9 cm outside the shrunk first region. OSQP was tried
+  for the LP first and hit its iteration cap on degenerate near-parallel faces, which is why it is a
+  hand-written simplex; `test_corridor` cross-checks it against brute force on 200 random pairs. The
+  interior junction is free in the planner's QP, so "they overlap somewhere" is exactly the need;
+  presets pin junctions to waypoints, and a waypoint outside a shrunk region there surfaces as `QP
+  INFEASIBLE` rather than as a decomposition failure. `corridor_trajectory.{hpp,cpp}`: `CorridorTrajectoryOptimizer`
   solves degree-7 min-snap as an **OSQP QP** — monomial coefficients (same snap `Q`), C0–C4
   continuity, rest-to-rest ends, Bézier control points of position confined to the regions and of
   vel/acc/jerk within per-axis `VMAX/AMAX/JMAX` (hull property ⇒ the whole curve complies; solved in

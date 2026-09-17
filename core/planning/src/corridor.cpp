@@ -1,6 +1,7 @@
 #include "drone_core/planning/corridor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -14,6 +15,13 @@
 #include <decomp_util/ellipsoid_decomp.h>
 
 namespace drone_core::planning {
+
+namespace {
+// Shallowest overlap two consecutive regions may have [m] (radius of the largest
+// ball inside both). Any positive depth lets the C0 junction sit in both; this
+// only keeps a sliver the solver cannot tell from empty from reaching the QP.
+constexpr double kMinRegionOverlap = 0.02;
+}  // namespace
 
 std::vector<std::vector<Eigen::Vector3d>> regionFaceLoops(const ConvexRegion& region) {
   std::vector<std::vector<Eigen::Vector3d>> loops;
@@ -71,6 +79,131 @@ std::vector<std::vector<Eigen::Vector3d>> regionFaceLoops(const ConvexRegion& re
     loops.push_back(std::move(on_face));
   }
   return loops;
+}
+
+double regionOverlapDepth(const ConvexRegion& a, const ConvexRegion& b) {
+  // A region with no faces is all of space (ConvexRegion::contains agrees).
+  if (a.A.rows() == 0 || b.A.rows() == 0) return std::numeric_limits<double>::infinity();
+
+  // Primal: maximise r over (x, r) subject to n_i·x + |n_i| r <= b_i for every
+  // face i of both regions — the ball of radius r about x is inside every face.
+  // Solved through its dual, which is in standard form with only four equality
+  // rows and one column per face:
+  //   minimise b·y  subject to  sum_i y_i n_i = 0,  sum_i y_i |n_i| = 1,  y >= 0.
+  // By strong duality the optimum equals the primal's largest radius. Dense
+  // two-phase simplex with Bland's rule (no cycling on the degenerate, near-
+  // parallel faces corridor regions carry). OSQP was tried first and stalled at
+  // its iteration cap on exactly those faces, which is ADMM's known weakness on
+  // degenerate LPs; this is exact and needs no cap on well-formed input.
+  const int m = static_cast<int>(a.A.rows() + b.A.rows());
+  constexpr int kRows = 4;
+  const int cols = m + kRows;  // face columns, then one artificial per row
+  Eigen::MatrixXd T = Eigen::MatrixXd::Zero(kRows, cols + 1);  // last column: rhs
+  Eigen::VectorXd face_b(m);
+  int col = 0;
+  for (const ConvexRegion* region : {&a, &b}) {
+    for (int f = 0; f < region->A.rows(); ++f, ++col) {
+      const Eigen::Vector3d nrm = region->A.row(f).transpose();
+      T.block(0, col, 3, 1) = nrm;
+      T(3, col) = nrm.norm();
+      face_b(col) = region->b(f);
+    }
+  }
+  for (int r = 0; r < kRows; ++r) T(r, m + r) = 1.0;
+  T(3, cols) = 1.0;  // rhs (0, 0, 0, 1) is already non-negative
+  std::array<int, kRows> basis = {m, m + 1, m + 2, m + 3};
+
+  constexpr double kEps = 1e-9;
+  const int max_pivots = 50 * cols;  // Bland's rule terminates; this only guards bad input
+  // Minimise cost·y over the current tableau. Artificial columns may leave the
+  // basis but never re-enter once phase 1 is done. False on unbounded or on
+  // hitting the pivot guard.
+  auto simplex = [&](const Eigen::VectorXd& cost, bool allow_artificial, bool& unbounded) {
+    unbounded = false;
+    for (int it = 0; it < max_pivots; ++it) {
+      int enter = -1;
+      const int limit = allow_artificial ? cols : m;
+      for (int j = 0; j < limit && enter < 0; ++j) {
+        double reduced = cost(j);
+        for (int r = 0; r < kRows; ++r) reduced -= cost(basis[r]) * T(r, j);
+        if (reduced < -kEps) enter = j;
+      }
+      if (enter < 0) return true;  // optimal
+      int leave = -1;
+      double best = std::numeric_limits<double>::infinity();
+      for (int r = 0; r < kRows; ++r) {
+        if (T(r, enter) <= kEps) continue;
+        const double ratio = T(r, cols) / T(r, enter);
+        if (leave < 0 || ratio < best - kEps ||
+            (std::abs(ratio - best) <= kEps && basis[r] < basis[leave])) {
+          best = ratio;
+          leave = r;
+        }
+      }
+      if (leave < 0) {
+        unbounded = true;
+        return false;
+      }
+      T.row(leave) /= T(leave, enter);
+      for (int r = 0; r < kRows; ++r) {
+        if (r != leave && T(r, enter) != 0.0) T.row(r) -= T(r, enter) * T.row(leave);
+      }
+      basis[leave] = enter;
+    }
+    return false;
+  };
+
+  // Phase 1: minimise the artificials to find a feasible dual basis.
+  Eigen::VectorXd cost1 = Eigen::VectorXd::Zero(cols);
+  cost1.tail(kRows).setOnes();
+  bool unbounded = false;
+  if (!simplex(cost1, /*allow_artificial=*/true, unbounded)) {
+    return -std::numeric_limits<double>::infinity();
+  }
+  double infeasibility = 0.0;
+  for (int r = 0; r < kRows; ++r) {
+    if (basis[r] >= m) infeasibility += T(r, cols);
+  }
+  // No dual solution means the primal is unbounded: the regions share an
+  // infinite ball, which closed corridor regions never do.
+  if (infeasibility > 1e-7) return std::numeric_limits<double>::infinity();
+  // Pivot any artificial still basic at zero out on a face column, so phase 2
+  // prices real columns only. A row with no such column is redundant (all face
+  // normals lack that component, e.g. a region open along z); its artificial
+  // stays at zero and phase 2 never moves it. On bounded regions the phase-1
+  // ratio test has already removed them, so this is for degenerate input only.
+  for (int r = 0; r < kRows; ++r) {
+    if (basis[r] < m) continue;
+    for (int j = 0; j < m; ++j) {
+      if (std::abs(T(r, j)) > kEps) {
+        T.row(r) /= T(r, j);
+        for (int k = 0; k < kRows; ++k) {
+          if (k != r && T(k, j) != 0.0) T.row(k) -= T(k, j) * T.row(r);
+        }
+        basis[r] = j;
+        break;
+      }
+    }
+  }
+
+  // Phase 2: minimise b·y. Artificials cost nothing and cannot enter.
+  Eigen::VectorXd cost2 = Eigen::VectorXd::Zero(cols);
+  cost2.head(m) = face_b;
+  if (!simplex(cost2, /*allow_artificial=*/false, unbounded)) {
+    // Unbounded dual = infeasible primal, impossible here (r can always shrink);
+    // treat it, and the pivot guard, as no usable overlap.
+    return -std::numeric_limits<double>::infinity();
+  }
+  double depth = 0.0;
+  for (int r = 0; r < kRows; ++r) {
+    // An artificial that phase 2 pushed off zero means the basis is no longer a
+    // dual solution and the value below would not be the overlap. Fail safe.
+    if (basis[r] >= m && std::abs(T(r, cols)) > 1e-7) {
+      return -std::numeric_limits<double>::infinity();
+    }
+    depth += cost2(basis[r]) * T(r, cols);
+  }
+  return depth;
 }
 
 std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& path,
@@ -354,11 +487,12 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
   // so requiring waypoints inside the shrunk regions would reintroduce the
   // "path barely clears, corridor fails" mode this rewrite removes; what C0
   // continuity actually needs is a non-empty INTERSECTION of each consecutive
-  // pair. Exact emptiness needs an LP; instead sample candidate points along
-  // the mid[s] -> junction -> mid[s+1] polyline and accept the first inside
-  // both regions. Approximate in the safe direction: it can fail a corridor
-  // whose overlap is real but sliver-thin (costing a tick of progress), and
-  // never passes an empty one.
+  // pair, wherever it lies. Checked exactly, as the deepest ball inside both
+  // (regionOverlapDepth). This replaced sampling 11 points on the lines from the
+  // junction waypoint to the two segment midpoints, which missed any overlap
+  // off those lines: on the bench (2026-09-17) it rejected two regions sharing
+  // a 0.82 m-radius ball because the junction itself sat 9 cm outside the
+  // shrunk first region.
   // With the adaptive shrink above, the first region can only miss the drone if
   // it was already outside the UNSHRUNK region or within half a voxel of it —
   // i.e. the conservative map says the vehicle is in, or touching, an occupied
@@ -375,22 +509,13 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
     return fail("margin shrink pushed the last region past the goal position");
   }
   for (size_t s = 0; s + 1 < regions_out.size(); ++s) {
-    const Eigen::Vector3d mid_a = 0.5 * (resampled_out[s] + resampled_out[s + 1]);
-    const Eigen::Vector3d mid_b = 0.5 * (resampled_out[s + 1] + resampled_out[s + 2]);
-    const Eigen::Vector3d& wp = resampled_out[s + 1];
-    bool overlap = false;
-    constexpr int kProbes = 11;  // wp first, then walk outward along both half-polylines
-    for (int k = 0; k < kProbes && !overlap; ++k) {
-      const double t = static_cast<double>(k) / (kProbes - 1);
-      overlap = regions_out[s].contains(wp + t * (mid_a - wp)) &&
-                regions_out[s + 1].contains(wp + t * (mid_a - wp));
-      if (!overlap)
-        overlap = regions_out[s].contains(wp + t * (mid_b - wp)) &&
-                  regions_out[s + 1].contains(wp + t * (mid_b - wp));
-    }
-    if (!overlap) {
+    const double depth = regionOverlapDepth(regions_out[s], regions_out[s + 1]);
+    if (depth < kMinRegionOverlap) {
       std::ostringstream os;
-      os << "regions " << s << " and " << s + 1 << " stopped overlapping after the margin shrink";
+      os << "regions " << s << " and " << s + 1 << " stopped overlapping after the margin shrink ("
+         << (std::isfinite(depth) ? "largest ball inside both " + std::to_string(depth) + " m"
+                                  : std::string("overlap solve failed"))
+         << ", need " << kMinRegionOverlap << " m)";
       return fail(os.str());
     }
   }
