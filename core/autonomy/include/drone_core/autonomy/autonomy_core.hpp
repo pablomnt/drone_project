@@ -232,8 +232,12 @@ public:
   // corridor pipeline needs one); with none the request is logged and dropped.
   void firePreset(const std::vector<Eigen::Vector3d>& waypoints);
 
-  // Live reconfiguration of the controller gains, hover thrust and feed-forward
-  // flag. Applied on the control thread at the next step.
+  // Live reconfiguration of the whole Config. Each thread picks it up on its own:
+  // the planner worker at the start of its next cycle (and planOnce at its
+  // start), armed or not, and the control thread at its next stepControl. So a
+  // planning parameter changed on a disarmed bench takes effect within one
+  // planner cycle, and a control parameter changed before arming is in force on
+  // the first control tick.
   void applyConfig(const Config& config);
 
   // Re-arm the controller on (re)engagement.
@@ -442,7 +446,15 @@ private:
   // worker owns), and only when debug_planner_viz is set.
   std::vector<std::array<double, 4>> sampleClearanceField() const;
 
+  // Two copies of the config, one per thread, so neither reads memory the other
+  // is writing. cfg_ belongs to the planner worker (and planOnce, which is not
+  // run alongside it); control_cfg_ to the thread calling stepControl. Both are
+  // refreshed from pending_config_ under io_mutex_, each on its own dirty flag.
+  // (There used to be one cfg_, assigned whole by stepControl while the worker
+  // read it unlocked — a data race — and only refreshed once the host started
+  // calling stepControl, i.e. once armed.)
   Config cfg_;
+  Config control_cfg_;
   std::function<double()> clock_;
 
   control::TrajectoryTracker tracker_;
@@ -472,7 +484,8 @@ private:
   // consumed by the worker to replan from the vehicle's position.
   std::atomic<bool> replan_requested_{false};
   Config pending_config_;
-  bool config_dirty_{false};
+  bool worker_config_dirty_{false};
+  bool control_config_dirty_{false};
 
   mutable std::mutex traj_mutex_;
   common::Trajectory pending_;
@@ -513,10 +526,12 @@ private:
   // model for both collision validity and the clearance cost. See clearanceField.
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> edt_;
   planning::MapHandle edt_source_map_;
+  double edt_maxdist_{0.0};  // clearance_threshold the field was built with
   // Second cached field over the conservative map view (truncation + corridor).
   // See conservativeField.
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> cons_edt_;
   planning::MapHandle cons_edt_source_map_;
+  double cons_edt_maxdist_{0.0};
   planning::MapHandle viz_sampled_map_;  // map the debug clearance samples were taken from
 };
 

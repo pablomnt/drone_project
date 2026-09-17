@@ -420,66 +420,83 @@ private:
     declare_parameter<std::vector<double>>("CORRIDOR_BBOX", {1.0, 2.0, 2.0});
   }
 
-  drone_core::autonomy::AutonomyCore::Config configFromParameters() {
+  // Build the core's Config from the node parameters. `incoming`, when given, are
+  // values in the middle of being set: they win over what param()
+  // returns. That matters because onParameterChange is registered with
+  // add_on_set_parameters_callback, which runs BEFORE the new values are stored,
+  // so reading param() there alone returns the OLD value (checked on
+  // Humble: a callback setting X from 1 to 5 reads 1). This used to push the
+  // previous config on every set, so a change only reached the core when some
+  // other parameter was set later.
+  drone_core::autonomy::AutonomyCore::Config configFromParameters(
+      const std::vector<rclcpp::Parameter>* incoming = nullptr) {
+    const auto param = [&](const std::string& name) {
+      if (incoming) {
+        for (const auto& p : *incoming) {
+          if (p.get_name() == name) return p;
+        }
+      }
+      return get_parameter(name);
+    };
     drone_core::autonomy::AutonomyCore::Config cfg;
-    const double xy_p = get_parameter("MPC_XY_P").as_double();
-    const double z_p = get_parameter("MPC_Z_P").as_double();
+    const double xy_p = param("MPC_XY_P").as_double();
+    const double z_p = param("MPC_Z_P").as_double();
     cfg.pos_p = Eigen::Vector3d(xy_p, xy_p, z_p);
 
-    const double xy_vp = get_parameter("MPC_XY_VEL_P").as_double();
-    const double z_vp = get_parameter("MPC_Z_VEL_P").as_double();
+    const double xy_vp = param("MPC_XY_VEL_P").as_double();
+    const double z_vp = param("MPC_Z_VEL_P").as_double();
     cfg.vel_p = Eigen::Vector3d(xy_vp, xy_vp, z_vp);
 
-    const double xy_vi = get_parameter("MPC_XY_VEL_I").as_double();
-    const double z_vi = get_parameter("MPC_Z_VEL_I").as_double();
+    const double xy_vi = param("MPC_XY_VEL_I").as_double();
+    const double z_vi = param("MPC_Z_VEL_I").as_double();
     cfg.vel_i = Eigen::Vector3d(xy_vi, xy_vi, z_vi);
 
-    const double xy_vd = get_parameter("MPC_XY_VEL_D").as_double();
-    const double z_vd = get_parameter("MPC_Z_VEL_D").as_double();
+    const double xy_vd = param("MPC_XY_VEL_D").as_double();
+    const double z_vd = param("MPC_Z_VEL_D").as_double();
     cfg.vel_d = Eigen::Vector3d(xy_vd, xy_vd, z_vd);
-    cfg.vel_d_tau = get_parameter("MPC_VEL_D_TAU").as_double();
-    cfg.int_err_limit = get_parameter("MPC_INT_ERR_MAX").as_double();
+    cfg.vel_d_tau = param("MPC_VEL_D_TAU").as_double();
+    cfg.int_err_limit = param("MPC_INT_ERR_MAX").as_double();
 
-    cfg.hover_thrust = get_parameter("MPC_HOVER_THRUST").as_double();
-    cfg.enable_feedforward = get_parameter("ENABLE_FEEDFORWARD").as_bool();
-    cfg.stale_timeout = get_parameter("STALE_TIMEOUT").as_double();
-    cfg.max_tracking_error = get_parameter("MAX_TRACKING_ERROR").as_double();
-    cfg.bench_replan_from_state = get_parameter("BENCH_TEST_REPLAN_DISABLER").as_bool();
-    cfg.rrt_monitor_period = get_parameter("RRT_MONITOR_PERIOD").as_double();
-    cfg.rrt_improve_period = get_parameter("RRT_IMPROVE_PERIOD").as_double();
-    cfg.rrt_solve_time = get_parameter("RRT_SOLVE_TIME").as_double();
-    const std::string planner = get_parameter("PLANNER_TYPE").as_string();
+    cfg.hover_thrust = param("MPC_HOVER_THRUST").as_double();
+    cfg.enable_feedforward = param("ENABLE_FEEDFORWARD").as_bool();
+    cfg.stale_timeout = param("STALE_TIMEOUT").as_double();
+    cfg.max_tracking_error = param("MAX_TRACKING_ERROR").as_double();
+    cfg.bench_replan_from_state = param("BENCH_TEST_REPLAN_DISABLER").as_bool();
+    cfg.rrt_monitor_period = param("RRT_MONITOR_PERIOD").as_double();
+    cfg.rrt_improve_period = param("RRT_IMPROVE_PERIOD").as_double();
+    cfg.rrt_solve_time = param("RRT_SOLVE_TIME").as_double();
+    const std::string planner = param("PLANNER_TYPE").as_string();
     if (!drone_core::planning::fromString(planner, cfg.planner_type)) {
       RCLCPP_WARN(get_logger(), "Unknown PLANNER_TYPE '%s', using RRTstar.", planner.c_str());
       cfg.planner_type = drone_core::planning::PlannerType::RRTstar;
     }
-    cfg.replan_improve_ratio = get_parameter("REPLAN_IMPROVE_RATIO").as_double();
-    cfg.clearance_weight = get_parameter("CLEARANCE_WEIGHT").as_double();
-    cfg.clearance_threshold = get_parameter("CLEARANCE_THRESHOLD").as_double();
-    cfg.unknown_weight = get_parameter("UNKNOWN_WEIGHT").as_double();
+    cfg.replan_improve_ratio = param("REPLAN_IMPROVE_RATIO").as_double();
+    cfg.clearance_weight = param("CLEARANCE_WEIGHT").as_double();
+    cfg.clearance_threshold = param("CLEARANCE_THRESHOLD").as_double();
+    cfg.unknown_weight = param("UNKNOWN_WEIGHT").as_double();
     // Whether unmapped space is a hazard at all — drives the cost surcharge and
     // truncation's refusal to commit into unobserved cells. Passed as its own
     // flag rather than left for the core to infer from the presence of a
     // conservative map view: that view only exists once a frontier cloud has
     // arrived, and both guards work off the raw octree without one.
-    cfg.treat_unknown_as_hazard = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
-    cfg.trajgen_period = get_parameter("TRAJGEN_PERIOD").as_double();
-    cfg.plan_trajectory = get_parameter("PLAN_TRAJECTORY").as_bool();
-    cfg.debug_planner_viz = get_parameter("DEBUG_PLANNER_VIZ").as_bool();
-    cfg.best_effort_goal = get_parameter("BEST_EFFORT_GOAL").as_bool();
+    cfg.treat_unknown_as_hazard = param("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
+    cfg.trajgen_period = param("TRAJGEN_PERIOD").as_double();
+    cfg.plan_trajectory = param("PLAN_TRAJECTORY").as_bool();
+    cfg.debug_planner_viz = param("DEBUG_PLANNER_VIZ").as_bool();
+    cfg.best_effort_goal = param("BEST_EFFORT_GOAL").as_bool();
     // With RTAB-Map correcting its map separately from OKVIS, planning without the
     // map->world transform would put obstacles off by that correction, so the core
     // must wait for it. In sim the map and the state share one frame.
-    cfg.require_map_to_world = !get_parameter("USE_SIM_MODE").as_bool();
-    cfg.use_corridor_qp = get_parameter("USE_CORRIDOR_QP").as_bool();
-    cfg.vmax = get_parameter("VMAX").as_double();
-    cfg.amax = get_parameter("AMAX").as_double();
-    cfg.jmax = get_parameter("JMAX").as_double();
-    cfg.frontier_margin = get_parameter("FRONTIER_MARGIN").as_double();
-    cfg.corridor_margin = get_parameter("CORRIDOR_MARGIN").as_double();
-    cfg.escape_ramp_dist = get_parameter("ESCAPE_RAMP_DIST").as_double();
-    cfg.max_segment_len = get_parameter("MAX_SEGMENT_LEN").as_double();
-    const auto bbox = get_parameter("CORRIDOR_BBOX").as_double_array();
+    cfg.require_map_to_world = !param("USE_SIM_MODE").as_bool();
+    cfg.use_corridor_qp = param("USE_CORRIDOR_QP").as_bool();
+    cfg.vmax = param("VMAX").as_double();
+    cfg.amax = param("AMAX").as_double();
+    cfg.jmax = param("JMAX").as_double();
+    cfg.frontier_margin = param("FRONTIER_MARGIN").as_double();
+    cfg.corridor_margin = param("CORRIDOR_MARGIN").as_double();
+    cfg.escape_ramp_dist = param("ESCAPE_RAMP_DIST").as_double();
+    cfg.max_segment_len = param("MAX_SEGMENT_LEN").as_double();
+    const auto bbox = param("CORRIDOR_BBOX").as_double_array();
     if (bbox.size() == 3) {
       cfg.corridor_bbox = Eigen::Vector3d(bbox[0], bbox[1], bbox[2]);
     } else {
@@ -496,13 +513,31 @@ private:
     // in the control tick, where a fresh state estimate is in hand and we know the
     // vehicle is armed, offboard and airborne. The tick sets the parameter back to
     // false once consumed.
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    // Built from the incoming values: this callback runs before they are stored
+    // (see configFromParameters). A value of the wrong type throws here, so the
+    // set is refused with the reason instead of taking the node down.
+    drone_core::autonomy::AutonomyCore::Config cfg;
+    try {
+      cfg = configFromParameters(&params);
+    } catch (const std::exception& e) {
+      result.successful = false;
+      result.reason = e.what();
+      RCLCPP_WARN(get_logger(), "Parameter change refused: %s", e.what());
+      return result;
+    }
     for (const auto& p : params) {
       if (p.get_name() == "PRESET_WAYPOINTS" && p.as_bool()) preset_fire_requested_ = true;
     }
-    // The control loop reads parameters live, so just push a refreshed config.
-    if (core_) core_->applyConfig(configFromParameters());
-    rcl_interfaces::msg::SetParametersResult result;
-    result.successful = true;
+    // The core applies it on each thread by itself, armed or not (see
+    // AutonomyCore::applyConfig).
+    if (core_) core_->applyConfig(cfg);
+    for (const auto& p : params) {
+      if (p.get_name() == "PRESET_WAYPOINTS" || p.get_name() == "POS_SP") continue;  // node-driven
+      RCLCPP_INFO(get_logger(), "Parameter %s = %s", p.get_name().c_str(),
+                  p.value_to_string().c_str());
+    }
     return result;
   }
 

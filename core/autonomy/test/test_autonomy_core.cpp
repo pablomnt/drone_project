@@ -354,6 +354,72 @@ int main() {
     check(above_floor, "corridor trajectory keeps the collision margin off the floor");
   }
 
+  // Config reaches each thread on its own. Planning must see a change without
+  // stepControl ever running (a disarmed bench never calls it), and control must
+  // see one on its first tick. Before the per-thread split, cfg_ was only updated
+  // inside stepControl, so on a disarmed bench no planning parameter ever
+  // changed after launch.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.stale_timeout = 5.0;
+    cfg.rrt_solve_time = 0.2;
+    cfg.require_map_to_world = true;  // and no transform is ever set
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+    core.setMap(std::make_shared<octomap::OcTree>(0.1));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+    check(!core.planOnce(), "config case: refuses to plan without a map->world transform");
+
+    autonomy::AutonomyCore::Config relaxed = cfg;
+    relaxed.require_map_to_world = false;
+    core.applyConfig(relaxed);
+    check(core.planOnce(), "planning picks up a config change without any stepControl");
+
+    // Control: a tighter stale timeout must be in force from the first tick.
+    autonomy::AutonomyCore::Config tight = relaxed;
+    tight.stale_timeout = 0.05;
+    core.applyConfig(tight);
+    core.stepControl(0.02);  // installs the trajectory, stamped now
+    fake_time += 0.1;
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "control picks up a config change on its first tick");
+  }
+
+  // Same for the background worker, on a real clock and without stepControl.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.rrt_solve_time = 0.2;
+    cfg.require_map_to_world = true;
+    autonomy::AutonomyCore core(cfg);
+    core.setMap(std::make_shared<octomap::OcTree>(0.1));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(2.0, 0.0, 1.0);
+    core.setGoal(goal);
+    core.startPlanner();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    check(core.geometricPath().empty(), "worker idles while the config requires a transform");
+
+    autonomy::AutonomyCore::Config relaxed = cfg;
+    relaxed.require_map_to_world = false;
+    core.applyConfig(relaxed);
+    bool planned = false;
+    for (int i = 0; i < 40 && !planned; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      planned = !core.geometricPath().empty();
+    }
+    core.stopPlanner();
+    check(planned, "worker picks up a config change without any stepControl");
+  }
+
   // Background planner thread: should plan and stage without help.
   {
     autonomy::AutonomyCore::Config cfg;

@@ -794,6 +794,23 @@ also straddling PX4's own 500 ms offboard-loss threshold. After the split, repla
 - `tf_buffer_` (the `map→world` lookup) is read from both groups — the control tick, `onGoal` and
   `onOctomap` — and needs no lock of ours: `tf2_ros::Buffer` is thread-safe, and the pointer is set
   once in the constructor before any callback exists.
+- **Parameter changes (fixed 2026-09-17, NOT yet flown).** Two bugs meant a `ros2 param set` did
+  not do what it said. (1) `onParameterChange` is registered with `add_on_set_parameters_callback`,
+  which rclcpp runs *before* storing the new values, so the `get_parameter()` calls in
+  `configFromParameters()` read the old ones (verified on Humble: setting X from 1 to 5, the callback
+  reads 1). Every set pushed the previous config; a change only landed when some other parameter was
+  set later (the node sets `POS_SP`/`PRESET_WAYPOINTS` itself, which hid it). Now
+  `configFromParameters(&params)` overlays the incoming values; do not go back to plain
+  `get_parameter()` there. A type error refuses the set instead of throwing. (2) The core's `cfg_`
+  was only refreshed inside `stepControl`, which the node calls only armed+offboard, so no planning
+  parameter changed after launch on a disarmed bench — and the worker read `cfg_` unlocked while
+  `stepControl` assigned it, a data race. Now `applyConfig` sets a dirty flag per thread: the worker
+  copies `pending_config_` into its own `cfg_` at the top of each cycle (`planOnce` at its start),
+  the control thread into `control_cfg_` in `stepControl`. Neither thread touches the other's copy.
+  The cached distance fields also rebuild when `CLEARANCE_THRESHOLD`/`FRONTIER_MARGIN` change
+  (they were keyed on the map object only). Tested in `test_autonomy_core` (planOnce, the threaded
+  worker without `stepControl`, and control on its first tick; the two pick-up points are
+  mutation-checked); the node-side overlay and the field rebuild have no unit test.
 - `AutonomyCore` is already fully internally locked (`io_mutex_` / `traj_mutex_`, both short-held)
   and was already being called from the planner worker thread, so `setMap` from the slow group
   alongside `setVehicleState`/`stepControl` from the fast group is safe as-is.

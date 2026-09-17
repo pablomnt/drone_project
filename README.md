@@ -350,9 +350,12 @@ RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (ray-traced 3D oc
 
 ## Runtime parameters
 
-Every parameter below is declared by `autonomy_node` and is **live-reconfigurable** — the control
-loop re-reads them each tick and `onParameterChange` pushes a refreshed config into the core, so
-`ros2 param set /autonomy_node <NAME> <VALUE>` takes effect immediately. There are no launch-file
+Every parameter below is declared by `autonomy_node` and is **live-reconfigurable**, armed or not:
+`ros2 param set /autonomy_node <NAME> <VALUE>` reaches the planner within one planner cycle and the
+controller on its next tick, and the node logs `Parameter <NAME> = <VALUE>` when it has taken it. A
+value of the wrong type is refused with a warning rather than applied. (Before 2026-09-17 neither
+held: a change pushed the *previous* value, and planning parameters only reached the core once the
+drone was armed, so on a disarmed bench they never changed after launch.) There are no launch-file
 overrides and no YAML parameter file: the defaults in the table are the `declare_parameter` calls in
 `ros2/autonomy_node/src/autonomy_node.cpp`, and that file is the only place to change what the drone
 comes up with.

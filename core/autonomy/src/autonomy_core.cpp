@@ -129,15 +129,15 @@ std::vector<std::vector<double>> remainingCommittedSuffix(
 }  // namespace
 
 AutonomyCore::AutonomyCore(const Config& config)
-    : cfg_(config), clock_(steadyNowSeconds) {
-  tracker_.setPositionGains(cfg_.pos_p);
-  tracker_.setVelocityGains(cfg_.vel_p, cfg_.vel_i, cfg_.vel_d);
-  tracker_.setDerivativeTau(cfg_.vel_d_tau);
-  tracker_.setIntegratorErrorLimit(cfg_.int_err_limit);
-  tracker_.setHoverThrust(cfg_.hover_thrust);
-  tracker_.enableFeedforward(cfg_.enable_feedforward);
-  tracker_.setStaleTimeout(cfg_.stale_timeout);
-  tracker_.setMaxTrackingError(cfg_.max_tracking_error);
+    : cfg_(config), control_cfg_(config), clock_(steadyNowSeconds) {
+  tracker_.setPositionGains(control_cfg_.pos_p);
+  tracker_.setVelocityGains(control_cfg_.vel_p, control_cfg_.vel_i, control_cfg_.vel_d);
+  tracker_.setDerivativeTau(control_cfg_.vel_d_tau);
+  tracker_.setIntegratorErrorLimit(control_cfg_.int_err_limit);
+  tracker_.setHoverThrust(control_cfg_.hover_thrust);
+  tracker_.enableFeedforward(control_cfg_.enable_feedforward);
+  tracker_.setStaleTimeout(control_cfg_.stale_timeout);
+  tracker_.setMaxTrackingError(control_cfg_.max_tracking_error);
 
   // Quiet OMPL's own console (the per-solve "RRTstar: ..." INFO/DEBUG spam) so the
   // terminal shows our planner summary; warnings and errors still come through.
@@ -207,7 +207,8 @@ void AutonomyCore::firePreset(const std::vector<Eigen::Vector3d>& waypoints) {
 void AutonomyCore::applyConfig(const Config& config) {
   std::lock_guard<std::mutex> lock(io_mutex_);
   pending_config_ = config;
-  config_dirty_ = true;
+  worker_config_dirty_ = true;
+  control_config_dirty_ = true;
 }
 
 void AutonomyCore::reset() {
@@ -244,9 +245,9 @@ common::Command AutonomyCore::stepControl(double dt) {
     direct_pos = direct_pos_;
     direct_yaw = direct_yaw_;
     has_direct = has_direct_setpoint_;
-    config = pending_config_;
-    config_dirty = config_dirty_;
-    config_dirty_ = false;
+    config_dirty = control_config_dirty_;
+    if (config_dirty) config = pending_config_;
+    control_config_dirty_ = false;
   }
 
   if (config_dirty) {
@@ -259,16 +260,16 @@ common::Command AutonomyCore::stepControl(double dt) {
     // estimator had to re-converge over its 2.5 s time constant every time.
     // Comparing keeps MPC_HOVER_THRUST working as a deliberate operator override
     // while leaving the estimator alone the rest of the time.
-    const bool hover_thrust_changed = (cfg_.hover_thrust != config.hover_thrust);
-    cfg_ = config;
-    tracker_.setPositionGains(cfg_.pos_p);
-    tracker_.setVelocityGains(cfg_.vel_p, cfg_.vel_i, cfg_.vel_d);
-    tracker_.setDerivativeTau(cfg_.vel_d_tau);
-    tracker_.setIntegratorErrorLimit(cfg_.int_err_limit);
-    if (hover_thrust_changed) tracker_.setHoverThrust(cfg_.hover_thrust);
-    tracker_.enableFeedforward(cfg_.enable_feedforward);
-    tracker_.setStaleTimeout(cfg_.stale_timeout);
-    tracker_.setMaxTrackingError(cfg_.max_tracking_error);
+    const bool hover_thrust_changed = (control_cfg_.hover_thrust != config.hover_thrust);
+    control_cfg_ = config;
+    tracker_.setPositionGains(control_cfg_.pos_p);
+    tracker_.setVelocityGains(control_cfg_.vel_p, control_cfg_.vel_i, control_cfg_.vel_d);
+    tracker_.setDerivativeTau(control_cfg_.vel_d_tau);
+    tracker_.setIntegratorErrorLimit(control_cfg_.int_err_limit);
+    if (hover_thrust_changed) tracker_.setHoverThrust(control_cfg_.hover_thrust);
+    tracker_.enableFeedforward(control_cfg_.enable_feedforward);
+    tracker_.setStaleTimeout(control_cfg_.stale_timeout);
+    tracker_.setMaxTrackingError(control_cfg_.max_tracking_error);
   }
 
   // The tracker is only ever touched from this control thread, so apply the
@@ -352,6 +353,10 @@ bool AutonomyCore::planOnce() {
     has_goal = has_goal_;
     world_from_map = world_from_map_;
     has_frame = has_map_to_world_;
+    if (worker_config_dirty_) {
+      cfg_ = pending_config_;
+      worker_config_dirty_ = false;
+    }
   }
 
   if (!has_goal || !map) return false;
@@ -875,9 +880,14 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
   // Rebuild only when the map object itself changed. This is what makes the EDT
   // collision check cheaper than the per-state octree scan it replaces: a static
   // scene reuses one field across many ticks instead of rebuilding it each time.
-  if (map != edt_source_map_) {
+  // Also rebuild when CLEARANCE_THRESHOLD changes: it is the field's maxdist, and
+  // keying on the map alone left a live change unapplied until the next octomap,
+  // which on a static bench scene may never come.
+  if (map != edt_source_map_ || cfg_.clearance_threshold != edt_maxdist_) {
     edt_ = buildEdt(map, cfg_.clearance_threshold);
     edt_source_map_ = map;
+    edt_maxdist_ = cfg_.clearance_threshold;
+    viz_sampled_map_.reset();  // debug clearance samples are of the old field
   }
   return edt_;
 }
@@ -892,9 +902,11 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
   // No frontier information => the conservative view IS the search map; reuse
   // its field rather than building a second identical EDT.
   if (map == edt_source_map_ && edt_) return edt_;
-  if (map != cons_edt_source_map_) {
-    cons_edt_ = buildEdt(map, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
+  const double cons_maxdist = std::max(cfg_.clearance_threshold, cfg_.frontier_margin);
+  if (map != cons_edt_source_map_ || cons_maxdist != cons_edt_maxdist_) {
+    cons_edt_ = buildEdt(map, cons_maxdist);
     cons_edt_source_map_ = map;
+    cons_edt_maxdist_ = cons_maxdist;
   }
   return cons_edt_;
 }
@@ -1001,6 +1013,14 @@ void AutonomyCore::plannerLoop() {
       preset_pending = preset_pending_;
       preset_pending_ = false;
       if (preset_pending) preset_waypoints = preset_waypoints_;
+      // Take any new config here, once per cycle, so everything this cycle does
+      // sees one consistent Config — and so it applies whether or not the
+      // vehicle is armed (stepControl, which used to be the only consumer, only
+      // runs armed).
+      if (worker_config_dirty_) {
+        cfg_ = pending_config_;
+        worker_config_dirty_ = false;
+      }
     }
 
     // A new goal invalidates the committed path regardless of its collision
