@@ -148,6 +148,11 @@ public:
     // commits further before demanding full clearance. <= 0 disables the ramp.
     double escape_ramp_dist{1.0};
     double max_segment_len{2.0};   // corridor resample cap: one region per piece [m]
+    // Wall-clock budget for the corridor QP's time-allocation search [s]. When
+    // it runs out the best feasible allocation found so far is used, so a
+    // slow search yields a slower trajectory rather than a late one. Covers
+    // the QP only, not truncation or corridor building. <= 0 = unlimited.
+    double traj_solve_budget{1.0};
     // Minimum half-extents of the region-growth window in the SEGMENT-ALIGNED
     // frame (x along the segment, y/z lateral) — not world axes. A floor, not a
     // cap: buildCorridor raises it to scale with the longest segment. Pinning
@@ -301,6 +306,9 @@ public:
   // at a glance: raw has volume, shrunk has none, so the margin ate it.
   struct CorridorSnapshot {
     std::vector<Eigen::Vector3d> committed;
+    // The path handed to truncation, filled only when truncation cut it short
+    // (or to nothing), so the viz can show what was cut next to what was kept.
+    std::vector<Eigen::Vector3d> untruncated;
     std::vector<planning::ConvexRegion> raw;     // as decomposed, before the margin
     std::vector<planning::ConvexRegion> shrunk;  // after the margin pull-in
     bool accepted{false};
@@ -521,6 +529,12 @@ private:
   static constexpr double kLeadMax = 0.5;        // [s]
   double trajgen_solve_max_{0.0};
   double trajgen_lead_{kLeadMin};
+
+  // Where the last runTrajgen call spent its time, for the per-replan timing log
+  // (worker thread only). Corridor covers truncation, obstacle gathering and the
+  // decomposition; QP is the trajectory solve. Zero for a stage not reached.
+  double trajgen_corridor_time_{0.0};
+  double trajgen_qp_time_{0.0};
 
   // Cached distance field and the map it was built from — the single obstacle
   // model for both collision validity and the clearance cost. See clearanceField.

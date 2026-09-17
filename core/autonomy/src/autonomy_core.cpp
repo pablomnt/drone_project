@@ -486,9 +486,12 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                               const planning::MapHandle& cons_map,
                               const planning::CorridorUnknownFn& unknown_fn,
                               common::Trajectory& traj, bool pin_waypoints) {
+  trajgen_corridor_time_ = 0.0;
+  trajgen_qp_time_ = 0.0;
   if (path.size() < 2) return false;
 
   if (cfg_.use_corridor_qp && cons_edt && cons_map) {
+    const double t_corridor = now();
     // Corridor pipeline: truncate the (possibly optimistic) path to the prefix
     // that is safely inside known-free space, grow one free box per resampled
     // segment, and solve the corridor-constrained min-snap QP. Every stage runs
@@ -510,6 +513,9 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     // able to move at all. Sharing the parameter keeps the two stages from
     // disagreeing about where the vehicle stops being a special case.
     params.start_relax_dist = cfg_.escape_ramp_dist;
+    // A bridge region replaces a joint waypoint with two points off the path,
+    // which pinned waypoints (presets) would then force the trajectory through.
+    params.bridge_joints = !pin_waypoints;
     // Obstacle points are voxel centres; the corridor must clear the voxel's
     // worst-case corner, so tell it the map's half-diagonal.
     params.voxel_half_diagonal = cons_map->getResolution() * std::sqrt(3.0) / 2.0;
@@ -555,6 +561,11 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       last_corridor_.accepted = accepted;
     };
     resetSnapshot();
+    if (cfg_.debug_planner_viz &&
+        (committed.size() < 2 || (committed.back() - epath.back()).norm() > 1e-6)) {
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      last_corridor_.untruncated = epath;
+    }
 
     if (committed.size() < 2) {
       // Nothing of the path is safely committable (start hemmed in by frontier
@@ -578,6 +589,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       }
       DRONE_LOG_INFO("[trajgen] corridor: truncation empty (" << why
                      << ") -> no new trajectory");
+      trajgen_corridor_time_ = now() - t_corridor;
       return false;
     }
     snapshotCommitted(committed);
@@ -663,9 +675,12 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     planning::CorridorAttempt attempt;
     double start_margin = params.margin;
     double end_pullback = 0.0;
-    if (!planning::buildCorridor(obstacles, committed, params, resampled, regions, &why,
-                                 cfg_.debug_planner_viz ? &attempt : nullptr, &start_margin,
-                                 &end_pullback)) {
+    planning::CorridorRepairs repairs;
+    const bool built = planning::buildCorridor(obstacles, committed, params, resampled, regions,
+                                               &why, cfg_.debug_planner_viz ? &attempt : nullptr,
+                                               &start_margin, &end_pullback, &repairs);
+    trajgen_corridor_time_ = now() - t_corridor;
+    if (!built) {
       snapshotRegions(attempt, /*accepted=*/false);
       DRONE_LOG_INFO("[trajgen] corridor: decomposition FAILED (" << why << ") over "
                      << committed.size() << " wp / " << polylineLength(committed)
@@ -692,13 +707,25 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                        << " m along the path to fit inside the shrunk corridor (CORRIDOR_MARGIN "
                        << params.margin << " m)");
       }
+      // A squeeze on the path: consecutive regions only overlapped once repaired.
+      // Safe (every joint still passed the overlap test), but it explains an
+      // unusually large region count and a slower solve.
+      if (repairs.bridges > 0 || repairs.split_rounds > 0) {
+        DRONE_LOG_INFO("[trajgen] corridor: repaired thin joints with " << repairs.bridges
+                       << " bridge region(s) and " << repairs.split_rounds
+                       << " split round(s) -> " << regions.size() << " regions");
+      }
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
+      optimizer.setTimeBudget(cfg_.traj_solve_budget);
       snapshotRegions(attempt, /*accepted=*/true);
       // `start` carries the splice state. Its position is path.front() by
       // construction (the caller rooted the path there), so it satisfies
       // regions[0]; the derivatives are what make the engage continuous.
-      if (optimizer.optimizeTrajectory(start, resampled, regions, traj, pin_waypoints)) {
+      const double t_qp = now();
+      const bool solved = optimizer.optimizeTrajectory(start, resampled, regions, traj, pin_waypoints);
+      trajgen_qp_time_ = now() - t_qp;
+      if (solved) {
         traj.t0 = t0;
         if (cfg_.debug_planner_viz) {
           DRONE_LOG_INFO("[trajgen] corridor: OK " << regions.size() << " regions / "
@@ -1164,9 +1191,14 @@ void AutonomyCore::plannerLoop() {
         return std::sqrt(dx * dx + dy * dy + dz * dz);
       };
 
+      // Wall time of this tick's geometric search, if one ran. It shares the
+      // worker thread with trajgen, so it delays the next staged trajectory too.
+      double search_time = 0.0;
       if (path_invalid || improve_run) {
         std::vector<std::vector<double>> candidate;
+        const double t_search = now();
         const bool solved = planner.planPath(start, goal_vec, candidate);
+        search_time = now() - t_search;
 
         // Debug-only: capture the tree this solve built (even if it failed — that
         // is exactly when seeing where it explored is most useful).
@@ -1308,17 +1340,38 @@ void AutonomyCore::plannerLoop() {
         const double solve_time = now() - t_gen;
         trajgen_solve_max_ = std::max(solve_time, kLeadMaxDecay * trajgen_solve_max_);
         trajgen_lead_ = std::clamp(kLeadSafetyFactor * trajgen_solve_max_, kLeadMin, kLeadMax);
-        // Only a splice can engage late: a rest start is re-anchored below.
-        if (anchor.from_trajectory && solve_time > anchor.t0 - t_gen) {
-          // The trajectory is due to engage before it was finished, so it will
-          // start slightly past its own beginning. Self-correcting (the lead
-          // just grew), but worth naming: this is the one case that puts a step
-          // in the reference, and a persistent one means the solve is too slow
-          // for TRAJGEN_PERIOD, not that the lead is mistuned.
-          DRONE_LOG_INFO("[trajgen] solve " << solve_time << " s overran its "
-                         << (anchor.t0 - t_gen) << " s lead — engaging late; lead now "
-                         << trajgen_lead_ << " s");
+        // One line per replan, success or failure, so the solve-time budget can be
+        // read straight off a log. Everything that decides whether the reference
+        // stays continuous is here: what the solve cost and where, the lead it was
+        // anchored with and how late a splice therefore engages (a rest start is
+        // re-anchored after the solve, so it cannot be late — its lead is what a
+        // splice would have had), and how long the tracker has gone since the
+        // last staged trajectory, against the timeout that latches hover-hold.
+        const double lead_used = anchor.t0 - t_gen;
+        const double late = std::max(0.0, solve_time - lead_used);
+        double since_staged = -1.0;
+        {
+          std::lock_guard<std::mutex> lock(traj_mutex_);
+          if (has_last_planned_) since_staged = now() - last_planned_at_;
         }
+        std::ostringstream gap;
+        if (since_staged >= 0.0) {
+          gap << since_staged << " s";
+        } else {
+          gap << "none staged yet";
+        }
+        DRONE_LOG_INFO("[trajgen] replan: solve " << solve_time << " s (corridor "
+                       << trajgen_corridor_time_ << " s, QP " << trajgen_qp_time_
+                       << " s) | " << (anchor.from_trajectory ? "splice" : "rest") << ", lead "
+                       << lead_used << " s"
+                       << (anchor.from_trajectory
+                               ? (late > 0.0 ? " -> ENGAGING LATE by " : " -> on time, spare ")
+                               : " -> splice would be late by ")
+                       << (anchor.from_trajectory && late <= 0.0 ? lead_used - solve_time : late)
+                       << " s | since last staged " << gap.str() << " (STALE_TIMEOUT "
+                       << cfg_.stale_timeout << " s) | search this tick " << search_time
+                       << " s | next lead " << trajgen_lead_ << " s | "
+                       << (ok ? "OK" : "FAILED"));
 
         if (ok) {
           stagePlanned(anchor, traj, world_from_map);

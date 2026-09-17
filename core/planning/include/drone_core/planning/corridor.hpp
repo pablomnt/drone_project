@@ -76,6 +76,20 @@ struct CorridorParams {
   // Set <= 0 to disable both — no split, uniform `margin` everywhere, and a
   // drone closer than `margin` to anything mapped or unknown gets no corridor.
   double start_relax_dist = 1.0;
+
+  // Repair joints whose regions stop overlapping once shrunk by growing an extra
+  // "bridge" region centred in the squeeze between them (see buildCorridor).
+  // Its two ends replace the joint's waypoint, so callers that PIN interior
+  // waypoints (presets) must turn this off: the bridge ends lie off their path.
+  // Splitting a failing joint's segments in half is always allowed, since the
+  // midpoints stay on the path.
+  bool bridge_joints = true;
+};
+
+// What buildCorridor had to do to make consecutive regions overlap.
+struct CorridorRepairs {
+  int bridges = 0;       // bridge regions spliced in
+  int split_rounds = 0;  // times segments around a failing joint were halved and rebuilt
 };
 
 // Vertex loops of a region's faces, for visualisation: one entry per face that
@@ -96,7 +110,10 @@ std::vector<std::vector<Eigen::Vector3d>> regionFaceLoops(const ConvexRegion& re
 // near the waypoint. A region with no faces is unbounded and overlaps anything
 // (+infinity); a solve that fails returns -infinity, the safe side for a caller
 // reading this as overlap depth. Microseconds for corridor-sized regions.
-double regionOverlapDepth(const ConvexRegion& a, const ConvexRegion& b);
+// `center`, if given, receives the centre of that ball — the deepest point of
+// the intersection — whenever the returned depth is finite; untouched otherwise.
+double regionOverlapDepth(const ConvexRegion& a, const ConvexRegion& b,
+                          Eigen::Vector3d* center = nullptr);
 
 // Subdivide any path segment longer than max_segment_len into equal pieces so
 // every output segment respects the cap. Keeps the original waypoints; never
@@ -166,7 +183,11 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
 // `start_margin` below for what it ended up guaranteeing). The result is then
 // validated against exactly what the QP pins: the start and end positions are
 // equality-constrained, so each must lie in its region, and consecutive regions
-// must still share a point for the C0 handover (which shrinking can empty). An
+// must still share a point for the C0 handover (which shrinking can empty). A
+// joint that fails that is repaired where possible — a bridge region grown in
+// the squeeze, then halving the segments around it and rebuilding (at most
+// twice) — so regions_out can hold MORE regions than the resampled path had
+// segments, with resampled_out extended to match. An
 // end the shrink excludes is not a failure: it is walked back along the path
 // until the shrunk region holds it, dropping trailing regions that hold none of
 // their segment, so resampled_out.back() may lie short of path.back() (see
@@ -203,6 +224,11 @@ struct CorridorAttempt {
 // back to fit the shrunk corridor [m], 0 when it fit as given. Reported for the
 // same reason: a trajectory that stops short of where it was sent must say so.
 // Untouched on failure.
+//
+// `repairs`, if given, receives how many joints needed a bridge region and how
+// many split-and-rebuild rounds ran (see CorridorParams::bridge_joints). A
+// repaired corridor is as safe as any other — every joint still passes the
+// same overlap test — but it says the path runs through a squeeze.
 bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    const std::vector<Eigen::Vector3d>& path,
                    const CorridorParams& p,
@@ -211,7 +237,8 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    std::string* reason = nullptr,
                    CorridorAttempt* attempt = nullptr,
                    double* start_margin = nullptr,
-                   double* end_pullback = nullptr);
+                   double* end_pullback = nullptr,
+                   CorridorRepairs* repairs = nullptr);
 
 // Upper bound on how far from the committed path a region can reach, given the
 // same params — i.e. how wide the obstacle window the caller extracts must be

@@ -81,7 +81,8 @@ std::vector<std::vector<Eigen::Vector3d>> regionFaceLoops(const ConvexRegion& re
   return loops;
 }
 
-double regionOverlapDepth(const ConvexRegion& a, const ConvexRegion& b) {
+double regionOverlapDepth(const ConvexRegion& a, const ConvexRegion& b,
+                          Eigen::Vector3d* center) {
   // A region with no faces is all of space (ConvexRegion::contains agrees).
   if (a.A.rows() == 0 || b.A.rows() == 0) return std::numeric_limits<double>::infinity();
 
@@ -203,6 +204,17 @@ double regionOverlapDepth(const ConvexRegion& a, const ConvexRegion& b) {
     }
     depth += cost2(basis[r]) * T(r, cols);
   }
+  if (center) {
+    // The primal optimum is the dual's simplex multipliers, pi = c_B B^-1: its
+    // first three entries are the ball centre x, its last the radius r. B^-1 is
+    // read off the artificial columns, which started as the identity and have
+    // had every row operation applied to them since.
+    Eigen::Vector4d pi = Eigen::Vector4d::Zero();
+    for (int j = 0; j < kRows; ++j) {
+      for (int r = 0; r < kRows; ++r) pi(j) += cost2(basis[r]) * T(r, m + j);
+    }
+    *center = pi.head<3>();
+  }
   return depth;
 }
 
@@ -320,7 +332,8 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    std::string* reason,
                    CorridorAttempt* attempt,
                    double* start_margin,
-                   double* end_pullback) {
+                   double* end_pullback,
+                   CorridorRepairs* repairs) {
   // The primary outputs are always cleared on failure so a rejected corridor
   // can never be flown; `attempt` deliberately survives so the host can draw
   // what was rejected.
@@ -334,6 +347,7 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
   regions_out.clear();
   if (reason) reason->clear();
   if (attempt) *attempt = CorridorAttempt{};
+  if (repairs) *repairs = CorridorRepairs{};
   if (path.size() < 2) return fail("path has fewer than 2 waypoints");
 
   resampled_out = resamplePath(path, p.max_segment_len);
@@ -370,9 +384,6 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
   vec_Vec3f obs;
   obs.reserve(obstacles.size());
   for (const auto& o : obstacles) obs.emplace_back(o.x(), o.y(), o.z());
-  vec_Vec3f dpath;
-  dpath.reserve(resampled_out.size());
-  for (const auto& w : resampled_out) dpath.emplace_back(w.x(), w.y(), w.z());
 
   // Size the growth window from the geometry rather than a fixed number. Two
   // requirements. (1) It must scale with the segments: a window narrower than
@@ -385,7 +396,8 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
   // (which also guarantees consecutive regions overlap generously, since each
   // reaches past its endpoints into its neighbour). p.local_bbox acts as a
   // floor, so a caller can ask for a wider window but never a self-defeating
-  // one.
+  // one. Sized once from the initial segments and kept through the repairs
+  // below, which only ever add shorter segments.
   const double pull_in = p.margin + p.voxel_half_diagonal;
   double seg_max = 0.0;
   for (size_t i = 0; i + 1 < resampled_out.size(); ++i) {
@@ -395,33 +407,26 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                              std::max(p.local_bbox.y(), seg_max),
                              std::max(p.local_bbox.z(), seg_max));
   const Eigen::Vector3d bbox = want.array() + pull_in;
-  if (attempt) attempt->resampled = resampled_out;
 
-  EllipsoidDecomp3D decomp;
-  decomp.set_obs(obs);
-  decomp.set_local_bbox(Vec3f(bbox.x(), bbox.y(), bbox.z()));
-  decomp.dilate(dpath);
-
-  // Each polyhedron -> plain A/b rows, oriented "inside satisfies A p <= b"
-  // using the segment midpoint (which the decomposition guarantees is inside
-  // the unshrunk region). Then pull every face in by margin + the voxel half
-  // diagonal: DecompUtil's faces touch the obstacle *points*, which are voxel
-  // centres, so the extra pull-in makes the margin hold against the voxel's
-  // worst-case corner, not just its centre. Faces are unit-normal on
-  // DecompUtil's side already, but normalise defensively so b stays metric.
-  const auto polys = decomp.get_polyhedrons();
-  if (polys.size() != resampled_out.size() - 1) {
-    return fail("decomposition returned the wrong number of regions");
-  }
-
-  regions_out.reserve(polys.size());
-  for (size_t s = 0; s < polys.size(); ++s) {
-    const Eigen::Vector3d mid = 0.5 * (resampled_out[s] + resampled_out[s + 1]);
-    LinearConstraint3D lc(Vec3f(mid.x(), mid.y(), mid.z()), polys[s].hyperplanes());
-
+  // Grow the UNSHRUNK region around one segment, as plain A/b rows oriented
+  // "inside satisfies A p <= b" using the segment midpoint (which the
+  // decomposition guarantees is inside). DecompUtil grows each segment of a
+  // path independently, so growing them one at a time is the same result as
+  // one call over the whole path, and lets a repair grow an extra region
+  // without regrowing the rest. Faces are unit-normal on DecompUtil's side
+  // already, but normalise defensively so b stays metric.
+  const auto growRaw = [&](const Eigen::Vector3d& a, const Eigen::Vector3d& b,
+                           ConvexRegion& raw) {
+    EllipsoidDecomp3D decomp;
+    decomp.set_obs(obs);
+    decomp.set_local_bbox(Vec3f(bbox.x(), bbox.y(), bbox.z()));
+    decomp.dilate(vec_Vec3f{Vec3f(a.x(), a.y(), a.z()), Vec3f(b.x(), b.y(), b.z())});
+    const auto polys = decomp.get_polyhedrons();
+    if (polys.size() != 1) return false;
+    const Eigen::Vector3d mid = 0.5 * (a + b);
+    LinearConstraint3D lc(Vec3f(mid.x(), mid.y(), mid.z()), polys[0].hyperplanes());
     std::vector<Eigen::Vector3d> normals;
-    std::vector<double> offsets;  // unshrunk; the pull-in is applied below
-    normals.reserve(lc.A().rows());
+    std::vector<double> offsets;
     for (int r = 0; r < lc.A().rows(); ++r) {
       const Eigen::Vector3d n = lc.A().row(r).transpose();
       const double norm = n.norm();
@@ -430,138 +435,305 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
       offsets.push_back(lc.b()(r) / norm);
     }
     const int rows = static_cast<int>(normals.size());
-
-    // The first region gets the largest shrink that still contains the drone,
-    // rather than the full one. The QP equality-constrains the trajectory to
-    // start at the vehicle's position, so a first region that excludes it is
-    // infeasible outright — and truncatePath, by design, hands us a start whose
-    // required clearance ramps to ZERO at the drone, so on a thin map the two
-    // stages disagree by construction and the corridor is refused every tick.
-    // Since every face is a plane and offsets carry metric distance, the
-    // vehicle's slack against face r is offsets[r] - n_r.p, and the tightest of
-    // those is the most we can pull in. Two things make this safe to do:
-    //   - It never relaxes more than it must. Give the drone room and the min
-    //     rises above pull_in, the clamp binds, and this is a no-op — the
-    //     relaxation heals itself as the map fills in, with no parameter to
-    //     retune.
-    //   - It never crosses the line from "less margin" into "into the
-    //     obstacle": the floor is voxel_half_diagonal, below which the region
-    //     would contain points inside an occupied voxel's actual volume rather
-    //     than merely close to it. That floor is geometry, not taste, which is
-    //     why there is no tunable minimum here.
-    // Deliberately NOT applied to later regions: the whole point of the split
-    // above is that leniency stops at start_relax_dist.
-    double shrink = pull_in;
-    if (s == 0 && p.start_relax_dist > 0.0) {
-      constexpr double kBoundarySlack = 1e-3;  // keep the QP off an exact face
-      double slack = std::numeric_limits<double>::infinity();
-      for (int r = 0; r < rows; ++r) {
-        slack = std::min(slack, offsets[r] - normals[r].dot(resampled_out.front()));
-      }
-      shrink = std::min(pull_in, slack - kBoundarySlack);
-      if (shrink < p.voxel_half_diagonal) shrink = p.voxel_half_diagonal;
-    }
-    if (s == 0 && start_margin) *start_margin = shrink - p.voxel_half_diagonal;
-
-    ConvexRegion region;
-    region.A.resize(rows, 3);
-    region.b.resize(rows);
+    raw.A.resize(rows, 3);
+    raw.b.resize(rows);
     for (int r = 0; r < rows; ++r) {
-      region.A.row(r) = normals[r];
-      region.b(r) = offsets[r] - shrink;
+      raw.A.row(r) = normals[r];
+      raw.b(r) = offsets[r];
     }
-    if (attempt) {
-      ConvexRegion raw;
-      raw.A = region.A;  // same normals, unshrunk offsets
-      raw.b.resize(rows);
-      for (int r = 0; r < rows; ++r) raw.b(r) = offsets[r];
-      attempt->raw.push_back(std::move(raw));
-      attempt->shrunk.push_back(region);
-    }
-    regions_out.push_back(std::move(region));
-  }
+    return true;
+  };
+  // Pull every face in by `shrink`. With the full pull_in (margin + voxel half
+  // diagonal): DecompUtil's faces touch the obstacle *points*, which are voxel
+  // centres, so the extra pull-in makes the margin hold against the voxel's
+  // worst-case corner, not just its centre.
+  const auto shrunkBy = [](const ConvexRegion& raw, double shrink) {
+    ConvexRegion region = raw;
+    region.b.array() -= shrink;
+    return region;
+  };
 
-  // Validate what the shrink may have destroyed, checking exactly what the QP
-  // pins — no more. The start and goal positions are equality-constrained, so
-  // they must lie in the first/last region. Interior junction positions are
-  // NOT pinned to the waypoints (the trajectory is free within the corridor),
-  // so requiring waypoints inside the shrunk regions would reintroduce the
-  // "path barely clears, corridor fails" mode this rewrite removes; what C0
-  // continuity actually needs is a non-empty INTERSECTION of each consecutive
-  // pair, wherever it lies. Checked exactly, as the deepest ball inside both
-  // (regionOverlapDepth). This replaced sampling 11 points on the lines from the
-  // junction waypoint to the two segment midpoints, which missed any overlap
-  // off those lines: on the bench (2026-09-17) it rejected two regions sharing
-  // a 0.82 m-radius ball because the junction itself sat 9 cm outside the
-  // shrunk first region.
-  // With the adaptive shrink above, the first region can only miss the drone if
-  // it was already outside the UNSHRUNK region or within half a voxel of it —
-  // i.e. the conservative map says the vehicle is in, or touching, an occupied
-  // or unknown cell. That is a different fault from a margin that was merely
-  // too greedy, and needs a different response (look at the map or the state
-  // estimate, not at CORRIDOR_MARGIN), so it says so.
-  if (!regions_out.front().contains(resampled_out.front())) {
-    return fail(p.start_relax_dist > 0.0
-                    ? "the drone's position is inside (or within half a voxel of) an occupied "
-                      "or unknown cell on the conservative map"
-                    : "margin shrink pushed the first region past the start position");
-  }
-  // The end, unlike the start, is free to move. Whatever sits there, a truncation
-  // cut or a projected goal, is placed right at a clearance limit, and DecompUtil
-  // puts every face THROUGH an obstacle point: the face separating the end from
-  // its nearest obstacle is closer than that obstacle, and square-on only by
-  // luck. The shrink needs margin + voxel_half_diagonal against that face, so an
-  // end sitting ~0.5 m from something is shrunk out of its own region almost
-  // every time. Rather than refuse the corridor, walk the end back along the path
-  // until the shrunk region holds it, dropping trailing regions that hold none of
-  // their segment. Full margin is kept everywhere; the vehicle only stops a
-  // little earlier, and the next cycle pushes the end forward again. A remaining
-  // piece shorter than kMinEndPiece counts as holding none of its segment: a
-  // near-zero segment gives the time allocation a degenerate T. Runs before the
-  // overlap check, so regions dropped here are never judged.
-  constexpr double kPullbackStep = 0.02;  // walk resolution [m]
-  constexpr double kMinEndPiece = 0.10;   // shortest last segment kept [m]
-  constexpr double kEndSlack = 1e-3;      // keep the pinned end off an exact face
+  // Repairs for consecutive regions that stop overlapping once shrunk (see the
+  // overlap check below). Overlap depth is the radius of the largest ball in
+  // both regions, and shrinking both by pull_in lowers it by exactly pull_in, so
+  // any joint whose unshrunk overlap is thinner than ~pull_in fails however
+  // roomy the two regions are on either side of it — typically a joint that
+  // falls in a squeeze, like passing under furniture. Two repairs, cheapest
+  // first:
+  //   - BRIDGE: grow one extra region on a short segment through the deepest
+  //     point of the two unshrunk regions' intersection, i.e. centred in the
+  //     squeeze, and splice it between them. Only the joint's waypoint changes
+  //     (it becomes the bridge segment's two ends), and interior waypoints are
+  //     not pinned by the QP, so nothing else moves. Kept only if both new
+  //     joints pass the same overlap test.
+  //   - SPLIT: halve the two segments either side of the joint and rebuild.
+  //     Shorter segments grow rounder regions about the joint, which usually
+  //     share more of it. Rebuilds everything, so it is bounded in rounds.
+  // Neither is guaranteed: a bridge's overlap with a neighbour is still limited
+  // by how thin that neighbour is near the squeeze. The overlap test stays the
+  // final word, so a genuinely narrow passage is still refused.
+  constexpr int kMaxSplitRounds = 2;
+  constexpr double kBridgeHalfLen = 0.25;  // bridge segment half-length [m]
+  constexpr double kBridgeDepthGive = 0.01;  // depth traded to centre a bridge near its joint [m]
+  constexpr double kMinHalfPiece = 0.15;   // don't split a segment below 2x this [m]
+  const std::vector<Eigen::Vector3d> base_start = resampled_out;
+  std::vector<Eigen::Vector3d> base = base_start;
+  int bridges = 0;
+  int split_rounds = 0;
   double pulled_back = 0.0;
-  while (!regions_out.back().contains(resampled_out.back())) {
-    const size_t k = regions_out.size() - 1;  // spans resampled_out[k] .. [k + 1]
-    const Eigen::Vector3d a = resampled_out[k];
-    const Eigen::Vector3d b = resampled_out[k + 1];
-    const double L = (b - a).norm();
-    bool found = false;
-    for (double back = kPullbackStep; L - back >= kMinEndPiece; back += kPullbackStep) {
-      const Eigen::Vector3d q = b + (back / L) * (a - b);
-      if (regions_out[k].contains(q, -kEndSlack)) {
-        resampled_out[k + 1] = q;
-        pulled_back += back;
-        found = true;
-        break;
+
+  for (;;) {
+    resampled_out = base;
+    regions_out.clear();
+    std::vector<ConvexRegion> raws;  // unshrunk, aligned with regions_out
+    // Index into `base` of each resampled_out point, -1 for bridge ends; says
+    // which base segments a failing joint sits between when splitting.
+    std::vector<int> origin(base.size());
+    for (size_t i = 0; i < origin.size(); ++i) origin[i] = static_cast<int>(i);
+    if (attempt) *attempt = CorridorAttempt{};
+    if (attempt) attempt->resampled = resampled_out;
+    bridges = 0;
+    pulled_back = 0.0;
+
+    regions_out.reserve(base.size() - 1);
+    for (size_t s = 0; s + 1 < resampled_out.size(); ++s) {
+      ConvexRegion raw;
+      if (!growRaw(resampled_out[s], resampled_out[s + 1], raw)) {
+        return fail("decomposition returned the wrong number of regions");
       }
+
+      // The first region gets the largest shrink that still contains the drone,
+      // rather than the full one. The QP equality-constrains the trajectory to
+      // start at the vehicle's position, so a first region that excludes it is
+      // infeasible outright — and truncatePath, by design, hands us a start whose
+      // required clearance ramps to ZERO at the drone, so on a thin map the two
+      // stages disagree by construction and the corridor is refused every tick.
+      // Since every face is a plane and offsets carry metric distance, the
+      // vehicle's slack against face r is offsets[r] - n_r.p, and the tightest of
+      // those is the most we can pull in. Two things make this safe to do:
+      //   - It never relaxes more than it must. Give the drone room and the min
+      //     rises above pull_in, the clamp binds, and this is a no-op — the
+      //     relaxation heals itself as the map fills in, with no parameter to
+      //     retune.
+      //   - It never crosses the line from "less margin" into "into the
+      //     obstacle": the floor is voxel_half_diagonal, below which the region
+      //     would contain points inside an occupied voxel's actual volume rather
+      //     than merely close to it. That floor is geometry, not taste, which is
+      //     why there is no tunable minimum here.
+      // Deliberately NOT applied to later regions: the whole point of the split
+      // above is that leniency stops at start_relax_dist.
+      double shrink = pull_in;
+      if (s == 0 && p.start_relax_dist > 0.0) {
+        constexpr double kBoundarySlack = 1e-3;  // keep the QP off an exact face
+        double slack = std::numeric_limits<double>::infinity();
+        for (int r = 0; r < raw.A.rows(); ++r) {
+          slack = std::min(slack, raw.b(r) - raw.A.row(r).dot(resampled_out.front()));
+        }
+        shrink = std::min(pull_in, slack - kBoundarySlack);
+        if (shrink < p.voxel_half_diagonal) shrink = p.voxel_half_diagonal;
+      }
+      if (s == 0 && start_margin) *start_margin = shrink - p.voxel_half_diagonal;
+
+      ConvexRegion region = shrunkBy(raw, shrink);
+      if (attempt) {
+        attempt->raw.push_back(raw);
+        attempt->shrunk.push_back(region);
+      }
+      raws.push_back(std::move(raw));
+      regions_out.push_back(std::move(region));
     }
-    if (found) break;
-    if (k == 0) {
-      std::ostringstream os;
-      os << "no point of the path at least " << kMinEndPiece
-         << " m from the start fits inside the shrunk corridor";
-      return fail(os.str());
+
+    // Validate what the shrink may have destroyed, checking exactly what the QP
+    // pins — no more. The start and goal positions are equality-constrained, so
+    // they must lie in the first/last region. Interior junction positions are
+    // NOT pinned to the waypoints (the trajectory is free within the corridor),
+    // so requiring waypoints inside the shrunk regions would reintroduce the
+    // "path barely clears, corridor fails" mode this rewrite removes; what C0
+    // continuity actually needs is a non-empty INTERSECTION of each consecutive
+    // pair, wherever it lies. Checked exactly, as the deepest ball inside both
+    // (regionOverlapDepth). This replaced sampling 11 points on the lines from the
+    // junction waypoint to the two segment midpoints, which missed any overlap
+    // off those lines: on the bench (2026-09-17) it rejected two regions sharing
+    // a 0.82 m-radius ball because the junction itself sat 9 cm outside the
+    // shrunk first region.
+    // With the adaptive shrink above, the first region can only miss the drone if
+    // it was already outside the UNSHRUNK region or within half a voxel of it —
+    // i.e. the conservative map says the vehicle is in, or touching, an occupied
+    // or unknown cell. That is a different fault from a margin that was merely
+    // too greedy, and needs a different response (look at the map or the state
+    // estimate, not at CORRIDOR_MARGIN), so it says so.
+    if (!regions_out.front().contains(resampled_out.front())) {
+      return fail(p.start_relax_dist > 0.0
+                      ? "the drone's position is inside (or within half a voxel of) an occupied "
+                        "or unknown cell on the conservative map"
+                      : "margin shrink pushed the first region past the start position");
     }
-    regions_out.pop_back();
-    resampled_out.pop_back();
-    pulled_back += L;
-  }
-  for (size_t s = 0; s + 1 < regions_out.size(); ++s) {
-    const double depth = regionOverlapDepth(regions_out[s], regions_out[s + 1]);
-    if (depth < kMinRegionOverlap) {
+    // The end, unlike the start, is free to move. Whatever sits there, a truncation
+    // cut or a projected goal, is placed right at a clearance limit, and DecompUtil
+    // puts every face THROUGH an obstacle point: the face separating the end from
+    // its nearest obstacle is closer than that obstacle, and square-on only by
+    // luck. The shrink needs margin + voxel_half_diagonal against that face, so an
+    // end sitting ~0.5 m from something is shrunk out of its own region almost
+    // every time. Rather than refuse the corridor, walk the end back along the path
+    // until the shrunk region holds it, dropping trailing regions that hold none of
+    // their segment. Full margin is kept everywhere; the vehicle only stops a
+    // little earlier, and the next cycle pushes the end forward again. A remaining
+    // piece shorter than kMinEndPiece counts as holding none of its segment: a
+    // near-zero segment gives the time allocation a degenerate T. Runs before the
+    // overlap check, so regions dropped here are never judged.
+    constexpr double kPullbackStep = 0.02;  // walk resolution [m]
+    constexpr double kMinEndPiece = 0.10;   // shortest last segment kept [m]
+    constexpr double kEndSlack = 1e-3;      // keep the pinned end off an exact face
+    while (!regions_out.back().contains(resampled_out.back())) {
+      const size_t k = regions_out.size() - 1;  // spans resampled_out[k] .. [k + 1]
+      const Eigen::Vector3d a = resampled_out[k];
+      const Eigen::Vector3d b = resampled_out[k + 1];
+      const double L = (b - a).norm();
+      bool found = false;
+      for (double back = kPullbackStep; L - back >= kMinEndPiece; back += kPullbackStep) {
+        const Eigen::Vector3d q = b + (back / L) * (a - b);
+        if (regions_out[k].contains(q, -kEndSlack)) {
+          resampled_out[k + 1] = q;
+          pulled_back += back;
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+      if (k == 0) {
+        std::ostringstream os;
+        os << "no point of the path at least " << kMinEndPiece
+           << " m from the start fits inside the shrunk corridor";
+        return fail(os.str());
+      }
+      regions_out.pop_back();
+      raws.pop_back();
+      resampled_out.pop_back();
+      origin.pop_back();
+      pulled_back += L;
+    }
+
+    int split_at = -1;  // base index of the joint to split around, if any
+    for (size_t s = 0; s + 1 < regions_out.size();) {
+      const double depth = regionOverlapDepth(regions_out[s], regions_out[s + 1]);
+      if (depth >= kMinRegionOverlap) {
+        ++s;
+        continue;
+      }
+
+      bool bridged = false;
+      Eigen::Vector3d c;
+      const double raw_depth = regionOverlapDepth(raws[s], raws[s + 1], &c);
+      // The bridge segment must lie in free space for DecompUtil to grow around
+      // it. The ball of radius raw_depth about c is inside both unshrunk regions,
+      // hence obstacle-free, so a segment of half-length <= raw_depth / 2 is too.
+      if (p.bridge_joints && std::isfinite(raw_depth) && raw_depth > kMinRegionOverlap) {
+        // Along the direction of travel through the joint, so the bridge is
+        // elongated the way the trajectory passes, not across it.
+        Eigen::Vector3d dir = resampled_out[s + 2] - resampled_out[s];
+        if (dir.norm() < 1e-9) dir = resampled_out[s + 1] - resampled_out[s];
+        if (dir.norm() < 1e-9) dir = Eigen::Vector3d::UnitX();
+        dir.normalize();
+        // The deepest point is often not unique — a squeeze uniform across the
+        // path has a whole line of them — and the LP returns whichever vertex it
+        // lands on, which can be metres to the side. Slide it back toward the
+        // joint waypoint as far as keeps all but kBridgeDepthGive of the depth.
+        // The ball radius min_i(b_i - n_i.x) is concave along the line, so the
+        // points that keep it form one interval ending at c: bisect for its start.
+        {
+          const Eigen::Vector3d w = resampled_out[s + 1];
+          const auto ball = [&](const Eigen::Vector3d& x) {
+            double r = std::numeric_limits<double>::infinity();
+            for (const ConvexRegion* q : {&raws[s], &raws[s + 1]}) {
+              for (int f = 0; f < q->A.rows(); ++f) r = std::min(r, q->b(f) - q->A.row(f).dot(x));
+            }
+            return r;
+          };
+          const double want = raw_depth - kBridgeDepthGive;
+          if (ball(w) >= want) {
+            c = w;
+          } else {
+            double lo = 0.0, hi = 1.0;  // ball(w + lo (c - w)) < want <= ball(... hi ...)
+            for (int it = 0; it < 30; ++it) {
+              const double mid = 0.5 * (lo + hi);
+              (ball(w + mid * (c - w)) >= want ? hi : lo) = mid;
+            }
+            c = w + hi * (c - w);
+          }
+        }
+        const double h = std::min(kBridgeHalfLen, 0.5 * (raw_depth - kBridgeDepthGive));
+        const Eigen::Vector3d ba = c - h * dir;
+        const Eigen::Vector3d bb = c + h * dir;
+        ConvexRegion braw;
+        if (growRaw(ba, bb, braw)) {
+          ConvexRegion bridge = shrunkBy(braw, pull_in);
+          if (regionOverlapDepth(regions_out[s], bridge) >= kMinRegionOverlap &&
+              regionOverlapDepth(bridge, regions_out[s + 1]) >= kMinRegionOverlap) {
+            // Region s now ends at ba, the bridge spans ba..bb, and region s+1
+            // starts at bb.
+            resampled_out[s + 1] = ba;
+            resampled_out.insert(resampled_out.begin() + s + 2, bb);
+            origin[s + 1] = -1;
+            origin.insert(origin.begin() + s + 2, -1);
+            if (attempt) {
+              attempt->raw.push_back(braw);
+              attempt->shrunk.push_back(bridge);
+            }
+            raws.insert(raws.begin() + s + 1, std::move(braw));
+            regions_out.insert(regions_out.begin() + s + 1, std::move(bridge));
+            ++bridges;
+            bridged = true;
+            // Don't advance: the loop re-checks both joints the bridge made with
+            // the same test every other joint passes, so a corridor can never be
+            // accepted on the strength of the check above alone.
+          }
+        }
+      }
+      if (bridged) continue;
+
       std::ostringstream os;
       os << "regions " << s << " and " << s + 1 << " stopped overlapping after the margin shrink ("
          << (std::isfinite(depth) ? "largest ball inside both " + std::to_string(depth) + " m"
                                   : std::string("overlap solve failed"))
-         << ", need " << kMinRegionOverlap << " m)";
+         << ", need " << kMinRegionOverlap << " m";
+      if (p.bridge_joints) os << "; a bridge region did not fix it";
+      if (split_rounds > 0) os << "; after " << split_rounds << " split round(s)";
+      os << ")";
+      if (split_rounds < kMaxSplitRounds && origin[s + 1] >= 0) {
+        split_at = origin[s + 1];
+        break;
+      }
       return fail(os.str());
     }
+    if (split_at < 0) break;  // every joint overlaps
+
+    // Halve the base segments either side of the joint, later one first so the
+    // earlier insertion index stays valid. A piece shorter than kMinHalfPiece is
+    // a sliver the time allocation handles badly, so such a segment is left
+    // whole; if neither can be split there is nothing left to try.
+    bool split_any = false;
+    const size_t j = static_cast<size_t>(split_at);
+    if (j + 1 < base.size() && (base[j + 1] - base[j]).norm() >= 2.0 * kMinHalfPiece) {
+      base.insert(base.begin() + j + 1, 0.5 * (base[j] + base[j + 1]));
+      split_any = true;
+    }
+    if (j > 0 && (base[j] - base[j - 1]).norm() >= 2.0 * kMinHalfPiece) {
+      base.insert(base.begin() + j, 0.5 * (base[j - 1] + base[j]));
+      split_any = true;
+    }
+    if (!split_any) {
+      return fail("regions around waypoint " + std::to_string(j) +
+                  " stopped overlapping after the margin shrink and their segments are too "
+                  "short to split");
+    }
+    ++split_rounds;
   }
 
   if (end_pullback) *end_pullback = pulled_back;
+  if (repairs) {
+    repairs->bridges = bridges;
+    repairs->split_rounds = split_rounds;
+  }
   return true;  // regions_out.size() == resampled_out.size() - 1
 }
 

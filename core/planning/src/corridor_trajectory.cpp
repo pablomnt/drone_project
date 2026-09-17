@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <type_traits>
@@ -406,6 +407,10 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // included: the allocation being searched has to be an allocation for the
   // shape actually being built.
   const std::vector<Eigen::Vector3d>* pin = pin_waypoints ? &waypoints : nullptr;
+  const auto t_begin = std::chrono::steady_clock::now();
+  const auto elapsed = [&t_begin]() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_begin).count();
+  };
 
   // Velocity-consistent seed: long enough to traverse each segment at vmax with
   // some slack. BOBYQA must start on the feasible side (the infeasible region
@@ -448,9 +453,27 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   optimizer.set_xtol_rel(1e-2);
   optimizer.set_maxeval(kMaxEvals);
 
+  // Whatever is left of the time budget after seed growth bounds the search.
+  bool budget_hit = false;
+  if (time_budget_ > 0.0) {
+    const double remaining = time_budget_ - elapsed();
+    if (remaining <= 0.0) {
+      budget_hit = true;
+    } else {
+      optimizer.set_maxtime(remaining);
+    }
+  }
+
   double min_cost = 0.0;
   try {
-    optimizer.optimize(times, min_cost);
+    // nlopt leaves the best point it evaluated in `times` on every positive
+    // result, MAXTIME_REACHED included.
+    if (!budget_hit) budget_hit = optimizer.optimize(times, min_cost) == nlopt::MAXTIME_REACHED;
+    if (budget_hit) {
+      DRONE_LOG_INFO("[corridor-qp] time search stopped at its " << time_budget_
+                     << " s budget (" << elapsed() << " s spent over " << S
+                     << " segments) — using the best allocation found so far");
+    }
   } catch (const std::exception& e) {
     // BOBYQA trouble is not fatal: fall through and try the QP at whatever
     // times we have (the seed if it never improved).

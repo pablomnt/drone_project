@@ -113,8 +113,21 @@ public:
 
   const CorridorLimits& limits() const { return limits_; }
 
+  // Wall-clock budget for optimizeTrajectory's time search [s]; <= 0 means
+  // unlimited. Counted from the start of the call, so seed growth uses it up
+  // too. When it runs out BOBYQA stops and the best allocation evaluated so far
+  // is used — always feasible, since the search starts from a feasible seed and
+  // infeasible points score worse than any feasible one. Seed growth itself is
+  // NOT cut short: until a feasible allocation exists there is nothing to fall
+  // back on, so a budget spent there skips the search and uses the seed. The
+  // budget is checked between QP evaluations, so a call can overrun it by one
+  // solve plus the final solve.
+  void setTimeBudget(double seconds) { time_budget_ = seconds; }
+  double timeBudget() const { return time_budget_; }
+
 private:
   CorridorLimits limits_;
+  double time_budget_ = 0.0;
 
   // Outer-loop tuning. The time penalty mirrors MinSnapTimeOptimizer's (cost
   // per second of flight time, trading smoothness against duration); the

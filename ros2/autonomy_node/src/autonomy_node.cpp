@@ -398,6 +398,11 @@ private:
     // centimetres and the committed path collapses to nothing. Longer commits
     // further before demanding full clearance; <= 0 disables the ramp.
     declare_parameter("ESCAPE_RAMP_DIST", 1.0);
+    // Wall-clock budget for the corridor QP's time-allocation search [s]. When
+    // it runs out the best feasible timing found so far is used (a slower
+    // trajectory, never an infeasible one). The QP only — truncation and
+    // corridor building are not counted. <= 0 disables the budget.
+    declare_parameter("TRAJ_SOLVE_BUDGET", 1.0);
     // Corridor resample cap: one free box is grown per path piece of at most
     // this length [m].
     declare_parameter("MAX_SEGMENT_LEN", 2.0);
@@ -495,6 +500,7 @@ private:
     cfg.frontier_margin = param("FRONTIER_MARGIN").as_double();
     cfg.corridor_margin = param("CORRIDOR_MARGIN").as_double();
     cfg.escape_ramp_dist = param("ESCAPE_RAMP_DIST").as_double();
+    cfg.traj_solve_budget = param("TRAJ_SOLVE_BUDGET").as_double();
     cfg.max_segment_len = param("MAX_SEGMENT_LEN").as_double();
     const auto bbox = param("CORRIDOR_BBOX").as_double_array();
     if (bbox.size() == 3) {
@@ -1280,9 +1286,13 @@ private:
   //     cut the optimistic path against unknown space;
   //   - "committed_goal": an orange sphere at the truncation endpoint — the
   //     intermediate goal inside known-safe space, which should ratchet toward
-  //     the red final goal marker as the drone maps more of the room.
-  // Empty when the corridor QP is off, when a tick truncates to nothing, or
-  // when corridor construction failed — in all of those the array is just the
+  //     the red final goal marker as the drone maps more of the room;
+  //   - "untruncated": the path as it went INTO truncation, a thinner magenta
+  //     line strip, only on ticks where truncation cut it. It starts at the
+  //     splice point, so unlike /planner/geometric_path it lines up with the
+  //     white prefix exactly and the cut-off stretch reads directly.
+  // Empty (apart from "untruncated") when the corridor QP is off, when a tick
+  // truncates to nothing, or when corridor construction failed — in all of those the array is just the
   // DELETEALL, which erases the previous drawing rather than leaving a stale
   // corridor on screen. Returns before touching the core when the debug flag
   // is off (the core does not populate the snapshot then either).
@@ -1338,6 +1348,26 @@ private:
       drawRegions(snap.shrunk, "regions", 0.2f, 0.8f, 1.0f, 0.45f, 0.014, shrunk_id);
     } else {
       drawRegions(snap.shrunk, "regions", 1.0f, 0.2f, 0.2f, 0.55f, 0.014, shrunk_id);
+    }
+
+    // Drawn before the white prefix so the kept stretch sits on top of it.
+    if (snap.untruncated.size() >= 2) {
+      visualization_msgs::msg::Marker full;
+      full.header.frame_id = kMapFrame;
+      full.header.stamp = now();
+      full.ns = "untruncated";
+      full.id = 0;
+      full.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      full.action = visualization_msgs::msg::Marker::ADD;
+      full.pose.orientation.w = 1.0;
+      full.scale.x = 0.025;  // line width [m], thinner than the committed prefix
+      full.color.r = 1.0f; full.color.g = 0.0f; full.color.b = 1.0f; full.color.a = 0.8f;
+      for (const auto& w : snap.untruncated) {
+        geometry_msgs::msg::Point p;
+        p.x = w.x(); p.y = w.y(); p.z = w.z();
+        full.points.push_back(p);
+      }
+      arr.markers.push_back(full);
     }
 
     if (snap.committed.size() >= 2) {

@@ -17,6 +17,7 @@ using drone_core::common::Trajectory;
 using drone_core::planning::ConvexRegion;
 using drone_core::planning::CorridorLimits;
 using drone_core::planning::CorridorParams;
+using drone_core::planning::CorridorRepairs;
 using drone_core::planning::CorridorTrajectoryOptimizer;
 
 namespace {
@@ -260,6 +261,30 @@ int main() {
       if (opt_traj.total_duration < 2.0) {
         std::cerr << "FAIL: optimized duration " << opt_traj.total_duration
                   << "s is physically impossible at vmax\n";
+        ++failures;
+      }
+    }
+  }
+
+  // A time budget that runs out immediately still yields a feasible trajectory:
+  // the search is skipped and the feasible seed is used, which is slower than
+  // the unbudgeted result but never infeasible.
+  {
+    CorridorTrajectoryOptimizer budgeted(limits);
+    budgeted.setTimeBudget(1e-9);
+    Trajectory full, cut;
+    if (!opt.optimizeTrajectory({start, corner, goal}, regions, full) ||
+        !budgeted.optimizeTrajectory({start, corner, goal}, regions, cut)) {
+      std::cerr << "FAIL: exhausted time budget produced no trajectory\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(cut, restAt(start), goal, regions, limits, "budget-exhausted");
+      // Strictly slower here: the seed (7.5 s after one growth step) is not the
+      // optimum (~7.45 s), so an equal duration means the budget was ignored.
+      if (cut.total_duration < full.total_duration + 0.02) {
+        std::cerr << "FAIL: budget-cut duration " << cut.total_duration
+                  << "s not slower than the full search's " << full.total_duration
+                  << "s — was the search actually stopped?\n";
         ++failures;
       }
     }
@@ -717,6 +742,118 @@ int main() {
         !r.empty() || !c.empty() || why.empty()) {
       std::cerr << "FAIL: a corridor with no room past the start was not refused cleanly\n";
       ++failures;
+    }
+  }
+
+  // Joint repairs. Two roomy stretches meet in a thin horizontal squeeze (a slab
+  // above and below the path, 1.1 m apart) right where the resampled path puts
+  // its joint (y = 2). Each region reaches into the squeeze, but their shared
+  // space is only ~0.55 m deep there, and the margin shrink lowers that depth by
+  // the full 0.44 m pull-in — so the plain build fails the overlap check, and the
+  // repairs must find a corridor that still keeps full margin everywhere.
+  {
+    const auto squeeze = [](double half_gap) {
+      std::vector<Eigen::Vector3d> pts;
+      // Wider than the region-growth window (lateral 2 m + pull-in), so no region
+      // can get around the squeeze instead of through it.
+      for (double x = -3.0; x <= 3.0 + 1e-9; x += 0.1) {
+        for (double y = -1.0; y <= 5.0 + 1e-9; y += 0.1) {
+          pts.emplace_back(x, y, -0.2);  // floor and ceiling of the roomy stretches
+          pts.emplace_back(x, y, 2.2);
+          if (std::abs(y - 2.0) <= 0.1 + 1e-9) {
+            pts.emplace_back(x, y, 1.0 - half_gap);
+            pts.emplace_back(x, y, 1.0 + half_gap);
+          }
+        }
+      }
+      return pts;
+    };
+    CorridorParams sp;
+    sp.margin = 0.4;
+    sp.start_relax_dist = 0.0;
+    sp.max_segment_len = 2.0;
+    const std::vector<Eigen::Vector3d> path = {{0, 0, 1}, {0, 4, 1}};
+    const auto obs = squeeze(0.55);
+
+    // Bridge: one extra region spliced in at the joint, no rebuild needed.
+    {
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      std::string why;
+      CorridorRepairs rep;
+      if (!drone_core::planning::buildCorridor(obs, path, sp, r, c, &why, nullptr, nullptr,
+                                               nullptr, &rep)) {
+        std::cerr << "FAIL: bridge did not repair the squeezed joint (" << why << ")\n";
+        ++failures;
+      } else {
+        if (rep.bridges < 1 || rep.split_rounds != 0 || c.size() != 3 ||
+            r.size() != c.size() + 1) {
+          std::cerr << "FAIL: squeezed joint repaired unexpectedly (bridges " << rep.bridges
+                    << ", split rounds " << rep.split_rounds << ", " << c.size() << " regions, "
+                    << r.size() << " waypoints)\n";
+          ++failures;
+        }
+        failures += checkRegionClearance(c, obs, {-1.5, -1.0, -0.2}, {1.5, 5.0, 2.2}, sp.margin,
+                                         "bridged");
+        Trajectory bt;
+        if (!opt.optimizeTrajectory(r, c, bt)) {
+          std::cerr << "FAIL: no trajectory through the bridged corridor\n";
+          ++failures;
+        } else {
+          failures += checkTrajectory(bt, restAt(r.front()), r.back(), c, limits, "bridged");
+        }
+      }
+    }
+
+    // Bridges off (the pinned-waypoint case): splitting the segments around the
+    // joint must repair it instead, with the extra points on the path itself.
+    {
+      CorridorParams np = sp;
+      np.bridge_joints = false;
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      std::string why;
+      CorridorRepairs rep;
+      if (!drone_core::planning::buildCorridor(obs, path, np, r, c, &why, nullptr, nullptr,
+                                               nullptr, &rep)) {
+        std::cerr << "FAIL: splitting did not repair the squeezed joint (" << why << ")\n";
+        ++failures;
+      } else {
+        bool on_path = true;
+        for (const auto& w : r) on_path = on_path && std::abs(w.x()) < kTol && std::abs(w.z() - 1.0) < kTol;
+        if (rep.bridges != 0 || rep.split_rounds < 1 || r.size() != c.size() + 1 || !on_path) {
+          std::cerr << "FAIL: split repair wrong (bridges " << rep.bridges << ", split rounds "
+                    << rep.split_rounds << ", waypoints on path " << on_path << ")\n";
+          ++failures;
+        }
+        failures += checkRegionClearance(c, obs, {-1.5, -1.0, -0.2}, {1.5, 5.0, 2.2}, np.margin,
+                                         "split");
+      }
+    }
+
+    // A squeeze with a few millimetres over the pull-in (0.45 vs 0.443 m) may get
+    // a corridor, but only one that keeps the margin.
+    {
+      const auto tight = squeeze(0.45);
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      if (drone_core::planning::buildCorridor(tight, path, sp, r, c)) {
+        failures += checkRegionClearance(c, tight, {-1.5, -1.0, -0.2}, {1.5, 5.0, 2.2}, sp.margin,
+                                         "tight squeeze");
+      }
+    }
+
+    // A squeeze narrower than the margin is still refused: no repair may buy a
+    // corridor by giving up clearance.
+    {
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      std::string why;
+      if (drone_core::planning::buildCorridor(squeeze(0.40), path, sp, r, c, &why) ||
+          !r.empty() || !c.empty() || why.empty()) {
+        std::cerr << "FAIL: a squeeze thinner than the margin was not refused cleanly\n";
+        ++failures;
+      }
     }
   }
 

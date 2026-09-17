@@ -617,9 +617,32 @@ clamped to [`kLeadMin` 0.04 s, `kLeadMax` 0.5 s], timed around the whole call in
 This works because `setTrajectory` **stages** rather than engages — the tracker holds a new
 trajectory until wall-clock reaches its `t0` and keeps evaluating the old one until then. So
 overshooting the lead costs nothing (bias it high), while overrunning it only starts the trajectory
-slightly past its own beginning and logs a line saying so. Note the corollary: a trajectory does
+slightly past its own beginning (flagged `ENGAGING LATE` in the replan log line below). Note the corollary: a trajectory does
 **not** take effect on the tick that produced it, which is what `test_autonomy_core` and
 `test_trajectory_tracker` pin.
+
+**Thin joints are repaired, not refused (NOT yet tried on bench).** Overlap depth is the radius of the
+largest ball in both regions, and the shrink lowers it by exactly margin + voxel half-diagonal, so a
+joint falling in a squeeze (e.g. under furniture) failed however roomy both regions were (bench
+2026-09-17: raw overlap 0.433 m vs 0.443 m pull-in). `buildCorridor` now tries, per failing joint:
+(1) a **bridge** region grown on a ±0.25 m segment through the deepest point of the two unshrunk
+regions' intersection — slid back toward the joint waypoint while keeping all but 1 cm of depth, since
+the LP's deepest point is non-unique in a uniform squeeze and landed 2 m to the side, which the QP then
+could not use — spliced in with its two ends replacing the joint waypoint; then (2) **halving** the
+base segments either side and rebuilding, at most 2 rounds. Every joint, bridged ones included, still
+passes the same overlap test, so full margin holds. `CorridorParams::bridge_joints` is off for presets
+(pinned waypoints; bridge ends lie off the path). Logged as `[trajgen] corridor: repaired thin joints`.
+Regions are now grown one segment per DecompUtil call (equivalent: `dilate` handles segments
+independently). `regionOverlapDepth` can also return the ball centre (the dual's simplex multipliers).
+
+**Every replan logs one timing line (NOT yet run on bench):** `[trajgen] replan: solve S s (corridor C s,
+QP Q s) | splice|rest, lead L s -> ... | since last staged G s (STALE_TIMEOUT T s) | search this tick R s |
+next lead s | OK|FAILED`. Corridor covers truncation + obstacle gathering + decomposition; the search
+time is the geometric solve on the same worker tick, which also delays the next staged trajectory.
+For a rest start, "splice would be late by" is what a splice would have suffered with that lead —
+this is how `BENCH_TEST_REPLAN_DISABLER` bench runs still measure the splice budget. "Since last
+staged" approaches the tracker's hover-hold latch (the tracker counts from arrival, ≤ one control
+tick later).
 
 **A start from rest waits for the solve instead (`f90a888`).** The lead exists so a splice can meet
 the outgoing trajectory at an instant fixed *before* solving. A trajectory with nothing to meet — a
@@ -633,7 +656,7 @@ the 0.04 s floor while their solves take **1-3 s** (39 logged presets: min 0.23 
 4.4 s, and they grow over a session), which put the reference up to 0.99 m ahead of the vehicle and
 already moving at 0.76 m/s on the first tracked tick — the drone then chased it and caught up. Two
 corollaries: `preset_end_` is computed from the restamped `t0`, so a preset no longer ends early by
-its own solve time; and the engaging-late log now fires only for splices, the only starts that can
+its own solve time; and `ENGAGING LATE` now fires only for splices, the only starts that can
 still be late.
 
 **Planning runs in `map`, control in `world` (fixed 2026-09-16, NOT yet flown).** RTAB-Map's `map`
@@ -969,6 +992,9 @@ publish nothing and cost nothing when the flag is off:
   - white line strip — the truncated committed prefix (drawn as soon as truncation succeeds);
   - orange sphere — the truncation endpoint, the intermediate goal in known-safe space, which should
     ratchet toward the red goal marker as the room is mapped.
+  - thin magenta line strip — the path as it went **into** truncation (starting at the splice point),
+    drawn only on ticks where truncation cut it short or to nothing, so the cut-off stretch is visible
+    beside the white prefix (NOT yet checked on bench).
 
   Reading it: grey present but nothing coloured ⇒ the margin collapsed the regions, so there is less
   room than `CORRIDOR_MARGIN` demands. Red ⇒ regions survived the shrink but failed validation (the
@@ -1095,6 +1121,13 @@ publish nothing and cost nothing when the flag is off:
   unknown space (the truncation margin against the conservative EDT). Enforced exactly as set; a
   committed point must still have strictly positive clearance whatever the value, so the prefix can
   never reach into an occupied or unknown voxel.
+- `TRAJ_SOLVE_BUDGET` (double, default `1.0` s) — wall-clock budget for the corridor QP's BOBYQA
+  time-allocation search, counted from the start of `optimizeTrajectory` (seed growth included). When
+  it runs out the best allocation evaluated so far is used — feasible by construction, just slower —
+  and `[corridor-qp] time search stopped at its ... budget` is logged. Seed growth is never cut short
+  (nothing feasible to fall back on yet), and the budget is checked between QP solves, so a call can
+  overrun by one solve plus the final solve. Truncation and corridor building are not counted.
+  `<= 0` = unlimited. NOT yet tried on bench.
 - `ESCAPE_RAMP_DIST` (double, default `1.0` m) — distance over which truncation's required clearance
   ramps from 0 at the drone up to the full `FRONTIER_MARGIN`. **Deliberately independent of the
   margin.** Ramping over the margin itself makes the requirement climb at 1 m/m, so on a thinly
@@ -1237,6 +1270,28 @@ Vendored in-tree copies of upstream repos (kept as copies, **not** git submodule
 matches the PX4 v1.17 topic set. Don't hand-edit these; they mirror upstream — **except one
 deliberate local patch**: `okvis2/okvis_ros2/src/Publisher.cpp` (`setBodyTransform`) no longer
 broadcasts `body→camera_link` (see *Frames & TF* above). Re-apply it if you re-vendor okvis2.
+
+## Open issues (to look into)
+
+1. **Capping the trajectory solve may make trajectories very slow.** With `TRAJ_SOLVE_BUDGET` = 1 s,
+   every bench solve on 2026-09-17 hit the budget (4-5 regions) and came out slow: 10.6 s for 4.25 m,
+   16.6 s for 4.9 m (bridged). The seed starts long (len/vmax + 0.5 s per segment, then a uniform 1.5x
+   stretch until feasible) and BOBYQA only shortens it from there, so a cut search leaves it near the
+   seed. If this holds up, change how segment times are searched so a fast allocation is reached
+   sooner (e.g. per-segment stretching of only the infeasible segments, a tighter seed, or shrinking
+   from feasible). Also check nothing stale gets staged: with ~1.05 s solves the gap between staged
+   trajectories was 2.04-2.08 s even on ticks with no search, just over `STALE_TIMEOUT` (2 s), so in
+   flight the tracker would drop into hover-hold between replans.
+2. **Planning stalls for tens of seconds.** On the same bench run the geometric search took 30.9 s,
+   46.5 s and 59.2 s (`search this tick` in the replan log) against `RRT_SOLVE_TIME` = 1 s, growing
+   over the session, on BLOCKED replans and IMPROVE ticks (EIT*). Search and trajgen share the worker
+   thread, so no trajectory was staged for up to 61 s. Cause not yet found: only the EIT* solve is
+   time-bounded; tree capture (`DEBUG_PLANNER_VIZ`, was on) and `shortcutClearanceAware` are not, and
+   EIT* only checks its termination condition between iterations. Next steps: time each part of
+   `planPath` when it overruns; then either fix the culprit (smaller EIT* batches, coarser edge-cost
+   sampling, a planner that honours the deadline) and/or move the search to its own thread so trajgen
+   keeps regenerating on the committed path (truncation + corridor against the current map already
+   stop it short of anything newly mapped), plus a hard wall-clock deadline on the whole search.
 
 ## Hardware / external process dependencies
 
