@@ -361,7 +361,16 @@ Module roles:
   are pulled in by `CORRIDOR_MARGIN` + the voxel half-diagonal (obstacle points are voxel *centres*),
   then each region is validated for a non-empty overlap with its neighbour, since C0 continuity pins
   the junction into that intersection and shrinking can empty it. **The first region is the
-  exception** — see the start relaxation below. The overlap test is **exact**
+  exception** — see the start relaxation below. **The end is walked back, not refused:** whatever
+  ends the prefix (a truncation cut, a projected goal) sits right at a clearance limit, and DecompUtil
+  puts every face *through* an obstacle point, so the face between the end and its nearest obstacle is
+  closer than that obstacle and the shrink excluded the end almost every time (bench, 2026-09-17:
+  `margin shrink pushed the last region past the goal position` at 0.5 m clearance vs 0.4 m margin).
+  `buildCorridor` now steps the end back along the path in 2 cm steps until the shrunk last region
+  holds it, dropping trailing regions that hold none of their segment (a remaining piece under 10 cm
+  counts as none), and refuses only if nothing past the start fits. Full margin everywhere; the drone
+  stops a little early and the next cycle pushes the end on. It logs `end pulled back X m`. NOT yet
+  tried on the bench. The overlap test is **exact**
   (`regionOverlapDepth`: the radius of the largest ball inside both regions, via a small dual
   simplex, microseconds) and requires at least 2 cm (`kMinRegionOverlap`). It replaced sampling 11
   points on the lines from the junction waypoint to the two segment midpoints, which missed overlaps
@@ -389,8 +398,8 @@ Module roles:
   why — `truncated to N wp / L m`
   (pipeline refusing to commit toward unknown space), `decomposition FAILED (<which check>) …
   tightest conservative clearance C m vs required M m` — the parenthetical names the actual check
-  that rejected it (two regions stopped overlapping, the goal fell outside the last region, or the
-  drone is inside/touching an occupied or unknown cell), since the clearance figure is context, not
+  that rejected it (two regions stopped overlapping, nothing past the start fits the shrunk
+  corridor, or the drone is inside/touching an occupied or unknown cell), since the clearance figure is context, not
   the cause — or `QP INFEASIBLE over S regions` (corridor fine, no trajectory fits it within
   `VMAX/AMAX/JMAX`). These are distinct faults needing opposite fixes, hence distinct messages. A
   successful corridor logs one line only when `DEBUG_PLANNER_VIZ` is on.

@@ -319,7 +319,8 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                    std::vector<ConvexRegion>& regions_out,
                    std::string* reason,
                    CorridorAttempt* attempt,
-                   double* start_margin) {
+                   double* start_margin,
+                   double* end_pullback) {
   // The primary outputs are always cleared on failure so a rejected corridor
   // can never be flown; `attempt` deliberately survives so the host can draw
   // what was rejected.
@@ -505,8 +506,48 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                       "or unknown cell on the conservative map"
                     : "margin shrink pushed the first region past the start position");
   }
-  if (!regions_out.back().contains(resampled_out.back())) {
-    return fail("margin shrink pushed the last region past the goal position");
+  // The end, unlike the start, is free to move. Whatever sits there, a truncation
+  // cut or a projected goal, is placed right at a clearance limit, and DecompUtil
+  // puts every face THROUGH an obstacle point: the face separating the end from
+  // its nearest obstacle is closer than that obstacle, and square-on only by
+  // luck. The shrink needs margin + voxel_half_diagonal against that face, so an
+  // end sitting ~0.5 m from something is shrunk out of its own region almost
+  // every time. Rather than refuse the corridor, walk the end back along the path
+  // until the shrunk region holds it, dropping trailing regions that hold none of
+  // their segment. Full margin is kept everywhere; the vehicle only stops a
+  // little earlier, and the next cycle pushes the end forward again. A remaining
+  // piece shorter than kMinEndPiece counts as holding none of its segment: a
+  // near-zero segment gives the time allocation a degenerate T. Runs before the
+  // overlap check, so regions dropped here are never judged.
+  constexpr double kPullbackStep = 0.02;  // walk resolution [m]
+  constexpr double kMinEndPiece = 0.10;   // shortest last segment kept [m]
+  constexpr double kEndSlack = 1e-3;      // keep the pinned end off an exact face
+  double pulled_back = 0.0;
+  while (!regions_out.back().contains(resampled_out.back())) {
+    const size_t k = regions_out.size() - 1;  // spans resampled_out[k] .. [k + 1]
+    const Eigen::Vector3d a = resampled_out[k];
+    const Eigen::Vector3d b = resampled_out[k + 1];
+    const double L = (b - a).norm();
+    bool found = false;
+    for (double back = kPullbackStep; L - back >= kMinEndPiece; back += kPullbackStep) {
+      const Eigen::Vector3d q = b + (back / L) * (a - b);
+      if (regions_out[k].contains(q, -kEndSlack)) {
+        resampled_out[k + 1] = q;
+        pulled_back += back;
+        found = true;
+        break;
+      }
+    }
+    if (found) break;
+    if (k == 0) {
+      std::ostringstream os;
+      os << "no point of the path at least " << kMinEndPiece
+         << " m from the start fits inside the shrunk corridor";
+      return fail(os.str());
+    }
+    regions_out.pop_back();
+    resampled_out.pop_back();
+    pulled_back += L;
   }
   for (size_t s = 0; s + 1 < regions_out.size(); ++s) {
     const double depth = regionOverlapDepth(regions_out[s], regions_out[s + 1]);
@@ -520,6 +561,7 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
     }
   }
 
+  if (end_pullback) *end_pullback = pulled_back;
   return true;  // regions_out.size() == resampled_out.size() - 1
 }
 

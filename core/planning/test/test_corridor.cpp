@@ -584,15 +584,138 @@ int main() {
     }
   }
 
-  // A path driven straight into a wall must fail cleanly (both outputs cleared)
-  // so the caller falls back rather than flying a half-built corridor.
+
+  // ------------------------------------------------------- end pull-back ---
+  // An end sitting close to something is walked back along the path until the
+  // shrunk last region holds it, instead of failing the corridor. Obstacles are
+  // written out explicitly: a flat wall across the path at y = wall_y.
+  const auto wallAcross = [](double wall_y) {
+    std::vector<Eigen::Vector3d> pts;
+    for (double x = -1.0; x <= 1.0 + 1e-9; x += 0.1) {
+      for (double z = 0.5; z <= 1.5 + 1e-9; z += 0.1) pts.emplace_back(x, wall_y, z);
+    }
+    return pts;
+  };
+
+  // Nothing near the end: the path is kept exactly as given.
   {
-    const auto obs = wallPoints(1.0, 1, -1.0, 1.0, 0.5, 1.5);  // wall at y = 1
-    std::vector<Eigen::Vector3d> r2;
-    std::vector<ConvexRegion> c2;
-    if (drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r2, c2) ||
-        !r2.empty() || !c2.empty()) {
-      std::cerr << "FAIL: corridor through a wall did not fail cleanly\n";
+    const auto obs = wallAcross(4.0);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r, c, &why,
+                                             nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: clear corridor rejected (" << why << ")\n";
+      ++failures;
+    } else if (pullback != 0.0 || (r.back() - Eigen::Vector3d(0, 2, 1)).norm() > 1e-9) {
+      std::cerr << "FAIL: an end with room was moved (pullback " << pullback << " m)\n";
+      ++failures;
+    }
+  }
+
+  // The bench failure: the end sits 0.3 m before a wall, inside the 0.4 m margin
+  // of the last region's face. It must come back to just inside the face (~1.9)
+  // and no further, the whole corridor must keep the margin, and it must fly.
+  {
+    const auto obs = wallAcross(2.3);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r, c, &why,
+                                             nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: end near a wall was not pulled back (" << why << ")\n";
+      ++failures;
+    } else {
+      if (pullback < 0.1 - kTol || pullback > 0.2 + kTol) {
+        std::cerr << "FAIL: end pulled back " << pullback << " m, expected 0.1-0.2 m\n";
+        ++failures;
+      }
+      if (std::abs((Eigen::Vector3d(0, 2, 1) - r.back()).norm() - pullback) > kTol) {
+        std::cerr << "FAIL: reported pullback " << pullback << " m does not match the end moving "
+                  << (Eigen::Vector3d(0, 2, 1) - r.back()).norm() << " m\n";
+        ++failures;
+      }
+      if (!c.back().contains(r.back())) {
+        std::cerr << "FAIL: pulled-back end is still outside the last region\n";
+        ++failures;
+      }
+      failures += checkRegionClearance(c, obs, {-1.5, -0.5, 0.5}, {1.5, 3.0, 1.5}, params.margin,
+                                       "end-pullback");
+      Trajectory pt;
+      if (!opt.optimizeTrajectory(r, c, pt)) {
+        std::cerr << "FAIL: no trajectory fits the pulled-back corridor\n";
+        ++failures;
+      } else {
+        failures += checkTrajectory(pt, restAt(r.front()), r.back(), c, limits, "end-pullback");
+      }
+    }
+  }
+
+  // A last segment too short to keep anything of is dropped with its region, and
+  // the end moves to the previous junction, which the previous region holds.
+  {
+    CorridorParams dp = params;
+    dp.start_relax_dist = 0.0;  // no split: the segments are exactly the ones given
+    const auto obs = wallAcross(2.1);  // last region's face lands at ~1.7
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 1.6, 1}, {0, 1.8, 1}}, dp, r,
+                                             c, &why, nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: droppable last segment failed the corridor (" << why << ")\n";
+      ++failures;
+    } else if (c.size() != 1 || r.size() != 2 ||
+               (r.back() - Eigen::Vector3d(0, 1.6, 1)).norm() > kTol ||
+               std::abs(pullback - 0.2) > kTol) {
+      std::cerr << "FAIL: last segment not dropped cleanly (regions " << c.size() << ", end y "
+                << r.back().y() << ", pullback " << pullback << " m)\n";
+      ++failures;
+    }
+  }
+
+  // A path driven straight into a wall must never yield a corridor through it.
+  // With the pull-back it is not refused either: the corridor stops the margin
+  // short of the wall, every region still clears it, and the end is reported.
+  {
+    const auto obs = wallAcross(1.0);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r, c, &why,
+                                             nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: path into a wall gave no corridor short of it (" << why << ")\n";
+      ++failures;
+    } else {
+      if (r.back().y() > 1.0 - params.margin + kTol) {
+        std::cerr << "FAIL: corridor into a wall ends at y " << r.back().y()
+                  << ", inside the margin of the wall at y 1\n";
+        ++failures;
+      }
+      if (std::abs(pullback - (2.0 - r.back().y())) > kTol) {
+        std::cerr << "FAIL: into-wall pullback " << pullback << " m does not match the end\n";
+        ++failures;
+      }
+      failures += checkRegionClearance(c, obs, {-1.5, -0.5, 0.5}, {1.5, 3.0, 1.5}, params.margin,
+                                       "into-wall");
+    }
+  }
+
+  // Nothing beyond the start fits (face ~0.1 m ahead of it): refused cleanly,
+  // not turned into a trajectory of a few centimetres.
+  {
+    CorridorParams dp = params;
+    dp.start_relax_dist = 0.0;
+    const auto obs = wallAcross(0.5);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    if (drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 0.4, 1}}, dp, r, c, &why) ||
+        !r.empty() || !c.empty() || why.empty()) {
+      std::cerr << "FAIL: a corridor with no room past the start was not refused cleanly\n";
       ++failures;
     }
   }

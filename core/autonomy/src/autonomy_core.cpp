@@ -662,8 +662,10 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     std::string why;
     planning::CorridorAttempt attempt;
     double start_margin = params.margin;
+    double end_pullback = 0.0;
     if (!planning::buildCorridor(obstacles, committed, params, resampled, regions, &why,
-                                 cfg_.debug_planner_viz ? &attempt : nullptr, &start_margin)) {
+                                 cfg_.debug_planner_viz ? &attempt : nullptr, &start_margin,
+                                 &end_pullback)) {
       snapshotRegions(attempt, /*accepted=*/false);
       DRONE_LOG_INFO("[trajgen] corridor: decomposition FAILED (" << why << ") over "
                      << committed.size() << " wp / " << polylineLength(committed)
@@ -684,6 +686,11 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                        << " m (of " << params.margin << " m) over the first "
                        << params.start_relax_dist
                        << " m — the drone is hemmed in; full margin applies beyond that");
+      }
+      if (end_pullback > 1e-6) {
+        DRONE_LOG_INFO("[trajgen] corridor: end pulled back " << end_pullback
+                       << " m along the path to fit inside the shrunk corridor (CORRIDOR_MARGIN "
+                       << params.margin << " m)");
       }
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
