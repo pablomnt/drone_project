@@ -271,6 +271,12 @@ private:
     // from there. Catches a vehicle knocked off course, which STALE_TIMEOUT (a
     // planner that stopped producing) cannot. <= 0 disables the check.
     declare_parameter("MAX_TRACKING_ERROR", 1.0);
+    // BENCH ONLY. Replan from the drone's measured position at rest instead of
+    // splicing onto where the current trajectory says it should be. On a disarmed
+    // bench the splice point runs ahead along the unflown trajectory and each
+    // replan shrinks it; this stops that. Never fly with it on: every replan
+    // would restart from zero velocity (warned while flying).
+    declare_parameter("BENCH_TEST_REPLAN_DISABLER", false);
     declare_parameter("SENSOR_TIMEOUT", 0.5);
     declare_parameter("SENSOR_WARMUP", 5.0);
     declare_parameter("RRT_MONITOR_PERIOD", 1.0);
@@ -315,7 +321,7 @@ private:
     // cannot stage a competing trajectory at all — which also keeps the takeoff
     // ramp clear of the no-airborne-gate issue documented in CLAUDE.md. Set it
     // back to true for planner-driven flights.
-    declare_parameter("PLAN_TRAJECTORY", false);
+    declare_parameter("PLAN_TRAJECTORY", true);
     // One-shot preset waypoints for isolating trajectory generation + the DFB
     // controller from the planner. Flip false->true (airborne, hovering on POS_SP)
     // to fly the shape hardcoded in firePresetSquare — as it stands a 2 m square
@@ -437,6 +443,7 @@ private:
     cfg.enable_feedforward = get_parameter("ENABLE_FEEDFORWARD").as_bool();
     cfg.stale_timeout = get_parameter("STALE_TIMEOUT").as_double();
     cfg.max_tracking_error = get_parameter("MAX_TRACKING_ERROR").as_double();
+    cfg.bench_replan_from_state = get_parameter("BENCH_TEST_REPLAN_DISABLER").as_bool();
     cfg.rrt_monitor_period = get_parameter("RRT_MONITOR_PERIOD").as_double();
     cfg.rrt_improve_period = get_parameter("RRT_IMPROVE_PERIOD").as_double();
     cfg.rrt_solve_time = get_parameter("RRT_SOLVE_TIME").as_double();
@@ -1026,6 +1033,12 @@ private:
       RCLCPP_INFO(get_logger(), "Controller engaged.");
       core_->reset();
       controller_running_ = true;
+    }
+
+    if (get_parameter("BENCH_TEST_REPLAN_DISABLER").as_bool()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "BENCH_TEST_REPLAN_DISABLER is ON while flying: every replan restarts "
+                           "from zero velocity. Set it false.");
     }
 
     // Default direct setpoint for takeoff / manual hover. A planner goal, once

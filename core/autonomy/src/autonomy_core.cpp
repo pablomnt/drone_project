@@ -830,7 +830,8 @@ AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state
   // timeout it has latched a hover, so the vehicle is no longer on that curve
   // and matching its state would step the reference rather than smooth it.
   const bool still_tracked = have && !outgoing.empty() &&
-                             (t_now - staged_at) <= cfg_.stale_timeout;
+                             (t_now - staged_at) <= cfg_.stale_timeout &&
+                             !cfg_.bench_replan_from_state;  // bench: always the measured state
   if (still_tracked) {
     // The outgoing trajectory is world-frame (it is what the tracker flies), so
     // sample it there and only then express the result in the map frame.

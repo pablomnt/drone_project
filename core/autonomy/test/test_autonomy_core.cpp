@@ -138,6 +138,46 @@ int main() {
     check(!core.inHoverHold(), "recovery trajectory from the real position is tracked");
   }
 
+  // Bench replan flag. Nothing flies the trajectory, so the drone stays at its
+  // start while the clock runs. A normal replan splices onto where the
+  // trajectory says the drone is by now (further along); with the flag it must
+  // start at the measured position. Both run, so the check proves a difference.
+  for (const bool bench : {false, true}) {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.stale_timeout = 5.0;
+    cfg.rrt_solve_time = 0.2;
+    cfg.bench_replan_from_state = bench;
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    core.setMap(octree);
+    const Eigen::Vector3d start(0.0, 0.0, 1.0);
+    core.setVehicleState(airborneAt(start));
+    core.reset();
+
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+    check(core.planOnce(), "bench-flag case: first plan");
+
+    fake_time += 1.5;  // the unflown trajectory has moved on; the drone has not
+    check(core.planOnce(), "bench-flag case: replan");
+    const auto path = core.sampledPlannedPath();
+    check(!path.empty(), "bench-flag case: replan is sampleable");
+    if (!path.empty()) {
+      const double off = (Eigen::Vector3d(path.front()[0], path.front()[1], path.front()[2]) -
+                          start).norm();
+      if (bench) {
+        check(off < 0.05, "BENCH_TEST_REPLAN_DISABLER: replan starts at the measured position");
+      } else {
+        check(off > 0.2, "without the bench flag the replan splices ahead (test contrast)");
+      }
+    }
+  }
+
   // A start at rest is re-anchored to after the solve. The clock jumps 2 s
   // straight after its first read inside planOnce (the splice anchor), as if the
   // solve took that long: with t0 fixed at the anchor, the trajectory would be

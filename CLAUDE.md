@@ -565,6 +565,15 @@ Covered by `checkDivergence` in `test_trajectory_tracker` and the divergence blo
 `test_autonomy_core`, mutation-checked (un-latching, keeping the staged trajectory, acting every
 tick, and not clearing the splice source each fail their check).
 
+**`BENCH_TEST_REPLAN_DISABLER` (bench only, default false)** makes `spliceAnchor` always take the
+rest-at-measured-position branch. Needed because on a disarmed bench nothing flies the trajectory,
+yet the splice samples it on the wall clock, so each replan starts further along and the trajectory
+shrinks to zero within its duration (observed 2026-09-16: 1.91 → 1.81 → 1.02 → 0.13 → 0 m, one
+`TRAJGEN_PERIOD` apart, with the geometric path unchanged). In flight it would restart every replan
+from zero velocity, so the node warns every 2 s while it is on and the controller is engaged.
+Covered by the bench-flag block in `test_autonomy_core` (flag off must splice ahead, on must start
+at the measured position).
+
 So `POS_SP` is a **pre-takeoff / no-goal setpoint only**. There is no "return to setpoint" or abort
 path through it, and **there is no goal-cancel API at all**: `AutonomyCore::has_goal_` is set by
 `setGoal` and never cleared, so once a goal is published the worker replans toward it forever. If an

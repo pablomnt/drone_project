@@ -60,6 +60,14 @@ public:
     // splices onto the reference, not the vehicle, so without this the corridor
     // would keep being grown around a point the vehicle is not at. <= 0 disables.
     double max_tracking_error{1.0};   // [m]
+    // BENCH ONLY. Every replan starts from rest at the measured position instead
+    // of splicing onto the outgoing trajectory. On a disarmed bench nothing flies
+    // the trajectory, but a splice still assumes the vehicle moved along it on the
+    // wall clock, so each replan starts further along and the trajectory shrinks
+    // to nothing within its own duration. In flight this would restart every
+    // replan from zero velocity — a stutter every TRAJGEN_PERIOD — so the node
+    // warns while it is on and the vehicle is flying.
+    bool bench_replan_from_state{false};
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
     double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
     double rrt_solve_time{3.0};       // planner optimisation budget per solve [s]

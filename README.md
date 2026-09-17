@@ -357,8 +357,8 @@ overrides and no YAML parameter file: the defaults in the table are the `declare
 `ros2/autonomy_node/src/autonomy_node.cpp`, and that file is the only place to change what the drone
 comes up with.
 
-Three defaults are currently set for **`PRESET_WAYPOINTS` bring-up** rather than for planner-driven
-flight; they are marked ⚑ and listed again at the end of this section.
+Two defaults are currently set for **bench and tuning work** rather than for a real flight; they are
+marked ⚑ and listed again at the end of this section.
 
 ### Mode and control
 
@@ -366,20 +366,22 @@ flight; they are marked ⚑ and listed again at the end of this section.
 |---|---|---|
 | `USE_SIM_MODE` | bool, `false` | Take state from PX4 odometry instead of VIO, and require only that stream to be healthy. For SITL. |
 | `ENABLE_FEEDFORWARD` | bool, `true` | Differential-flatness feed-forward (`vel_ff` before the velocity PID, `acc_ff` after it). Active only in `kTracking`, and suppressed during the takeoff ramp. False makes the controller byte-identical to the flight-tested baseline. |
-| `POS_SP` | double[3], `[0, 0, 1.5]` ⚑ | Takeoff / manual-hover setpoint in ENU metres. Used **only** in `kDirect` — ignored while any trajectory is installed. |
+| `POS_SP` | double[3], `[0, 0, 1.5]` | Takeoff / manual-hover setpoint in ENU metres. Used **only** in `kDirect` — ignored while any trajectory is installed. |
 | `MPC_XY_P` / `MPC_Z_P` | double, `0.95` / `1.0` | Position-loop proportional gains (outer cascade). Flight-tuned. |
-| `MPC_XY_VEL_P/I/D` | double, `2.8` / `0.4` / `0.2` | Horizontal velocity-loop PID gains. Flight-tuned. |
-| `MPC_Z_VEL_P/I/D` | double, `2.6` / `0.5` / `0.2` | Vertical velocity-loop PID gains. Flight-tuned. |
+| `MPC_XY_VEL_P/I/D` | double, `2.0` / `0.9` / `0.5` | Horizontal velocity-loop PID gains. Flight-tuned. While tracking with feed-forward, D damps the measured acceleration relative to the trajectory's `acc_ff` rather than the raw measurement, so it does not oppose planned acceleration (`0f3ebf9`, not yet flown). |
+| `MPC_Z_VEL_P/I/D` | double, `2.6` / `0.8` / `0.2` | Vertical velocity-loop PID gains. Flight-tuned. |
 | `MPC_VEL_D_TAU` | double, `0.04` s | Low-pass time constant on the D term. The raw derivative refreshes only when a new VIO sample lands (~25 Hz), so this keeps the term smooth between measurements. Roughly one sample period; raise for less noise, lower for less phase lag. |
-| `MPC_HOVER_THRUST` | double, `0.35` | Seed for the online hover-thrust estimator (normalised 0–1). |
+| `MPC_INT_ERR_MAX` | double, `0.2` m | Position error above which the velocity integrator is frozen (held, not reset), judged separately for XY (norm) and z. Stops a long move winding it up and overshooting on arrival. `≤ 0` disables. |
+| `MPC_HOVER_THRUST` | double, `0.33` | Seed for the online hover-thrust estimator (normalised 0–1). Setting it live re-seeds the estimate. |
 
 ### Safety and timeouts
 
 | Parameter | Type / default | What it does |
 |---|---|---|
 | `STALE_TIMEOUT` | double, `2.0` s | How long after a trajectory's *arrival* the tracker keeps tracking it before falling to `kHoverHold`. Guards against a dead planner, not a stale map. |
-| `SENSOR_TIMEOUT` | double, `0.5` s | A stream counts as healthy if it produced a sample within this window. Drives both guards below. |
 | `MAX_TRACKING_ERROR` | double, `1.0` m | If the vehicle gets further than this from the trajectory's reference, it gives up on that trajectory: it holds its current position, drops anything planned against the old reference, and the planner searches again and generates a new trajectory from there, starting at rest. Latched — it never resumes the abandoned trajectory. Catches what `STALE_TIMEOUT` cannot: guidance still arriving on time while the vehicle has been knocked off course. Logged as `[track] vehicle … m from the trajectory reference`. During a preset it holds until the preset's scheduled end, then returns to `POS_SP` (presets are never replanned). `≤ 0` disables. |
+| `BENCH_TEST_REPLAN_DISABLER` | bool, `false` | **Bench only.** Every replan starts at rest from the drone's measured position instead of splicing onto where the current trajectory says the drone should be by now. On a disarmed bench nothing flies the trajectory, so without this each replan starts further along it and the trajectory shrinks to nothing within its own duration. **Never fly with it on**: every replan would restart from zero velocity, a stutter every `TRAJGEN_PERIOD`. The node warns every 2 s if it is on while the controller is engaged. |
+| `SENSOR_TIMEOUT` | double, `0.5` s | A stream counts as healthy if it produced a sample within this window. Drives both guards below. |
 | `SENSOR_WARMUP` | double, `5.0` s | Continuous stream health required before the controller will *engage*. Any lapse resets the streak, so every takeoff re-proves it. |
 
 Two guards use these. Before takeoff, the controller refuses to engage until every required stream
@@ -392,8 +394,8 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 
 | Parameter | Type / default | What it does |
 |---|---|---|
-| `PLAN_TRAJECTORY` | bool, `false` ⚑ | Master gate on trajectory generation from the **planner**. False stops the worker after the geometric search (path still published for viz) and control stays on `POS_SP`. Does **not** gate `PRESET_WAYPOINTS`. |
-| `PRESET_WAYPOINTS` | bool, `false` | **Momentary trigger, not a mode.** A `false→true` edge fires one preset trajectory through waypoints hardcoded in `firePresetSquare` — currently a 2 m square centred on the drone's XY at 1.5 m — then the node resets it to false. Bypasses the geometric planner, solves the corridor QP once, holds it to completion, then returns control to `POS_SP`. Also clears any active goal (the only goal-cancel path there is). Needs a map; refuses a fire below 0.8 m while flying. |
+| `PLAN_TRAJECTORY` | bool, `true` | Master gate on trajectory generation from the **planner**. False stops the worker after the geometric search (path still published for viz) and control stays on `POS_SP`. Does **not** gate `PRESET_WAYPOINTS`. With it on, **do not have a goal live when you arm**: there is no airborne gate, so a staged trajectory can pre-empt the takeoff ramp (see `CLAUDE.md`). |
+| `PRESET_WAYPOINTS` | bool, `false` | **Momentary trigger, not a mode.** A `false→true` edge fires one preset trajectory through waypoints hardcoded in `firePresetSquare`, then the node resets it to false. Currently four waypoints in `map`: the drone's position, then +0.5 m in x at 1.3 m, +1.5 m x / +0.5 m y at 2.0 m, and +2.5 m x at 1.3 m. It does **not** end where it started: `POS_SP` is moved to the first waypoint on fire, so after completion the drone flies back there on `POS_SP`. Bypasses the geometric planner, solves the corridor QP once, holds it to completion, then returns control to `POS_SP`. Also clears any active goal (the only goal-cancel path there is). Needs a map; refuses a fire below 0.8 m while flying. |
 | `PLANNER_TYPE` | string, `"EITstar"` | Which OMPL planner to build: `RRTstar`, `BITstar`, `ABITstar`, `AITstar`, `EITstar`. Per-planner internals are **not** parameters — they live in `PlannerConfig` in `geometric_planner.hpp`. |
 | `RRT_MONITOR_PERIOD` | double, `1.0` s | How often the worker re-checks the committed path for collisions. |
 | `RRT_IMPROVE_PERIOD` | double, `10.0` s | How often it attempts an improvement search on an already-valid path. |
@@ -427,15 +429,15 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 
 | Parameter | Type / default | What it does |
 |---|---|---|
-| `DEBUG_PLANNER_VIZ` | bool, `true` ⚑ | Single switch for the debug visualisation: search tree, EDT clearance field, and the corridor stages on `/planner/corridor`. Zero-cost when off (nothing is extracted, sampled or published). Turn it off for a real flight so the NUC pays nothing. |
+| `DEBUG_PLANNER_VIZ` | bool, `true` ⚑ | Single switch for the planner debug visualisation: search tree, EDT clearance field, and the corridor stages on `/planner/corridor`. Zero-cost when off (nothing is extracted, sampled or published). Turn it off for a real flight so the NUC pays nothing. |
+| `DEBUG_CONTROL_VIZ` | bool, `true` ⚑ | Publishes `/control/pos_ff`, a sphere at the reference point the controller is chasing. Runs on the 50 Hz control tick, so unlike the planner viz it is **not** free when on; kept as its own switch for that reason. |
 
-### ⚑ Currently set for the preset test
+### ⚑ Currently set for bench and tuning work
 
-| Parameter | Test value | Flight value | Why |
+| Parameter | Current default | Flight value | Why |
 |---|---|---|---|
-| `PLAN_TRAJECTORY` | `false` | `true` | The preset does not need it, and with it off the worker cannot stage a competing trajectory at all — which also keeps the takeoff ramp clear of the no-airborne-gate issue in `CLAUDE.md`. |
-| `DEBUG_PLANNER_VIZ` | `true` | `false` | `/planner/corridor` is what separates a margin collapse from a failed validation from a QP infeasibility when a preset refuses to generate. |
-| `POS_SP` z | `1.5` | `1.3` | Matches the preset's altitude, so firing from this hover adds no altitude step to the first segment and the hand-back is at the same height. |
+| `DEBUG_PLANNER_VIZ` | `true` | `false` | `/planner/corridor` is what separates a margin collapse from a failed validation from a QP infeasibility when a trajectory refuses to generate. |
+| `DEBUG_CONTROL_VIZ` | `true` | `false` | `/control/pos_ff` is what shows tracking lag in RViz; it costs a publish every control tick. |
 
 ## Frames & TF (OKVIS ↔ RTAB-Map)
 
@@ -586,11 +588,11 @@ ros2 param set /autonomy_node POS_SP "[0.0, 0.0, 1.5]"
 with the planner bypassed entirely. Take off and settle into a stable hover on `POS_SP` above 0.8 m
 first, and confirm the node has logged `First octomap received` (the corridor pipeline needs a map or
 the fire is dropped). The parameter is a momentary trigger and resets itself, so set it again to fly
-the square again:
+it again:
 ```bash
 ros2 param set /autonomy_node PRESET_WAYPOINTS true
 ```
-Watch for `PRESET_WAYPOINTS fired: 6 waypoints from (…)` from the node, then either `[preset]
+Watch for `PRESET_WAYPOINTS fired: 4 waypoints from (…) in map` from the node, then either `[preset]
 trajectory staged: L m / T s` or `[preset] trajectory generation FAILED — staying on POS_SP` from the
 core. On failure nothing is staged and the vehicle keeps hovering — there is no fallback to an
 unchecked polynomial. Leaving offboard is the abort; there is no in-flight cancel.
