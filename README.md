@@ -348,6 +348,68 @@ RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (ray-traced 3D oc
                                   PX4 (via MicroXRCEAgent, serial /dev/ttyUSB0 or UDP for SITL)
 ```
 
+## Threading model
+
+Everything the drone runs sits in separate ROS 2 processes. `autonomy_node` is the one this repo
+owns; the perception stack around it is third-party. On the NUC (i5-8259U, 4 cores / 8 threads) a
+flight session looks roughly like this, with the CPU figures from a 2026-09-23 bench run:
+
+```
+ NUC (8 logical CPUs)
+ ├─ okvis_node        ~22 threads, ~170% CPU   visual-inertial odometry
+ ├─ rtabmap           ~91 threads,  ~32% CPU   SLAM + the occupancy octomap
+ ├─ realsense2_camera ~29 threads,  ~16% CPU   camera driver
+ ├─ MicroXRCEAgent                             PX4 uORB bridge
+ └─ autonomy_node     ~16 threads,  ~21% CPU   this repo (below)
+```
+
+Inside `autonomy_node`, four threads matter. The rest are DDS internals (discovery, delivery,
+timers) that we neither create nor tune.
+
+```
+ autonomy_node
+ ├─ main thread ................. spins the executor, then idle
+ │
+ ├─ executor thread A — FAST callback group (mutually exclusive)
+ │     50 Hz control tick: AutonomyCore::stepControl -> tracker -> PX4 attitude setpoint
+ │     estimator callbacks: VIO odom, PX4 odom, sensor_combined, vehicle_status, joy, goal
+ │
+ ├─ executor thread B — SLOW callback group (mutually exclusive)
+ │     onOctomap (150-500 ms per map), onFrontier, the 2 Hz debug visualisation
+ │
+ ├─ executor thread C — default group
+ │     parameter services only
+ │
+ ├─ SEARCH thread (AutonomyCore::searchLoop, ticks at RRT_MONITOR_PERIOD)
+ │     re-checks the committed path, runs the geometric search when it is blocked
+ │     or on the improve cadence, adopts a new committed path
+ │
+ └─ TRAJGEN thread (AutonomyCore::trajgenLoop, ticks at TRAJGEN_PERIOD)
+       reads the committed path, truncates it, grows the corridor, solves the QP,
+       stages the trajectory for the tracker; also plays one-shot presets
+```
+
+**Why the two callback groups.** A single-threaded executor let `onOctomap` block the control tick
+for 150-520 ms per map update; the first tick afterwards saw all three estimator streams stale at
+once and the in-flight watchdog landed the aircraft (2026-07-31). Both groups are *mutually
+exclusive*, so state used within one group needs no locking; only what genuinely crosses them is
+guarded (`cross_mutex_` in the node).
+
+**Why the search and trajgen threads are separate.** They used to be one loop, with the search
+first. A geometric search that overran its budget — measured at 30-59 s against a 1 s budget on the
+2026-09-17 bench — therefore stopped trajectory generation for as long as it ran, and past
+`STALE_TIMEOUT` the tracker latches hover-hold and the drone brakes. Split, a slow search only
+delays a *better* path: trajgen keeps regenerating on the committed path every `TRAJGEN_PERIOD`.
+That is safe because each trajgen tick re-truncates the path and regrows the corridor against the
+*current* map, so a path running into something newly mapped is cut short of it rather than flown.
+Shared state is small and each lock is held briefly: the committed path (`path_mutex_`), the two
+cached distance fields (`edt_mutex_`), the staged trajectory and viz snapshots (`traj_mutex_`), and
+the inputs from the host — state, map, goal, transform (`io_mutex_`). Each planner thread keeps its
+own copy of the config, as the control thread already did.
+
+**Rule of thumb when adding work:** anything that can block for longer than one 20 ms control tick
+belongs in the slow group or on a thread of its own, never on the fast group.
+
 ## Runtime parameters
 
 Every parameter below is declared by `autonomy_node` and is **live-reconfigurable**, armed or not:

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <sstream>
 #include <type_traits>
 #include <vector>
 
@@ -373,6 +374,15 @@ struct CorridorTimeContext {
   // through. The time search has to solve the SAME problem the final solve
   // will, or it optimises an allocation for a shape that is never built.
   const std::vector<Eigen::Vector3d>* pin_waypoints;
+  // Debug accounting, filled in by the objective. BOBYQA spends its first
+  // `probe_evals` evaluations (2n+1, nlopt's default) building its quadratic
+  // model before it takes a real step, so the time to that point is reported
+  // apart from the rest of the search.
+  int probe_evals = 0;
+  int evals = 0;
+  int infeasible = 0;
+  std::chrono::steady_clock::time_point search_start{};
+  double probe_time = -1.0;  // < 0 until the probe evaluations are done
 };
 
 // Feasibility-aware objective: QP snap cost + time penalty for a candidate
@@ -382,16 +392,21 @@ struct CorridorTimeContext {
 double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& grad,
                              void* data) {
   (void)grad;
-  const auto* ctx = static_cast<const CorridorTimeContext*>(data);
+  auto* ctx = static_cast<CorridorTimeContext*>(data);
   double total = 0.0;
   for (double t : x) total += t;
 
   common::Trajectory traj;
   double cost = 0.0;
-  if (!ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost,
-                            ctx->pin_waypoints)) {
-    return ctx->infeasible_penalty;
+  const bool ok = ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost,
+                                       ctx->pin_waypoints);
+  ++ctx->evals;
+  if (!ok) ++ctx->infeasible;
+  if (ctx->evals == ctx->probe_evals) {
+    ctx->probe_time =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx->search_start).count();
   }
+  if (!ok) return ctx->infeasible_penalty;
   return cost + ctx->time_penalty * total;
 }
 
@@ -428,24 +443,72 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // a seed, and BOBYQA redistributes it. Without this a fast replan starts the
   // search inside the infeasible region and burns growth iterations getting out.
   times[0] += limits_.amax > 0.0 ? start.vel.cwiseAbs().maxCoeff() / limits_.amax : 0.0;
+
+  // Debug accounting for the one-line breakdown below (debug_ only).
+  const auto sum = [](const std::vector<double>& v) {
+    double t = 0.0;
+    for (double x : v) t += x;
+    return t;
+  };
+  const double seed_total = sum(times);
+  int grow_solves = 0;
+  double grow_time = 0.0;
+  double grown_total = 0.0;
+  // Filled in once the search has run; the report below reads it on every exit.
+  CorridorTimeContext ctx{this,         start,              waypoints.back(), &regions,
+                          kTimePenalty, kInfeasiblePenalty, pin};
+  ctx.probe_evals = 2 * S + 1;
+  double search_time = 0.0;
+  double searched_total = 0.0;
+  bool budget_hit = false;
+  const auto report = [&](const char* outcome, double final_time, bool retried,
+                          const common::Trajectory* result) {
+    if (!debug_) return;
+    std::ostringstream os;
+    os << "[corridor-qp] " << S << " segments | stage 1: " << grow_time << " s, " << grow_solves
+       << " QP solve(s), seed " << seed_total << " s -> " << grown_total << " s | ";
+    if (ctx.evals == 0) {
+      os << "BOBYQA: not run";
+    } else {
+      const bool probed = ctx.probe_time >= 0.0;
+      const double probe = probed ? ctx.probe_time : search_time;
+      os << "BOBYQA probe: " << probe << " s (" << std::min(ctx.evals, ctx.probe_evals) << "/"
+         << ctx.probe_evals << " evals) | BOBYQA search: " << (search_time - probe) << " s ("
+         << std::max(0, ctx.evals - ctx.probe_evals) << " evals), " << ctx.infeasible
+         << " infeasible of " << ctx.evals << ", -> " << searched_total << " s"
+         << (budget_hit ? " [budget hit]" : "");
+    }
+    os << " | final solve: " << final_time << " s" << (retried ? " (retried at 1.5x)" : "")
+       << " | total " << elapsed() << " s | " << outcome;
+    if (result) os << ", trajectory " << result->total_duration << " s";
+    DRONE_LOG_INFO(os.str());
+  };
+
   {
     common::Trajectory probe;
     int grow = 0;
-    while (grow < kMaxSeedGrowth &&
-           !solveQP(start, waypoints.back(), times, regions, probe, nullptr, pin)) {
+    const auto t_grow = std::chrono::steady_clock::now();
+    bool feasible = false;
+    while (true) {
+      ++grow_solves;
+      feasible = solveQP(start, waypoints.back(), times, regions, probe, nullptr, pin);
+      if (feasible || grow >= kMaxSeedGrowth) break;
       for (double& t : times) t *= 1.5;
       ++grow;
     }
+    grow_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_grow).count();
+    grown_total = sum(times);
+    if (!feasible) grow = kMaxSeedGrowth;
     // Note this cannot rescue a corridor that is simply too SHORT to stop in:
     // braking from v0 inside distance d needs a >= v0^2/(2d) whatever the time
     // allocation, so stretching time does not help. That is a real physical
     // refusal (the committed prefix is shorter than the stopping distance) and
     // the caller must treat it as "no trajectory", not as a tuning failure.
-    if (grow == kMaxSeedGrowth) return false;  // corridor unusable at any sane duration
+    if (grow == kMaxSeedGrowth) {  // corridor unusable at any sane duration
+      report("FAILED (no feasible allocation within the seed growth)", 0.0, false, nullptr);
+      return false;
+    }
   }
-
-  CorridorTimeContext ctx{this,         start,              waypoints.back(), &regions,
-                          kTimePenalty, kInfeasiblePenalty, pin};
 
   nlopt::opt optimizer(nlopt::LN_BOBYQA, S);
   optimizer.set_min_objective(corridorTimeObjective, &ctx);
@@ -454,7 +517,6 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   optimizer.set_maxeval(kMaxEvals);
 
   // Whatever is left of the time budget after seed growth bounds the search.
-  bool budget_hit = false;
   if (time_budget_ > 0.0) {
     const double remaining = time_budget_ - elapsed();
     if (remaining <= 0.0) {
@@ -465,6 +527,7 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   }
 
   double min_cost = 0.0;
+  ctx.search_start = std::chrono::steady_clock::now();
   try {
     // nlopt leaves the best point it evaluated in `times` on every positive
     // result, MAXTIME_REACHED included.
@@ -481,12 +544,25 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
                    << "), using current allocation");
   }
 
+  search_time =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx.search_start).count();
+  searched_total = sum(times);
+
   // Final solve at the chosen allocation. The search started feasible, but
   // BOBYQA returns its lowest evaluated point, which can sit just inside the
   // infeasible boundary; retry once with a modest stretch before giving up.
-  if (solveQP(start, waypoints.back(), times, regions, out, nullptr, pin)) return true;
+  const auto t_final = std::chrono::steady_clock::now();
+  const auto finalTime = [&t_final]() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_final).count();
+  };
+  if (solveQP(start, waypoints.back(), times, regions, out, nullptr, pin)) {
+    report("OK", finalTime(), false, &out);
+    return true;
+  }
   for (double& t : times) t *= 1.5;
-  return solveQP(start, waypoints.back(), times, regions, out, nullptr, pin);
+  const bool ok = solveQP(start, waypoints.back(), times, regions, out, nullptr, pin);
+  report(ok ? "OK" : "FAILED (final solve infeasible)", finalTime(), true, ok ? &out : nullptr);
+  return ok;
 }
 
 }  // namespace drone_core::planning

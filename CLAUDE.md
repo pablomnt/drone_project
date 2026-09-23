@@ -143,7 +143,35 @@ camera/VIO/mapping stack + Foxglove + the `body→camera_link` static TF), `auto
 harness, or a test) drives. It is middleware-free and runs cadences on a background worker thread
 and the fast control thread:
 
-**Background worker (planning, geometry-first phase):** one loop ticking at the monitor cadence
+**Two planner threads (2026-09-23, NOT yet run on bench).** The geometric search and trajectory
+generation used to share one loop, so a slow search stopped trajectories: on the 2026-09-17 bench the
+search took 30.9 / 46.5 / 59.2 s against `RRT_SOLVE_TIME` = 1 s and nothing was staged for up to 61 s,
+which in flight means the tracker latches hover-hold and the drone brakes. They are now
+`searchLoop()` (monitor check, improve cadence, OMPL solve, adopt/hysteresis, `[plan]` line, search
+tree + clearance-field viz) and `trajgenLoop()` (presets, splice anchor, truncation, corridor, QP,
+staging, `[trajgen]` lines, corridor snapshot), started and joined together by
+`startPlanner`/`stopPlanner`. A slow search now only delays a *better* path. That is safe because
+every trajgen tick re-truncates and regrows the corridor against the CURRENT map, so a committed path
+running into something newly mapped is cut short of it rather than flown. It also fixes the
+2.04–2.08 s gap between staged trajectories (trajgen no longer waits for a monitor tick).
+What crosses the two threads, and how:
+- **committed path** — `committedPath()` / `setCommittedPath()` under `path_mutex_`, copied per tick,
+  never held across a solve. Distinct from `last_geometric_path_`, which is viz-only and is written by
+  presets too.
+- **distance fields** — `clearanceField` / `conservativeField` take `edt_mutex_` and now take their
+  `maxdist` as an argument (each thread owns its own Config). `sampleClearanceField` picks the field up
+  under the lock and samples outside it.
+- **config** — three copies now: `cfg_` (trajgen + `planOnce`), `search_cfg_` (search), `control_cfg_`
+  (`stepControl`), each with its own dirty flag. All three are initialised from the constructor's
+  Config — forgetting `search_cfg_` there made every search run at the default 3 s budget.
+- **divergence** — `search_replan_requested_` / `trajgen_replan_requested_`, one per thread.
+- `planOnce()` still runs both stages synchronously on the caller's thread, and still must not be
+  used alongside the threads.
+Covered in `test_autonomy_core`: with the improve cadence at the monitor cadence (so a search is
+almost always running) trajgen must keep staging at roughly `trajgen_period` —
+`stagedTrajectoryCount()` is the hook. Mutation-checked by making trajgen wait on `search_running_`.
+
+**The search loop (geometry-first phase):** ticks at the monitor cadence
 (`rrt_monitor_period`, ~2 Hz). Each tick builds **one** planner and does:
 - **Monitor (every tick):** re-checks the committed path via `GeometricPlanner::isPathValid`. If a
   point's clearance has dropped below the margin it's `path_invalid`.
@@ -177,8 +205,8 @@ and the fast control thread:
   reports the **resolved** map topic and its publisher count: zero publishers means the map source is
   silent (RTAB-Map only emits on motion-gated map-graph updates, so it needs camera motion *and*
   usable odometry), a non-zero count means a QoS or remap mismatch on our side.
-- **Trajectory generation (~1 Hz, `trajgen_period`):** re-anchors min-snap to current position.
-  **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
+- **Trajectory generation (~1 Hz, `trajgen_period`, on its own thread):** re-anchors min-snap to
+  current position. **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
   control stays on `kDirect` / POS_SP.
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
@@ -637,8 +665,10 @@ independently). `regionOverlapDepth` can also return the ball centre (the dual's
 
 **Every replan logs one timing line (NOT yet run on bench):** `[trajgen] replan: solve S s (corridor C s,
 QP Q s) | splice|rest, lead L s -> ... | since last staged G s (STALE_TIMEOUT T s) | search this tick R s |
-next lead s | OK|FAILED`. Corridor covers truncation + obstacle gathering + decomposition; the search
-time is the geometric solve on the same worker tick, which also delays the next staged trajectory.
+next lead s | OK|FAILED`. Corridor covers truncation + obstacle gathering + decomposition. The search
+field reports the **last completed** search's duration and whether one is running right now — since the
+thread split it cannot be "time spent searching this tick", and a search in flight no longer delays
+this trajectory.
 For a rest start, "splice would be late by" is what a splice would have suffered with that lead —
 this is how `BENCH_TEST_REPLAN_DISABLER` bench runs still measure the splice budget. "Since last
 staged" approaches the tracker's hover-hold latch (the tracker counts from arrival, ≤ one control
@@ -1288,10 +1318,11 @@ broadcasts `body→camera_link` (see *Frames & TF* above). Re-apply it if you re
    thread, so no trajectory was staged for up to 61 s. Cause not yet found: only the EIT* solve is
    time-bounded; tree capture (`DEBUG_PLANNER_VIZ`, was on) and `shortcutClearanceAware` are not, and
    EIT* only checks its termination condition between iterations. Next steps: time each part of
-   `planPath` when it overruns; then either fix the culprit (smaller EIT* batches, coarser edge-cost
-   sampling, a planner that honours the deadline) and/or move the search to its own thread so trajgen
-   keeps regenerating on the committed path (truncation + corridor against the current map already
-   stop it short of anything newly mapped), plus a hard wall-clock deadline on the whole search.
+   `planPath` when it overruns — **done**: a search taking more than 1.5x its budget now logs
+   `[plan] search OVERRAN its N s budget: … (goal projection, setup, solve, tree capture, shortcut)`,
+   so the next bench run says which part is slow. The **thread split is also done** (see *Two planner
+   threads*), so a stall no longer stops trajectories. Still open: the cause itself, and a hard
+   wall-clock deadline covering the whole search including the unbounded post-processing.
 
 ## Hardware / external process dependencies
 

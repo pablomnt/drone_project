@@ -403,6 +403,10 @@ private:
     // trajectory, never an infeasible one). The QP only — truncation and
     // corridor building are not counted. <= 0 disables the budget.
     declare_parameter("TRAJ_SOLVE_BUDGET", 1.0);
+    // Log one line per corridor QP solve breaking down its time: seed growth,
+    // BOBYQA's initial probe, the rest of the search, the final solve. On for
+    // now while the time search is being tuned.
+    declare_parameter("DEBUG_TRAJGEN", true);
     // Corridor resample cap: one free box is grown per path piece of at most
     // this length [m].
     declare_parameter("MAX_SEGMENT_LEN", 2.0);
@@ -501,6 +505,7 @@ private:
     cfg.corridor_margin = param("CORRIDOR_MARGIN").as_double();
     cfg.escape_ramp_dist = param("ESCAPE_RAMP_DIST").as_double();
     cfg.traj_solve_budget = param("TRAJ_SOLVE_BUDGET").as_double();
+    cfg.debug_trajgen = param("DEBUG_TRAJGEN").as_bool();
     cfg.max_segment_len = param("MAX_SEGMENT_LEN").as_double();
     const auto bbox = param("CORRIDOR_BBOX").as_double_array();
     if (bbox.size() == 3) {

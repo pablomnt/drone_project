@@ -1,6 +1,9 @@
 #include "drone_core/planning/geometric_planner.hpp"
 
+#include "drone_core/common/logging.hpp"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -402,6 +405,31 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
 
   for (int i = 0; i < 3; ++i) start->values[i] = start_vec[i];
 
+  // Only the OMPL solve is bounded by planning_time_ — goal projection, the
+  // debug tree capture and the post-processing shortcut are not, and the solve
+  // itself only checks its termination condition between iterations. A search
+  // taking tens of seconds against a 1 s budget has been seen on the bench, so
+  // when this call overruns badly, say where the time went. Silent otherwise:
+  // four clock reads on a solve that behaved.
+  const auto t_begin = std::chrono::steady_clock::now();
+  auto lap = [](std::chrono::steady_clock::time_point& mark) {
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - mark).count();
+    mark = now;
+    return dt;
+  };
+  auto mark = t_begin;
+  double t_project = 0.0, t_setup = 0.0, t_solve = 0.0, t_tree = 0.0, t_post = 0.0;
+  const auto reportOverrun = [&](const char* outcome) {
+    const double total = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t_begin).count();
+    if (total <= 1.5 * planning_time_) return;
+    DRONE_LOG_INFO("[plan] search OVERRAN its " << planning_time_ << " s budget: " << total
+                   << " s total (goal projection " << t_project << " s, setup " << t_setup
+                   << " s, solve " << t_solve << " s, tree capture " << t_tree
+                   << " s, shortcut " << t_post << " s) — " << outcome);
+  };
+
   // Anchor the start-state collision exemption at this solve's start. Must
   // precede projectGoal, which validates candidates under the same exemption.
   start_pos_ = {start_vec[0], start_vec[1], start_vec[2]};
@@ -416,8 +444,11 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   if (!projectGoal(goal_vec, planning_goal)) {
     last_goal_projection_ = std::numeric_limits<double>::infinity();
     last_goal_gap_ = std::numeric_limits<double>::infinity();
+    t_project = lap(mark);
+    reportOverrun("no valid goal nearby, never solved");
     return false;
   }
+  t_project = lap(mark);
   last_planning_goal_ = planning_goal;
   last_goal_projection_ = std::sqrt(std::pow(planning_goal[0] - goal_vec[0], 2) +
                                     std::pow(planning_goal[1] - goal_vec[1], 2) +
@@ -432,8 +463,10 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   auto planner = makePlanner();
   planner->setProblemDefinition(pdef);
   planner->setup();
+  t_setup = lap(mark);
 
   const ompl::base::PlannerStatus solved = planner->solve(planning_time_);
+  t_solve = lap(mark);
 
   // Capture the tree for debug visualisation before the planner goes out of
   // scope. Done regardless of success (the tree of a *failed* solve is just as
@@ -458,8 +491,10 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
     }
   }
 
+  t_tree = lap(mark);
   if (!solved) {
     last_goal_gap_ = std::numeric_limits<double>::infinity();
+    reportOverrun("no solution");
     return false;
   }
 
@@ -513,6 +548,8 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   if (clearanceMode()) {
     shortcutClearanceAware(result_path);
   }
+  t_post = lap(mark);
+  reportOverrun("solved");
   return true;
 }
 

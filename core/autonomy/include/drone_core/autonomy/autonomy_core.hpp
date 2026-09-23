@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -153,6 +154,9 @@ public:
     // slow search yields a slower trajectory rather than a late one. Covers
     // the QP only, not truncation or corridor building. <= 0 = unlimited.
     double traj_solve_budget{1.0};
+    // Log where each corridor QP solve spends its time (seed growth, BOBYQA
+    // probe and search, final solve). See CorridorTrajectoryOptimizer::setDebug.
+    bool debug_trajgen{true};
     // Minimum half-extents of the region-growth window in the SEGMENT-ALIGNED
     // frame (x along the segment, y/z lateral) — not world axes. A floor, not a
     // cap: buildCorridor raises it to scale with the longest segment. Pinning
@@ -262,6 +266,12 @@ public:
 
   // Introspection (call from the control thread).
   bool hasTrajectory() const;
+
+  // How many trajectories have been handed to the tracker since construction.
+  // Counts staging, not engagement, so it advances once per successful trajgen
+  // tick — which is what says the trajgen thread is still producing while a
+  // slow search runs on the other one.
+  std::uint64_t stagedTrajectoryCount() const { return staged_count_.load(); }
   bool inHoverHold() const;
   const control::PositionControl& controller() const { return tracker_.controller(); }
 
@@ -357,7 +367,28 @@ private:
                  const planning::MapHandle& map,
                  const planning::MapHandle& conservative,
                  const std::vector<Eigen::Vector3d>& waypoints);
-  void plannerLoop();
+  // The two planner threads. They are deliberately separate: a geometric search
+  // can take tens of seconds (EIT* overrunning its budget has been measured at
+  // 59 s on the bench), and while they shared one loop that stalled trajectory
+  // generation too, so the tracker ran past STALE_TIMEOUT and latched
+  // hover-hold. Now a slow search only delays a BETTER path; trajgen keeps
+  // regenerating on the committed path every trajgen_period. That is safe while
+  // the search runs because every trajgen tick re-truncates and regrows the
+  // corridor against the CURRENT map, so a committed path running into
+  // something newly mapped is cut short of it rather than flown.
+  void searchLoop();
+  void trajgenLoop();
+
+  // The committed path, shared between the two threads: written by the search
+  // loop when it adopts, read (by copy, never held across a solve) by trajgen.
+  std::vector<std::vector<double>> committedPath() const;
+  void setCommittedPath(std::vector<std::vector<double>> path);
+
+  // Which map the debug clearance samples were taken from. Guarded by
+  // edt_mutex_ with the fields it belongs to, since clearanceField clears it on
+  // a rebuild and that rebuild can happen on either planner thread.
+  planning::MapHandle vizSampledMap() const;
+  void setVizSampledMap(const planning::MapHandle& map);
 
   // Where a replan must begin, so that engaging it does not step the reference.
   struct SpliceAnchor {
@@ -434,34 +465,40 @@ private:
   // the map has actually changed (octomap hands us a fresh tree per message). A
   // static scene therefore reuses one EDT instead of rebuilding it every tick.
   // Returns nullptr (and clears the cache) when the map is empty / has no
-  // obstacles. Called only from the planner worker thread.
+  // obstacles. `maxdist` is the field's saturation distance; it is passed in
+  // rather than read from a config member because both planner threads call
+  // this and each owns its own Config copy. The cache is guarded by edt_mutex_,
+  // which is held only for the rebuild and the pointer hand-back — never across
+  // a solve.
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> clearanceField(
-      const planning::MapHandle& map);
+      const planning::MapHandle& map, double maxdist);
 
   // Cached distance field over the conservative map view, for truncation and
   // corridor growth. Mirrors clearanceField's rebuild-on-map-change caching;
   // when the conservative and search maps are the same object (no frontier
   // information), the search field is reused instead of building a second EDT.
-  // Worker thread only.
+  // Same edt_mutex_ and same reason for the explicit maxdist as clearanceField.
   std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> conservativeField(
-      const planning::MapHandle& map);
+      const planning::MapHandle& map, double maxdist);
 
   // Sample the cached EDT on a coarse grid over the map's bounding box. Samples
   // whichever field the cost objective is scored against — the conservative one
   // when it is a distinct view, the search one otherwise — so the published
-  // cloud shows what the objective actually sees. Called only from the planner
-  // worker thread (it reads edt_ / cons_edt_ and their source maps, which the
-  // worker owns), and only when debug_planner_viz is set.
-  std::vector<std::array<double, 4>> sampleClearanceField() const;
+  // cloud shows what the objective actually sees. Takes edt_mutex_ to pick up
+  // the field, then samples outside it. Search thread only, and only when
+  // debug_planner_viz is set.
+  std::vector<std::array<double, 4>> sampleClearanceField(double maxdist) const;
 
-  // Two copies of the config, one per thread, so neither reads memory the other
-  // is writing. cfg_ belongs to the planner worker (and planOnce, which is not
-  // run alongside it); control_cfg_ to the thread calling stepControl. Both are
-  // refreshed from pending_config_ under io_mutex_, each on its own dirty flag.
-  // (There used to be one cfg_, assigned whole by stepControl while the worker
-  // read it unlocked — a data race — and only refreshed once the host started
-  // calling stepControl, i.e. once armed.)
+  // One copy of the config per thread, so none of them reads memory another is
+  // writing. cfg_ belongs to the trajgen thread (and to planOnce, which is not
+  // run alongside the threads); search_cfg_ to the search thread; control_cfg_
+  // to the thread calling stepControl. All three are refreshed from
+  // pending_config_ under io_mutex_, each on its own dirty flag. (There used to
+  // be one cfg_, assigned whole by stepControl while the worker read it
+  // unlocked — a data race — and only refreshed once the host started calling
+  // stepControl, i.e. once armed.)
   Config cfg_;
+  Config search_cfg_;
   Config control_cfg_;
   std::function<double()> clock_;
 
@@ -488,12 +525,21 @@ private:
   bool preset_pending_{false};
   std::atomic<bool> preset_active_{false};
   std::atomic<double> preset_end_{0.0};
-  // Raised by stepControl when the tracker abandons a trajectory for divergence,
-  // consumed by the worker to replan from the vehicle's position.
-  std::atomic<bool> replan_requested_{false};
+  // Raised by stepControl when the tracker abandons a trajectory for divergence.
+  // One flag per planner thread, because both have to react and each consumes
+  // its own: the search thread drops the committed path and re-searches from the
+  // vehicle, the trajgen thread regenerates immediately instead of waiting out
+  // trajgen_period.
+  std::atomic<bool> search_replan_requested_{false};
+  std::atomic<bool> trajgen_replan_requested_{false};
   Config pending_config_;
-  bool worker_config_dirty_{false};
+  bool search_config_dirty_{false};
+  bool trajgen_config_dirty_{false};
   bool control_config_dirty_{false};
+
+  // Guards the two cached distance fields below and everything derived from
+  // them, now that both planner threads use them.
+  mutable std::mutex edt_mutex_;
 
   mutable std::mutex traj_mutex_;
   common::Trajectory pending_;
@@ -506,10 +552,22 @@ private:
   std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
   CorridorSnapshot last_corridor_;  // debug viz; empty unless corridor QP + viz on
 
-  std::thread worker_;
+  std::thread search_worker_;
+  std::thread trajgen_worker_;
   std::atomic<bool> running_{false};
-  std::vector<std::vector<double>> cached_path_;
-  double last_trajgen_{-1.0e9};
+
+  // The committed path (see committedPath/setCommittedPath). Distinct from
+  // last_geometric_path_, which is viz only and is also written by presets.
+  mutable std::mutex path_mutex_;
+  std::vector<std::vector<double>> committed_path_;
+
+  // How the last geometric search went, for the trajgen log line: it can no
+  // longer time the search itself, since the search runs on the other thread.
+  std::atomic<std::uint64_t> staged_count_{0};
+  std::atomic<bool> search_running_{false};
+  std::atomic<double> last_search_time_{0.0};
+
+  double last_trajgen_{-1.0e9};  // trajgen thread only
 
   // Replan lead time (worker thread only). How far ahead of "now" a replan is
   // anchored, so it is ready by the time it is due to engage. Measured rather

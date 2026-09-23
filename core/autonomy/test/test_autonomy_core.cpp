@@ -420,6 +420,51 @@ int main() {
     check(planned, "worker picks up a config change without any stepControl");
   }
 
+  // Search and trajgen run on SEPARATE threads: a slow geometric search must not
+  // stop trajectories from being regenerated. With the improve cadence at the
+  // monitor cadence, a search is running almost all the time; trajgen must keep
+  // staging on the committed path meanwhile, at roughly trajgen_period. While the
+  // two shared one loop this produced one trajectory per search instead.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.require_map_to_world = false;
+    cfg.plan_trajectory = true;
+    cfg.use_corridor_qp = false;      // plain min-snap: trajgen itself stays cheap
+    cfg.treat_unknown_as_hazard = false;
+    cfg.bench_replan_from_state = true;  // no stepControl here, so never splice ahead
+    cfg.rrt_solve_time = 1.0;         // each search takes about a second
+    cfg.rrt_monitor_period = 0.05;
+    cfg.rrt_improve_period = 0.05;    // improve every tick => a search is ~always running
+    cfg.trajgen_period = 0.1;
+    autonomy::AutonomyCore core(cfg);
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    octree->updateNode(octomap::point3d(1.0f, 2.0f, 1.0f), true);  // improve needs obstacles
+    core.setMap(octree);
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(2.0, 0.0, 1.0);
+    core.setGoal(goal);
+    core.startPlanner();
+
+    // Wait for the first search to produce a committed path and the first
+    // trajectory off it.
+    bool staged = false;
+    for (int i = 0; i < 60 && !staged; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      staged = core.stagedTrajectoryCount() > 0;
+    }
+    const std::uint64_t before = core.stagedTrajectoryCount();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    const std::uint64_t during = core.stagedTrajectoryCount() - before;
+    core.stopPlanner();
+
+    check(staged, "split threads: a trajectory is staged at all");
+    // One second at a 0.1 s period is ~10 trajectories; one per ~1 s search is at
+    // most 2. Five leaves room for scheduling without admitting the old coupling.
+    check(during >= 5, "trajgen keeps staging while the search thread is busy");
+  }
+
   // Background planner thread: should plan and stage without help.
   {
     autonomy::AutonomyCore::Config cfg;

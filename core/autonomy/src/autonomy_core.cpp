@@ -129,7 +129,7 @@ std::vector<std::vector<double>> remainingCommittedSuffix(
 }  // namespace
 
 AutonomyCore::AutonomyCore(const Config& config)
-    : cfg_(config), control_cfg_(config), clock_(steadyNowSeconds) {
+    : cfg_(config), search_cfg_(config), control_cfg_(config), clock_(steadyNowSeconds) {
   tracker_.setPositionGains(control_cfg_.pos_p);
   tracker_.setVelocityGains(control_cfg_.vel_p, control_cfg_.vel_i, control_cfg_.vel_d);
   tracker_.setDerivativeTau(control_cfg_.vel_d_tau);
@@ -207,7 +207,8 @@ void AutonomyCore::firePreset(const std::vector<Eigen::Vector3d>& waypoints) {
 void AutonomyCore::applyConfig(const Config& config) {
   std::lock_guard<std::mutex> lock(io_mutex_);
   pending_config_ = config;
-  worker_config_dirty_ = true;
+  search_config_dirty_ = true;
+  trajgen_config_dirty_ = true;
   control_config_dirty_ = true;
 }
 
@@ -320,7 +321,8 @@ common::Command AutonomyCore::stepControl(double dt) {
       has_last_planned_ = false;
       last_planned_ = common::Trajectory{};
     }
-    replan_requested_.store(true);
+    search_replan_requested_.store(true);
+    trajgen_replan_requested_.store(true);
   }
 
   return cmd;
@@ -328,12 +330,35 @@ common::Command AutonomyCore::stepControl(double dt) {
 
 void AutonomyCore::startPlanner() {
   if (running_.exchange(true)) return;
-  worker_ = std::thread(&AutonomyCore::plannerLoop, this);
+  // Two threads on purpose — see searchLoop/trajgenLoop.
+  search_worker_ = std::thread(&AutonomyCore::searchLoop, this);
+  trajgen_worker_ = std::thread(&AutonomyCore::trajgenLoop, this);
 }
 
 void AutonomyCore::stopPlanner() {
   if (!running_.exchange(false)) return;
-  if (worker_.joinable()) worker_.join();
+  if (search_worker_.joinable()) search_worker_.join();
+  if (trajgen_worker_.joinable()) trajgen_worker_.join();
+}
+
+std::vector<std::vector<double>> AutonomyCore::committedPath() const {
+  std::lock_guard<std::mutex> lock(path_mutex_);
+  return committed_path_;
+}
+
+void AutonomyCore::setCommittedPath(std::vector<std::vector<double>> path) {
+  std::lock_guard<std::mutex> lock(path_mutex_);
+  committed_path_ = std::move(path);
+}
+
+planning::MapHandle AutonomyCore::vizSampledMap() const {
+  std::lock_guard<std::mutex> lock(edt_mutex_);
+  return viz_sampled_map_;
+}
+
+void AutonomyCore::setVizSampledMap(const planning::MapHandle& map) {
+  std::lock_guard<std::mutex> lock(edt_mutex_);
+  viz_sampled_map_ = map;
 }
 
 bool AutonomyCore::planOnce() {
@@ -353,9 +378,16 @@ bool AutonomyCore::planOnce() {
     has_goal = has_goal_;
     world_from_map = world_from_map_;
     has_frame = has_map_to_world_;
-    if (worker_config_dirty_) {
+    // planOnce runs BOTH stages on the calling thread, so it refreshes both
+    // planner-side copies (it is documented as not running alongside the two
+    // planner threads, which own them otherwise).
+    if (search_config_dirty_) {
+      search_cfg_ = pending_config_;
+      search_config_dirty_ = false;
+    }
+    if (trajgen_config_dirty_) {
       cfg_ = pending_config_;
-      worker_config_dirty_ = false;
+      trajgen_config_dirty_ = false;
     }
   }
 
@@ -379,7 +411,9 @@ bool AutonomyCore::planOnce() {
   // Truncation stops at unobserved space only when the operator asked for it —
   // see the worker's copy of this for why it keys off the flag and not off
   // whether a conservative view exists. The predicate reads the RAW map.
-  if (!runTrajgen(path, anchor.t0, anchor.start, conservativeField(cons), cons,
+  if (!runTrajgen(path, anchor.t0, anchor.start,
+                  conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin)),
+                  cons,
                   cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
                                                : planning::CorridorUnknownFn{},
                   traj))
@@ -435,7 +469,7 @@ AutonomyCore::CorridorSnapshot AutonomyCore::corridorSnapshot() const {
   return last_corridor_;
 }
 
-std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
+std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField(double maxdist) const {
   std::vector<std::array<double, 4>> out;
 
   // Sample whichever field the cost is actually scored against, since tuning
@@ -443,10 +477,17 @@ std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
   // shows what the objective sees. That is the conservative field whenever one
   // exists as a distinct view, and the search field otherwise. Both are current
   // for this tick: applyClearanceObjective runs before this and populates them.
-  const bool use_cons = cons_edt_ && cons_edt_source_map_ &&
-                        cons_edt_source_map_ != edt_source_map_;
-  const auto& field = use_cons ? cons_edt_ : edt_;
-  const auto& source = use_cons ? cons_edt_source_map_ : edt_source_map_;
+  std::shared_ptr<DynamicEDTOctomap> field;
+  planning::MapHandle source;
+  {
+    // Pick the field up under the lock, then sample outside it: the walk is slow
+    // and the other planner thread must not wait on it.
+    std::lock_guard<std::mutex> lock(edt_mutex_);
+    const bool use_cons = cons_edt_ && cons_edt_source_map_ &&
+                          cons_edt_source_map_ != edt_source_map_;
+    field = use_cons ? cons_edt_ : edt_;
+    source = use_cons ? cons_edt_source_map_ : edt_source_map_;
+  }
   if (!field || !source) return out;
 
   double xmin, ymin, zmin, xmax, ymax, zmax;
@@ -454,7 +495,7 @@ std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
   source->getMetricMax(xmax, ymax, zmax);
 
   constexpr double step = 0.15;  // grid spacing [m] — coarse, debug-only
-  const double maxd = cfg_.clearance_threshold;
+  const double maxd = maxdist;
   for (double x = xmin; x <= xmax; x += step) {
     for (double y = ymin; y <= ymax; y += step) {
       for (double z = zmin; z <= zmax; z += step) {
@@ -472,9 +513,9 @@ std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField() const {
 bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal& goal,
                                  const planning::MapHandle& map,
                                  std::vector<std::vector<double>>& path) {
-  planning::GeometricPlanner planner(map, cfg_.rrt_solve_time);
-  planner.setPlannerType(cfg_.planner_type);
-  planner.setBestEffort(cfg_.best_effort_goal);
+  planning::GeometricPlanner planner(map, search_cfg_.rrt_solve_time);
+  planner.setPlannerType(search_cfg_.planner_type);
+  planner.setBestEffort(search_cfg_.best_effort_goal);
   const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
   const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
   return planner.planPath(start, goal_vec, path);
@@ -718,6 +759,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
       optimizer.setTimeBudget(cfg_.traj_solve_budget);
+      optimizer.setDebug(cfg_.debug_trajgen);
       snapshotRegions(attempt, /*accepted=*/true);
       // `start` carries the splice state. Its position is path.front() by
       // construction (the caller rooted the path there), so it satisfies
@@ -767,6 +809,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
 }
 
 void AutonomyCore::stagePending(const common::Trajectory& traj) {
+  staged_count_.fetch_add(1);
   std::lock_guard<std::mutex> lock(traj_mutex_);
   pending_ = traj;
   last_planned_ = traj;
@@ -818,7 +861,10 @@ void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d
   // free the QP is pinned only at the two ends and takes the cheapest route the
   // corridor allows, which for a closed square (last waypoint == first) is
   // barely moving at all. Planning deliberately leaves them free; see runTrajgen.
-  const bool ok = runTrajgen(path, anchor.t0, anchor.start, conservativeField(cons), cons,
+  const bool ok = runTrajgen(path, anchor.t0, anchor.start,
+                             conservativeField(cons, std::max(cfg_.clearance_threshold,
+                                                              cfg_.frontier_margin)),
+                             cons,
                              cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
                                                           : planning::CorridorUnknownFn{},
                              traj, /*pin_waypoints=*/true);
@@ -903,7 +949,8 @@ common::Trajectory AutonomyCore::stagePlanned(const SpliceAnchor& anchor,
 }
 
 std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
-    const planning::MapHandle& map) {
+    const planning::MapHandle& map, double maxdist) {
+  std::lock_guard<std::mutex> lock(edt_mutex_);
   // No obstacles => clearance is uniform => no field needed (validity treats
   // everything as free, cost reduces to length). Drop any stale cache.
   if (!map || map->size() == 0) {
@@ -917,17 +964,18 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
   // Also rebuild when CLEARANCE_THRESHOLD changes: it is the field's maxdist, and
   // keying on the map alone left a live change unapplied until the next octomap,
   // which on a static bench scene may never come.
-  if (map != edt_source_map_ || cfg_.clearance_threshold != edt_maxdist_) {
-    edt_ = buildEdt(map, cfg_.clearance_threshold);
+  if (map != edt_source_map_ || maxdist != edt_maxdist_) {
+    edt_ = buildEdt(map, maxdist);
     edt_source_map_ = map;
-    edt_maxdist_ = cfg_.clearance_threshold;
+    edt_maxdist_ = maxdist;
     viz_sampled_map_.reset();  // debug clearance samples are of the old field
   }
   return edt_;
 }
 
 std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
-    const planning::MapHandle& map) {
+    const planning::MapHandle& map, double maxdist) {
+  std::lock_guard<std::mutex> lock(edt_mutex_);
   if (!map || map->size() == 0) {
     cons_edt_.reset();
     cons_edt_source_map_.reset();
@@ -936,11 +984,10 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
   // No frontier information => the conservative view IS the search map; reuse
   // its field rather than building a second identical EDT.
   if (map == edt_source_map_ && edt_) return edt_;
-  const double cons_maxdist = std::max(cfg_.clearance_threshold, cfg_.frontier_margin);
-  if (map != cons_edt_source_map_ || cons_maxdist != cons_edt_maxdist_) {
-    cons_edt_ = buildEdt(map, cons_maxdist);
+  if (map != cons_edt_source_map_ || maxdist != cons_edt_maxdist_) {
+    cons_edt_ = buildEdt(map, maxdist);
     cons_edt_source_map_ = map;
-    cons_edt_maxdist_ = cons_maxdist;
+    cons_edt_maxdist_ = maxdist;
   }
   return cons_edt_;
 }
@@ -948,7 +995,7 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
 bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
                                            const planning::MapHandle& map,
                                            const planning::MapHandle& cons) {
-  auto edt = clearanceField(map);
+  auto edt = clearanceField(map, search_cfg_.clearance_threshold);
   if (!edt) return false;
   // The search map's field drives the collision check (clearance > margin). It
   // has to be this view and not the conservative one, because the conservative
@@ -978,8 +1025,9 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   // already runs on the conservative view. There the override would be a no-op
   // at best, and calling conservativeField would just hand back the same field.
   if (cons && cons != map) {
-    if (auto cons_edt = conservativeField(cons)) {
-      planner.setCostClearance(makeClearanceFn(cons_edt, cfg_.clearance_threshold));
+    if (auto cons_edt = conservativeField(
+            cons, std::max(search_cfg_.clearance_threshold, search_cfg_.frontier_margin))) {
+      planner.setCostClearance(makeClearanceFn(cons_edt, search_cfg_.clearance_threshold));
     }
   }
 
@@ -1004,16 +1052,16 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   return true;
 }
 
-void AutonomyCore::plannerLoop() {
-  std::uint64_t run = 0;  // planner ticks taken (advanced only while a goal and map exist)
+void AutonomyCore::searchLoop() {
+  std::uint64_t run = 0;  // search ticks taken (advanced only while a goal and map exist)
 
   // Idle diagnostics. A tick that cannot plan produces no [plan] line at all,
   // which from outside is indistinguishable from a crashed worker — "I sent a
   // goal and nothing happens" has two very different causes (no goal reached
   // the core, or no map has). Name the missing precondition instead of going
   // quiet: log on every change of reason, then periodically so a persistent
-  // stall stays visible without spamming at the tick rate. Worker-thread
-  // locals, so this costs nothing once planning is running.
+  // stall stays visible without spamming at the tick rate. Thread locals, so
+  // this costs nothing once planning is running.
   enum class Idle { kNone, kNoGoal, kNoMap, kNoFrame };
   Idle idle = Idle::kNone;
   double last_idle_log = -1.0e9;
@@ -1027,10 +1075,7 @@ void AutonomyCore::plannerLoop() {
     common::Goal goal;
     bool has_goal = false;
     bool new_goal = false;
-    bool preset_pending = false;
-    std::vector<Eigen::Vector3d> preset_waypoints;
-    // One snapshot per cycle, used both to bring the state into the map frame and
-    // to take the finished trajectory back out (see stagePlanned).
+    // One snapshot per cycle, used to bring the state into the map frame.
     Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
     bool has_frame = false;
     {
@@ -1044,35 +1089,32 @@ void AutonomyCore::plannerLoop() {
       has_goal = has_goal_;
       new_goal = new_goal_;
       new_goal_ = false;
-      preset_pending = preset_pending_;
-      preset_pending_ = false;
-      if (preset_pending) preset_waypoints = preset_waypoints_;
       // Take any new config here, once per cycle, so everything this cycle does
       // sees one consistent Config — and so it applies whether or not the
       // vehicle is armed (stepControl, which used to be the only consumer, only
       // runs armed).
-      if (worker_config_dirty_) {
-        cfg_ = pending_config_;
-        worker_config_dirty_ = false;
+      if (search_config_dirty_) {
+        search_cfg_ = pending_config_;
+        search_config_dirty_ = false;
       }
     }
 
     // A new goal invalidates the committed path regardless of its collision
     // validity (the monitor check below only tests for collisions, not whether
-    // the path still targets the current goal). Drop it here on the worker
-    // thread so the tick below replans from the drone's current position toward
-    // the new goal.
-    if (new_goal) cached_path_.clear();
+    // the path still targets the current goal). Drop it here on this thread so
+    // the tick below replans from the drone's current position toward the new
+    // goal.
+    if (new_goal) setCommittedPath({});
 
     // The tracker abandoned the trajectory (the vehicle got too far from its
     // reference) and is holding position. Same treatment as a new goal: drop the
     // committed path so this tick searches again from where the vehicle actually
-    // is, and generate the trajectory this tick rather than waiting out
-    // TRAJGEN_PERIOD. stepControl has already cleared the splice source, so it
-    // starts from rest at the measured position.
-    if (replan_requested_.exchange(false)) {
-      cached_path_.clear();
-      last_trajgen_ = -1.0e9;
+    // is. The trajgen thread consumes its own copy of the flag and regenerates
+    // immediately rather than waiting out TRAJGEN_PERIOD. stepControl has
+    // already cleared the splice source, so it starts from rest at the measured
+    // position.
+    if (search_replan_requested_.exchange(false)) {
+      setCommittedPath({});
       if (has_goal) {
         DRONE_LOG_INFO("[plan] tracking diverged: replanning from the vehicle's position");
       }
@@ -1081,23 +1123,14 @@ void AutonomyCore::plannerLoop() {
     // Without the map->world transform, map-frame obstacles and the world-frame
     // vehicle cannot be put side by side, and assuming identity is exactly the
     // offset this exists to prevent. Hold off; the idle branch says why.
-    const bool frame_ok = has_frame || !cfg_.require_map_to_world;
-
-    // One-shot preset trajectory: bypass the geometric search entirely and solve
-    // the corridor-QP trajectory once through the given waypoints, then hold it
-    // (kept fresh by stepControl) until it completes. Handled before — and to the
-    // exclusion of — normal planning: firePreset dropped any goal, and while the
-    // preset is playing the planner must not fight it.
-    if (preset_pending && !frame_ok) {
-      DRONE_LOG_INFO("[preset] ignored: no map->world transform yet — the preset square is in "
-                     "the map frame and cannot be placed without it (is RTAB-Map publishing?)");
-    } else if (preset_pending) {
-      runPreset(state, world_from_map, map, conservative, preset_waypoints);
-      // Fall through to the idle branch below only if nothing else runs this tick.
-    }
+    const bool frame_ok = has_frame || !search_cfg_.require_map_to_world;
 
     if (!preset_active_.load() && has_goal && map && frame_ok) {
       run++;
+      // Local copy for this tick. The trajgen thread reads the shared one
+      // whenever it likes, so everything below works on this snapshot and
+      // publishes through setCommittedPath.
+      std::vector<std::vector<double>> committed_path = committedPath();
       // The search, the committed-path cost from the drone and every other
       // planning quantity use the vehicle position in the map frame.
       const Eigen::Vector3d pos_map = world_from_map.inverse() * state.pos;
@@ -1105,10 +1138,11 @@ void AutonomyCore::plannerLoop() {
       const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
 
       // Commit a path: keep it on the worker and republish for visualisation.
-      auto adopt = [this](const std::vector<std::vector<double>>& p) {
-        cached_path_ = p;
+      auto adopt = [this, &committed_path](const std::vector<std::vector<double>>& p) {
+        committed_path = p;
+        setCommittedPath(p);
         std::lock_guard<std::mutex> lock(traj_mutex_);
-        last_geometric_path_ = p;
+        last_geometric_path_ = p;  // viz copy; presets write this one too
       };
 
       // Which map view the geometric search (and the committed-path monitor)
@@ -1120,7 +1154,7 @@ void AutonomyCore::plannerLoop() {
       // legacy single-map behavior is preserved: the conservative
       // (frontier-stamped) view, when present, is the one obstacle model.
       const planning::MapHandle search_map =
-          (!cfg_.use_corridor_qp && conservative) ? conservative : map;
+          (!search_cfg_.use_corridor_qp && conservative) ? conservative : map;
 
       // One planner per tick. Set the clearance fields FIRST, so the
       // committed-path re-check below sees the same obstacle model the search
@@ -1130,43 +1164,43 @@ void AutonomyCore::plannerLoop() {
       // otherwise skim (see applyClearanceObjective). Both are cached and
       // rebuilt only on a map change, so this is cheap on the common
       // still-valid tick.
-      planning::GeometricPlanner planner(search_map, cfg_.rrt_solve_time);
-      planner.setPlannerType(cfg_.planner_type);
-      planner.setBestEffort(cfg_.best_effort_goal);
-      planner.setRecordTree(cfg_.debug_planner_viz);
+      planning::GeometricPlanner planner(search_map, search_cfg_.rrt_solve_time);
+      planner.setPlannerType(search_cfg_.planner_type);
+      planner.setBestEffort(search_cfg_.best_effort_goal);
+      planner.setRecordTree(search_cfg_.debug_planner_viz);
       applyClearanceObjective(planner, search_map, conservative);
 
       // Debug-only: re-sample the clearance field when the map changes (the EDT
       // is now current for this tick). Gated so a regular flight never walks the
       // grid. Sampling only on map change keeps even a debug run cheap on a
       // static scene.
-      if (cfg_.debug_planner_viz && search_map != viz_sampled_map_) {
-        auto samples = sampleClearanceField();
+      if (search_cfg_.debug_planner_viz && search_map != vizSampledMap()) {
+        auto samples = sampleClearanceField(search_cfg_.clearance_threshold);
         {
           std::lock_guard<std::mutex> lock(traj_mutex_);
           last_clearance_samples_ = std::move(samples);
         }
-        viz_sampled_map_ = search_map;
+        setVizSampledMap(search_map);
       }
 
-      const bool had_path = !cached_path_.empty();
-      const bool path_invalid = !had_path || !planner.isPathValid(cached_path_);
+      const bool had_path = !committed_path.empty();
+      const bool path_invalid = !had_path || !planner.isPathValid(committed_path);
 
       // IMPROVE every Nth tick, N = improve period / monitor period (≈10 with the
       // defaults), so the RRT_MONITOR_PERIOD / RRT_IMPROVE_PERIOD params still set
       // both cadences. Skipped with no committed path or no obstacles mapped
       // (clearance is then uniform, so there is nothing to improve — a blocked path
       // still replans below regardless).
-      const long n = std::lround(cfg_.rrt_improve_period /
-                                 std::max(cfg_.rrt_monitor_period, 1.0e-3));
+      const long n = std::lround(search_cfg_.rrt_improve_period /
+                                 std::max(search_cfg_.rrt_monitor_period, 1.0e-3));
       const std::uint64_t improve_interval = static_cast<std::uint64_t>(std::max<long>(1, n));
       const bool improve_run = (run % improve_interval == 0) && had_path && map->size() > 0;
 
       // Diagnostics on the committed path (the field is already set). The cost is
       // split into its length + clearance-penalty terms for the logs below;
       // committed_clr is the tightest distance to a wall along the path.
-      const auto committed = planner.costBreakdown(cached_path_);
-      const double committed_clr = planner.minClearance(cached_path_);
+      const auto committed = planner.costBreakdown(committed_path);
+      const double committed_clr = planner.minClearance(committed_path);
 
       // Stream a cost as "total (len=L + clr_cost=C + unk_cost=U)". The unknown
       // term is shown only when it is being charged, so the common line stays
@@ -1191,18 +1225,17 @@ void AutonomyCore::plannerLoop() {
         return std::sqrt(dx * dx + dy * dy + dz * dz);
       };
 
-      // Wall time of this tick's geometric search, if one ran. It shares the
-      // worker thread with trajgen, so it delays the next staged trajectory too.
-      double search_time = 0.0;
       if (path_invalid || improve_run) {
         std::vector<std::vector<double>> candidate;
         const double t_search = now();
+        search_running_.store(true);
         const bool solved = planner.planPath(start, goal_vec, candidate);
-        search_time = now() - t_search;
+        search_running_.store(false);
+        last_search_time_.store(now() - t_search);
 
         // Debug-only: capture the tree this solve built (even if it failed — that
         // is exactly when seeing where it explored is most useful).
-        if (cfg_.debug_planner_viz) {
+        if (search_cfg_.debug_planner_viz) {
           std::lock_guard<std::mutex> lock(traj_mutex_);
           last_search_tree_ = planner.searchTree();
         }
@@ -1234,16 +1267,16 @@ void AutonomyCore::plannerLoop() {
             const auto cand = planner.costBreakdown(candidate);
             adopt(candidate);
             if (had_path)
-              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed BLOCKED (clr="
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed BLOCKED (clr="
                              << committed_clr << "m < " << planner.collisionMargin()
                              << "m) -> REPLAN cost=" << fmtCost(cand) << " clr="
                              << planner.minClearance(candidate) << "m" << goal_note);
             else
-              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR no committed path -> PLAN cost="
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR no committed path -> PLAN cost="
                              << fmtCost(cand) << " clr="
                              << planner.minClearance(candidate) << "m" << goal_note);
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed "
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed "
                            << (had_path ? "BLOCKED" : "absent")
                            << " -> REPLAN FAILED (no path to goal), holding" << goal_note);
           }
@@ -1265,25 +1298,25 @@ void AutonomyCore::plannerLoop() {
           // candidate win merely because the drone advanced (its root creeps toward
           // the goal while the committed cost still charges the traversed prefix).
           constexpr double kGoalProgress = 0.25;  // min gap reduction [m] to count as advancing
-          const double committed_gap = gapToGoal(cached_path_);
+          const double committed_gap = gapToGoal(committed_path);
           const double cand_gap =
               solved ? planner.lastGoalGap() : std::numeric_limits<double>::infinity();
-          const auto remaining = remainingCommittedSuffix(cached_path_, start);
+          const auto remaining = remainingCommittedSuffix(committed_path, start);
           const double remaining_cost = planner.pathCost(remaining);
-          const double threshold = cfg_.replan_improve_ratio * remaining_cost;
+          const double threshold = search_cfg_.replan_improve_ratio * remaining_cost;
           const auto cand = planner.costBreakdown(candidate);
           if (solved && cand_gap < committed_gap - kGoalProgress) {
             adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE best-effort ADVANCE gap "
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE best-effort ADVANCE gap "
                            << committed_gap << "m -> " << cand_gap << "m (goal) cost=" << fmtCost(cand) << " clr="
                            << planner.minClearance(candidate) << "m" << goal_note);
           } else if (solved && cand_gap <= committed_gap + kGoalProgress && cand.total <= threshold) {
             adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
                            << " (committed=" << fmtCost(committed) << ") -> ADOPT cost=" << fmtCost(cand) << " clr="
                            << planner.minClearance(candidate) << "m" << goal_note);
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
                            << " clr=" << committed_clr << "m gap=" << committed_gap << "m candidate cost="
                            << (solved ? fmtCost(cand) : std::string("inf")) << " gap="
                            << (solved ? std::to_string(cand_gap) : std::string("inf"))
@@ -1295,15 +1328,94 @@ void AutonomyCore::plannerLoop() {
         // committed path's end still is from the goal — ~0 once the goal is reached,
         // or the best-effort closest-approach distance while the drone is ratcheting
         // toward a goal beyond the mapped frontier.
-        DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(cfg_.planner_type) <<" MONITOR committed cost=" << fmtCost(committed)
-                       << " clr=" << committed_clr << "m gap=" << gapToGoal(cached_path_) << "m -> OK");
+        DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed cost=" << fmtCost(committed)
+                       << " clr=" << committed_clr << "m gap=" << gapToGoal(committed_path) << "m -> OK");
       }
 
+    } else if (!preset_active_.load()) {
+      const Idle reason = !has_goal ? Idle::kNoGoal : !map ? Idle::kNoMap : Idle::kNoFrame;
+      if (reason != idle || t - last_idle_log >= kIdleLogPeriod) {
+        if (reason == Idle::kNoGoal) {
+          DRONE_LOG_INFO("[plan] idle: no goal set — nothing to plan toward");
+        } else if (reason == Idle::kNoMap) {
+          DRONE_LOG_INFO("[plan] idle: goal set but no map yet — waiting for the first "
+                         "octomap; the planner cannot run without one");
+        } else {
+          DRONE_LOG_INFO("[plan] idle: goal and map set but no map->world transform yet — "
+                         "planning is paused until the host supplies one (is RTAB-Map publishing?)");
+        }
+        idle = reason;
+        last_idle_log = t;
+      }
+    }
+
+    // The loop ticks at the monitor cadence — every iteration is one monitor tick.
+    // Clamp to a small floor so a mis-set period cannot turn this into a busy loop.
+    std::this_thread::sleep_for(
+        std::chrono::duration<double>(std::max(search_cfg_.rrt_monitor_period, 0.01)));
+  }
+}
+
+void AutonomyCore::trajgenLoop() {
+  while (running_.load()) {
+    const double t = now();
+
+    common::State state;
+    planning::MapHandle map;
+    planning::MapHandle conservative;
+    bool preset_pending = false;
+    std::vector<Eigen::Vector3d> preset_waypoints;
+    // One snapshot per cycle, used both to bring the state into the map frame and
+    // to take the finished trajectory back out (see stagePlanned).
+    Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
+    bool has_frame = false;
+    {
+      std::lock_guard<std::mutex> lock(io_mutex_);
+      state = state_;
+      world_from_map = world_from_map_;
+      has_frame = has_map_to_world_;
+      map = map_;
+      conservative = conservative_map_;
+      preset_pending = preset_pending_;
+      preset_pending_ = false;
+      if (preset_pending) preset_waypoints = preset_waypoints_;
+      if (trajgen_config_dirty_) {
+        cfg_ = pending_config_;
+        trajgen_config_dirty_ = false;
+      }
+    }
+
+    // Divergence: regenerate now rather than waiting out TRAJGEN_PERIOD. The
+    // search thread has its own copy of the flag and drops the committed path.
+    if (trajgen_replan_requested_.exchange(false)) last_trajgen_ = -1.0e9;
+
+    const bool frame_ok = has_frame || !cfg_.require_map_to_world;
+
+    // One-shot preset trajectory: bypass the geometric search entirely and solve
+    // the corridor-QP trajectory once through the given waypoints, then hold it
+    // (kept fresh by stepControl) until it completes. It lives on this thread
+    // because it is trajectory generation; the search thread stands down while
+    // preset_active_ is set, and firePreset dropped any goal.
+    if (preset_pending && !frame_ok) {
+      DRONE_LOG_INFO("[preset] ignored: no map->world transform yet — the preset square is in "
+                     "the map frame and cannot be placed without it (is RTAB-Map publishing?)");
+    } else if (preset_pending) {
+      runPreset(state, world_from_map, map, conservative, preset_waypoints);
+    }
+
+    // The committed path is produced by the search thread. Working on a copy is
+    // what decouples the two: a search that takes a minute no longer holds up a
+    // single trajectory, and this keeps regenerating on the last path it was
+    // given. Safe because every tick re-truncates and regrows the corridor
+    // against the CURRENT map, so a path that now runs into something newly
+    // mapped is cut short of it rather than flown.
+    const std::vector<std::vector<double>> committed_path = committedPath();
+    if (!preset_active_.load() && map && frame_ok) {
       // Trajectory generation is the next pipeline stage; while plan_trajectory is
       // false the worker is a pure geometric planner and control keeps following
       // the direct setpoint (the tracker is never handed a trajectory). When
       // enabled it re-anchors min-snap to where the vehicle is now, on its cadence.
-      if (cfg_.plan_trajectory && !cached_path_.empty() &&
+      if (cfg_.plan_trajectory && !committed_path.empty() &&
           t - last_trajgen_ >= cfg_.trajgen_period) {
         // Anchor the replan on the state the vehicle will be in when it
         // engages, not on where it is now, and root the path there so the
@@ -1313,7 +1425,7 @@ void AutonomyCore::plannerLoop() {
         // start equality would then be infeasible against region 0's faces.
         const double t_gen = now();
         const SpliceAnchor anchor = spliceAnchor(state, t_gen, world_from_map);
-        std::vector<std::vector<double>> path = cached_path_;
+        std::vector<std::vector<double>> path = committed_path;
         path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
         common::Trajectory traj;
         const planning::MapHandle cons = conservative ? conservative : map;
@@ -1329,7 +1441,11 @@ void AutonomyCore::plannerLoop() {
         // check — the predicate reads the RAW map, never the stamped copy, since
         // stamping writes voxels into that copy and a stamped point that did not
         // already exist would make genuinely unobserved space read as observed.
-        const bool ok = runTrajgen(path, anchor.t0, anchor.start, conservativeField(cons), cons,
+        const bool ok = runTrajgen(path, anchor.t0, anchor.start,
+                                   conservativeField(cons,
+                                                     std::max(cfg_.clearance_threshold,
+                                                              cfg_.frontier_margin)),
+                                   cons,
                                    cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
                                                                 : planning::CorridorUnknownFn{},
                                    traj);
@@ -1354,6 +1470,14 @@ void AutonomyCore::plannerLoop() {
           std::lock_guard<std::mutex> lock(traj_mutex_);
           if (has_last_planned_) since_staged = now() - last_planned_at_;
         }
+        // What the search thread is doing. It no longer runs on this thread, so
+        // this cannot be "time spent searching this tick" — it is the duration of
+        // the last completed search, and whether one is in flight right now
+        // (in which case this trajectory is deliberately built on the older
+        // committed path rather than waiting for it).
+        std::ostringstream search_note;
+        search_note << "last " << last_search_time_.load() << " s"
+                    << (search_running_.load() ? ", one running now" : "");
         std::ostringstream gap;
         if (since_staged >= 0.0) {
           gap << since_staged << " s";
@@ -1369,8 +1493,8 @@ void AutonomyCore::plannerLoop() {
                                : " -> splice would be late by ")
                        << (anchor.from_trajectory && late <= 0.0 ? lead_used - solve_time : late)
                        << " s | since last staged " << gap.str() << " (STALE_TIMEOUT "
-                       << cfg_.stale_timeout << " s) | search this tick " << search_time
-                       << " s | next lead " << trajgen_lead_ << " s | "
+                       << cfg_.stale_timeout << " s) | search " << search_note.str()
+                       << " | next lead " << trajgen_lead_ << " s | "
                        << (ok ? "OK" : "FAILED"));
 
         if (ok) {
@@ -1378,28 +1502,14 @@ void AutonomyCore::plannerLoop() {
           last_trajgen_ = t;
         }
       }
-      idle = Idle::kNone;  // planning again; a later stall re-reports immediately
-    } else if (!preset_active_.load()) {
-      const Idle reason = !has_goal ? Idle::kNoGoal : !map ? Idle::kNoMap : Idle::kNoFrame;
-      if (reason != idle || t - last_idle_log >= kIdleLogPeriod) {
-        if (reason == Idle::kNoGoal) {
-          DRONE_LOG_INFO("[plan] idle: no goal set — nothing to plan toward");
-        } else if (reason == Idle::kNoMap) {
-          DRONE_LOG_INFO("[plan] idle: goal set but no map yet — waiting for the first "
-                         "octomap; the planner cannot run without one");
-        } else {
-          DRONE_LOG_INFO("[plan] idle: goal and map set but no map->world transform yet — "
-                         "planning is paused until the host supplies one (is RTAB-Map publishing?)");
-        }
-        idle = reason;
-        last_idle_log = t;
-      }
     }
 
-    // The loop ticks at the monitor cadence — every iteration is one monitor tick.
-    // Clamp to a small floor so a mis-set period cannot turn this into a busy loop.
+    // Tick faster than the trajgen period so the period itself is met closely and
+    // a preset or a divergence replan is picked up promptly, with a floor that
+    // keeps a mis-set period from turning this into a busy loop.
+    const double due = last_trajgen_ + cfg_.trajgen_period - now();
     std::this_thread::sleep_for(
-        std::chrono::duration<double>(std::max(cfg_.rrt_monitor_period, 0.01)));
+        std::chrono::duration<double>(std::clamp(due, 0.01, 0.1)));
   }
 }
 

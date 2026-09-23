@@ -125,9 +125,17 @@ public:
   void setTimeBudget(double seconds) { time_budget_ = seconds; }
   double timeBudget() const { return time_budget_; }
 
+  // When on, every optimizeTrajectory call logs one line breaking down where
+  // its time went: seed growth (time, QP solves, seed and grown durations),
+  // BOBYQA's initial model-building probe (its first 2n+1 evaluations), the
+  // rest of the search (evaluations, how many were infeasible, the duration it
+  // reached), the final solve, and the trajectory duration.
+  void setDebug(bool on) { debug_ = on; }
+
 private:
   CorridorLimits limits_;
   double time_budget_ = 0.0;
+  bool debug_ = false;
 
   // Outer-loop tuning. The time penalty mirrors MinSnapTimeOptimizer's (cost
   // per second of flight time, trading smoothness against duration); the
