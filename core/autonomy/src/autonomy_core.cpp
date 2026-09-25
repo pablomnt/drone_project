@@ -135,7 +135,16 @@ std::vector<std::vector<double>> remainingCommittedSuffix(
 }  // namespace
 
 AutonomyCore::AutonomyCore(const Config& config)
-    : cfg_(config), search_cfg_(config), control_cfg_(config), clock_(steadyNowSeconds) {
+    : cfg_(config),
+      search_cfg_(config),
+      control_cfg_(config),
+      clock_(steadyNowSeconds),
+      // setMap reads the field saturation distances from here to prebuild the
+      // fields, so it must hold the real config from the start rather than
+      // defaults — otherwise every prebuilt field would miss and the planner
+      // threads would rebuild it themselves, which is the stall prebuilding
+      // exists to remove.
+      pending_config_(config) {
   tracker_.setPositionGains(control_cfg_.pos_p);
   tracker_.setVelocityGains(control_cfg_.vel_p, control_cfg_.vel_i, control_cfg_.vel_d);
   tracker_.setDerivativeTau(control_cfg_.vel_d_tau);
@@ -165,9 +174,88 @@ void AutonomyCore::setVehicleState(const common::State& state) {
 
 void AutonomyCore::setMap(const planning::MapHandle& map,
                           const planning::MapHandle& conservative) {
+  // Fields first, map second: once a planner can see this map, the field built
+  // from it is already installed, so no planner tick ever has to build one.
+  prebuildFields(map, conservative);
   std::lock_guard<std::mutex> lock(io_mutex_);
   map_ = map;
   conservative_map_ = conservative;
+}
+
+namespace {
+
+// Whether `map` is one of the maps a cached field has been superseded for.
+// Owner comparison, so an expired entry never matches and a freed map's address
+// being reused by a new map cannot either.
+bool wasSuperseded(const std::vector<std::weak_ptr<octomap::OcTree>>& history,
+                   const planning::MapHandle& map) {
+  for (const auto& w : history) {
+    if (!w.owner_before(map) && !map.owner_before(w)) return true;
+  }
+  return false;
+}
+
+void pushSuperseded(std::vector<std::weak_ptr<octomap::OcTree>>& history,
+                    const planning::MapHandle& old_source, std::size_t cap) {
+  if (!old_source) return;
+  history.erase(std::remove_if(history.begin(), history.end(),
+                               [](const std::weak_ptr<octomap::OcTree>& w) { return w.expired(); }),
+                history.end());
+  history.push_back(old_source);
+  if (history.size() > cap) history.erase(history.begin());
+}
+
+}  // namespace
+
+void AutonomyCore::prebuildFields(const planning::MapHandle& map,
+                                  const planning::MapHandle& conservative) {
+  // The same saturation distances the planners will ask for (clearanceField from
+  // the search, conservativeField from truncation/corridor and the search's cost).
+  // Read from the newest config; a thread still on an older copy for a tick just
+  // takes the fallback build in the accessor, as any maxdist change always has.
+  double search_md = 0.0, cons_md = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    search_md = pending_config_.clearance_threshold;
+    cons_md = std::max(pending_config_.clearance_threshold, pending_config_.frontier_margin);
+  }
+
+  // Built with NO lock held — the whole point. Installation is a pointer swap.
+  if (map && map->size() > 0) {
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> lock(edt_mutex_);
+      have = edt_ && edt_source_map_ == map && edt_maxdist_ == search_md;
+    }
+    if (!have) {
+      auto field = buildEdt(map, search_md);
+      std::lock_guard<std::mutex> lock(edt_mutex_);
+      if (edt_source_map_ != map) pushSuperseded(edt_superseded_, edt_source_map_, kSupersededHistory);
+      edt_ = std::move(field);
+      edt_source_map_ = map;
+      edt_maxdist_ = search_md;
+      viz_sampled_map_.reset();  // debug clearance samples are of the old field
+    }
+  }
+  // Only a DISTINCT conservative view needs its own field; when it is the same
+  // object (no frontier information) conservativeField hands back the search one.
+  if (conservative && conservative != map && conservative->size() > 0) {
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> lock(edt_mutex_);
+      have = cons_edt_ && cons_edt_source_map_ == conservative && cons_edt_maxdist_ == cons_md;
+    }
+    if (!have) {
+      auto field = buildEdt(conservative, cons_md);
+      std::lock_guard<std::mutex> lock(edt_mutex_);
+      if (cons_edt_source_map_ != conservative) {
+        pushSuperseded(cons_edt_superseded_, cons_edt_source_map_, kSupersededHistory);
+      }
+      cons_edt_ = std::move(field);
+      cons_edt_source_map_ = conservative;
+      cons_edt_maxdist_ = cons_md;
+    }
+  }
 }
 
 void AutonomyCore::setMapToWorld(const Eigen::Isometry3d& world_from_map) {
@@ -798,9 +886,51 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
         }
         return true;
       }
-      DRONE_LOG_INFO("[trajgen] corridor: QP INFEASIBLE over " << regions.size() << " regions / "
-                     << polylineLength(committed) << " m — corridor built but no trajectory "
-                     << "fits it within VMAX/AMAX/JMAX -> no new trajectory");
+      // Quantify the corridor's SHAPE, not just the fact that nothing fit it.
+      // Three bench stalls in a row (2026-09-23/25) came back as "QP INFEASIBLE"
+      // with nothing to say which region was at fault, and each time the seed
+      // growth had run all the way out — infeasible from 4.8 s to 54 s. That
+      // pattern can only be geometric: lengthening every segment loosens the
+      // velocity, acceleration and jerk rows and leaves the corridor rows
+      // untouched, so a problem still infeasible at 11x the time is infeasible at
+      // any time, and the old message naming VMAX/AMAX/JMAX pointed at the one
+      // thing it could not be. These are the numbers that decide whether a
+      // degree-7 C4 spline can thread the chain at all:
+      //   - how far the start sits inside region 0. The start position AND its
+      //     rest derivatives pin the first four Bezier control points exactly
+      //     there, so a start on the region's boundary has no room to leave it.
+      //   - each region's inradius (the largest ball it contains): a sliver
+      //     region cannot hold eight control points however roomy its
+      //     neighbours are.
+      //   - each joint's overlap depth, which is what C0 continuity must land
+      //     the junction inside.
+      // regionOverlapDepth against itself is the inradius; both are a small LP,
+      // microseconds each, and only on a tick that has already failed.
+      std::ostringstream geom;
+      if (!regions.empty()) {
+        double start_slack = std::numeric_limits<double>::infinity();
+        for (int r = 0; r < regions.front().A.rows(); ++r) {
+          start_slack =
+              std::min(start_slack, regions.front().b(r) - regions.front().A.row(r).dot(start.pos));
+        }
+        geom << " — start " << start_slack << " m inside region 0, inradii [";
+        for (std::size_t i = 0; i < regions.size(); ++i) {
+          if (i) geom << ", ";
+          geom << planning::regionOverlapDepth(regions[i], regions[i]);
+        }
+        geom << "] m, joint overlaps [";
+        for (std::size_t i = 0; i + 1 < regions.size(); ++i) {
+          if (i) geom << ", ";
+          geom << planning::regionOverlapDepth(regions[i], regions[i + 1]);
+        }
+        geom << "] m";
+      }
+      DRONE_LOG_INFO("[trajgen] corridor: QP INFEASIBLE over "
+                     << regions.size() << " regions / " << polylineLength(committed) << " m"
+                     << geom.str()
+                     << " -> no new trajectory (the [corridor-qp] line says whether a longer time "
+                        "allocation could ever have helped; if the seed growth ran out, the "
+                        "corridor shape is the fault, not VMAX/AMAX/JMAX)");
     }
 
     // Every corridor failure path ends here, and it stages NOTHING. There used
@@ -979,20 +1109,34 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
   if (!map || map->size() == 0) {
     edt_.reset();
     edt_source_map_.reset();
+    edt_superseded_.clear();
     return nullptr;
   }
-  // Rebuild only when the map object itself changed. This is what makes the EDT
-  // collision check cheaper than the per-state octree scan it replaces: a static
-  // scene reuses one field across many ticks instead of rebuilding it each time.
-  // Also rebuild when CLEARANCE_THRESHOLD changes: it is the field's maxdist, and
-  // keying on the map alone left a live change unapplied until the next octomap,
-  // which on a static bench scene may never come.
-  if (map != edt_source_map_ || maxdist != edt_maxdist_) {
-    edt_ = buildEdt(map, maxdist);
-    edt_source_map_ = map;
-    edt_maxdist_ = maxdist;
-    viz_sampled_map_.reset();  // debug clearance samples are of the old field
+  // Normal case: setMap already built this map's field before publishing it.
+  // A map that has since been superseded (a planner snapshotted it just before
+  // a newer one arrived) is served the newer field rather than rebuilt: the
+  // newer field only knows about more obstacles, and rebuilding would put the
+  // whole build back on this planner thread.
+  if (edt_ && maxdist == edt_maxdist_ &&
+      (map == edt_source_map_ || wasSuperseded(edt_superseded_, map))) {
+    return edt_;
   }
+  // Fallback, built here under the lock: a maxdist change (CLEARANCE_THRESHOLD
+  // set live — keying on the map alone used to leave that unapplied until the
+  // next octomap, which on a static bench scene may never come), or a map that
+  // did not come through setMap. Rare, and it serialises so the two planner
+  // threads never build the same field twice. Always for the NEWEST map: a
+  // superseded one must not become the cache's source, or the newer map would
+  // then be served an older field.
+  const planning::MapHandle target =
+      (edt_source_map_ && wasSuperseded(edt_superseded_, map)) ? edt_source_map_ : map;
+  planner_field_builds_.fetch_add(1);
+  auto field = buildEdt(target, maxdist);
+  if (target != edt_source_map_) pushSuperseded(edt_superseded_, edt_source_map_, kSupersededHistory);
+  edt_ = std::move(field);
+  edt_source_map_ = target;
+  edt_maxdist_ = maxdist;
+  viz_sampled_map_.reset();  // debug clearance samples are of the old field
   return edt_;
 }
 
@@ -1002,16 +1146,28 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
   if (!map || map->size() == 0) {
     cons_edt_.reset();
     cons_edt_source_map_.reset();
+    cons_edt_superseded_.clear();
     return nullptr;
   }
   // No frontier information => the conservative view IS the search map; reuse
   // its field rather than building a second identical EDT.
-  if (map == edt_source_map_ && edt_) return edt_;
-  if (map != cons_edt_source_map_ || maxdist != cons_edt_maxdist_) {
-    cons_edt_ = buildEdt(map, maxdist);
-    cons_edt_source_map_ = map;
-    cons_edt_maxdist_ = maxdist;
+  if (edt_ && (map == edt_source_map_ || wasSuperseded(edt_superseded_, map))) return edt_;
+  // Same prebuilt / superseded / fallback logic as clearanceField.
+  if (cons_edt_ && maxdist == cons_edt_maxdist_ &&
+      (map == cons_edt_source_map_ || wasSuperseded(cons_edt_superseded_, map))) {
+    return cons_edt_;
   }
+  const planning::MapHandle target =
+      (cons_edt_source_map_ && wasSuperseded(cons_edt_superseded_, map)) ? cons_edt_source_map_
+                                                                         : map;
+  planner_field_builds_.fetch_add(1);
+  auto field = buildEdt(target, maxdist);
+  if (target != cons_edt_source_map_) {
+    pushSuperseded(cons_edt_superseded_, cons_edt_source_map_, kSupersededHistory);
+  }
+  cons_edt_ = std::move(field);
+  cons_edt_source_map_ = target;
+  cons_edt_maxdist_ = maxdist;
   return cons_edt_;
 }
 
@@ -1469,11 +1625,19 @@ void AutonomyCore::trajgenLoop() {
             std::pow(path.front()[0] - committed_path.front()[0], 2) +
             std::pow(path.front()[1] - committed_path.front()[1], 2) +
             std::pow(path.front()[2] - committed_path.front()[2], 2));
-        const bool ok = runTrajgen(path, anchor.t0, anchor.start,
-                                   conservativeField(cons,
-                                                     std::max(cfg_.clearance_threshold,
-                                                              cfg_.frontier_margin)),
-                                   cons,
+        // Fetched and timed on its own line: this is the one part of a replan
+        // that can wait on the other planner thread (edt_mutex_) or on a field
+        // build, and it happens before runTrajgen starts its own timers — so it
+        // used to show up only as solve time that corridor + QP did not account
+        // for (bench 2026-09-25: 1.36 s of a 2.10 s replan). setMap now builds
+        // fields before publishing a map, so this should read ~0; anything larger
+        // is the fallback build (a live CLEARANCE_THRESHOLD / FRONTIER_MARGIN
+        // change) or lock contention.
+        const double t_field = now();
+        const auto cons_field =
+            conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
+        const double field_time = now() - t_field;
+        const bool ok = runTrajgen(path, anchor.t0, anchor.start, cons_field, cons,
                                    cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
                                                                 : planning::CorridorUnknownFn{},
                                    traj, /*pin_waypoints=*/false, root_shift);
@@ -1512,8 +1676,8 @@ void AutonomyCore::trajgenLoop() {
         } else {
           gap << "none staged yet";
         }
-        DRONE_LOG_INFO("[trajgen] replan: solve " << solve_time << " s (corridor "
-                       << trajgen_corridor_time_ << " s, QP " << trajgen_qp_time_
+        DRONE_LOG_INFO("[trajgen] replan: solve " << solve_time << " s (field " << field_time
+                       << " s, corridor " << trajgen_corridor_time_ << " s, QP " << trajgen_qp_time_
                        << " s) | " << (anchor.from_trajectory ? "splice" : "rest") << ", lead "
                        << lead_used << " s"
                        << (anchor.from_trajectory

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -224,6 +225,17 @@ public:
   // With use_corridor_qp off and a conservative map present, the search runs on
   // the conservative view instead — the legacy single-map behavior of
   // TREAT_FRONTIER_AS_OBSTACLE.
+  //
+  // BLOCKS for as long as it takes to build the new map's distance fields
+  // (over a second on a room-sized map), on the CALLER's thread, before the map
+  // becomes visible to the planners. That is deliberate: the fields used to be
+  // built lazily by whichever planner thread asked first, under edt_mutex_, so a
+  // new map stalled trajectory generation for the length of the build (bench
+  // 2026-09-25: a 2.10 s replan, 1.36 s of it the field, pushing "since last
+  // staged" past STALE_TIMEOUT). The node calls this from its slow callback
+  // group, which exists for exactly this kind of blocking work. Meanwhile the
+  // planners keep running on the previous map and its fields; they switch to the
+  // new pair together, so a tick never mixes a new map with an old field.
   void setMap(const planning::MapHandle& map,
               const planning::MapHandle& conservative = nullptr);
   // MAP frame.
@@ -278,6 +290,12 @@ public:
   // tick — which is what says the trajgen thread is still producing while a
   // slow search runs on the other one.
   std::uint64_t stagedTrajectoryCount() const { return staged_count_.load(); }
+  // How many distance fields a PLANNER thread has had to build itself. setMap
+  // builds a new map's fields before publishing it, so this stays at zero in
+  // steady state; it moves only on the fallback path (a live change of the
+  // fields' saturation distance, or a map that did not come through setMap).
+  // Test hook, and the reason a stalled replan would show a large `field` time.
+  std::uint64_t plannerFieldBuildCount() const { return planner_field_builds_.load(); }
   bool inHoverHold() const;
   const control::PositionControl& controller() const { return tracker_.controller(); }
 
@@ -574,6 +592,7 @@ private:
   // How the last geometric search went, for the trajgen log line: it can no
   // longer time the search itself, since the search runs on the other thread.
   std::atomic<std::uint64_t> staged_count_{0};
+  std::atomic<std::uint64_t> planner_field_builds_{0};  // see plannerFieldBuildCount
   std::atomic<bool> search_running_{false};
   std::atomic<double> last_search_time_{0.0};
 
@@ -615,6 +634,21 @@ private:
   planning::MapHandle cons_edt_source_map_;
   double cons_edt_maxdist_{0.0};
   planning::MapHandle viz_sampled_map_;  // map the debug clearance samples were taken from
+
+  // Maps whose field has since been REPLACED by one built for a newer map, per
+  // kind. setMap builds the fields for a new map before publishing it, so a
+  // planner that snapshotted the previous map just before the swap asks for a
+  // field the cache no longer holds. Rebuilding it would put the whole build
+  // back on the planner thread — the stall this design exists to remove — so a
+  // request for a superseded map is served the newer field instead, which only
+  // knows about more obstacles, never fewer. weak_ptr rather than raw pointers
+  // so a freed map's address being reused by a new one can never match.
+  std::vector<std::weak_ptr<octomap::OcTree>> edt_superseded_;
+  std::vector<std::weak_ptr<octomap::OcTree>> cons_edt_superseded_;
+  static constexpr std::size_t kSupersededHistory = 8;
+
+  // Build the fields a new map will need, OFF the planner threads (see setMap).
+  void prebuildFields(const planning::MapHandle& map, const planning::MapHandle& conservative);
 };
 
 }  // namespace drone_core::autonomy

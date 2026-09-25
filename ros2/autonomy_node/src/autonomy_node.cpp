@@ -403,6 +403,10 @@ private:
     // trajectory, never an infeasible one). The QP only — truncation and
     // corridor building are not counted. <= 0 disables the budget.
     declare_parameter("TRAJ_SOLVE_BUDGET", 1.0);
+    // 0 = pure minimum-snap (the corridor alone holds the curve near the path,
+    // so wide turns wherever the regions are roomy). Raise to pull the
+    // trajectory toward the planned waypoints without tightening the corridor.
+    declare_parameter("TRAJ_PATH_WEIGHT", 0.0);
     // Log one line per corridor QP solve breaking down its time: seed growth,
     // BOBYQA's initial probe, the rest of the search, the final solve. On for
     // now while the time search is being tuned.
@@ -505,6 +509,7 @@ private:
     cfg.corridor_margin = param("CORRIDOR_MARGIN").as_double();
     cfg.escape_ramp_dist = param("ESCAPE_RAMP_DIST").as_double();
     cfg.traj_solve_budget = param("TRAJ_SOLVE_BUDGET").as_double();
+    cfg.traj_path_weight = param("TRAJ_PATH_WEIGHT").as_double();
     cfg.debug_trajgen = param("DEBUG_TRAJGEN").as_bool();
     cfg.max_segment_len = param("MAX_SEGMENT_LEN").as_double();
     const auto bbox = param("CORRIDOR_BBOX").as_double_array();

@@ -296,6 +296,65 @@ int main() {
     }
   }
 
+  // Distance fields are built by setMap, before the map is published, never by
+  // a planner thread. A new map used to make whichever planner asked first build
+  // the field under edt_mutex_, stalling trajectory generation for the length of
+  // the build (bench 2026-09-25: 1.36 s of a 2.10 s replan, past STALE_TIMEOUT).
+  // With a DISTINCT conservative view so both fields (search validity/cost, and
+  // truncation/corridor) are exercised. A live saturation-distance change must
+  // still take effect, which is the one case a planner builds on its own.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.use_corridor_qp = true;
+    cfg.rrt_solve_time = 0.5;
+    autonomy::AutonomyCore core(cfg);
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    for (int ix = -10; ix <= 40; ++ix) {
+      for (int iy = -10; iy <= 10; ++iy) {
+        const double x = ix * 0.1, y = iy * 0.1;
+        octree->updateNode(octomap::point3d(x, y, 0.0), true);
+        for (int iz = 1; iz <= 20; ++iz) {
+          octree->updateNode(octomap::point3d(x, y, iz * 0.1), false);
+        }
+      }
+    }
+    // A separate object, as the node's frontier-stamped deep copy is.
+    auto conservative = std::make_shared<octomap::OcTree>(*octree);
+    core.setMap(octree, conservative);
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+
+    check(core.planOnce(), "prebuilt fields: planOnce produced a trajectory");
+    check(core.plannerFieldBuildCount() == 0,
+          "prebuilt fields: no planner thread built a distance field");
+
+    // A second map arrives: again built before publication, not by the planner.
+    auto octree2 = std::make_shared<octomap::OcTree>(*octree);
+    auto conservative2 = std::make_shared<octomap::OcTree>(*octree);
+    core.setMap(octree2, conservative2);
+    fake_time += 1.0;
+    core.planOnce();
+    check(core.plannerFieldBuildCount() == 0,
+          "prebuilt fields: a new map is not built on a planner thread either");
+
+    // Changing the saturation distance live must still rebuild (it used to be
+    // keyed on the map alone and never applied on a static scene) — that is the
+    // fallback, and the only time a planner builds.
+    autonomy::AutonomyCore::Config wider = cfg;
+    wider.clearance_threshold = cfg.clearance_threshold + 0.5;
+    core.applyConfig(wider);
+    fake_time += 1.0;
+    core.planOnce();
+    check(core.plannerFieldBuildCount() > 0,
+          "prebuilt fields: a live CLEARANCE_THRESHOLD change still rebuilds the field");
+  }
+
   // Corridor-QP mode: planOnce must route trajgen through the corridor
   // pipeline (truncation + box corridor + QP against the conservative EDT) and
   // still stage a trajectory. A mapped floor gives the distance field real

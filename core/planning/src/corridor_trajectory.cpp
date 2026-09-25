@@ -133,7 +133,9 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
                                           const std::vector<ConvexRegion>& regions,
                                           common::Trajectory& out,
                                           double* cost_out,
-                                          const std::vector<Eigen::Vector3d>* pin_waypoints) const {
+                                          const std::vector<Eigen::Vector3d>* pin_waypoints,
+                                          const std::vector<Eigen::Vector3d>* path_waypoints,
+                                          double* path_cost_out, std::string* status_out) const {
   const int S = static_cast<int>(times.size());
   if (S < 1 || regions.size() != times.size()) return false;
   // Pinning needs one waypoint per segment boundary. A mismatched list is a
@@ -171,6 +173,82 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
     const Eigen::MatrixXd Qs = 2.0 * snapCostBlock(1.0) / std::pow(times[s], 7);
     for (int ax = 0; ax < kAxes; ++ax) {
       P.block(idx(s, ax), idx(s, ax), kCoeffs, kCoeffs) = Qs;
+    }
+  }
+
+  // Bezier position control points as a linear map of the scaled coefficients:
+  // control point j of a segment is G_pos.row(j) . ct. Hoisted here because both
+  // the corridor face rows below and the path term just under it need it.
+  const Eigen::MatrixXd G_pos = bezierControlRows(0, 1.0);
+
+  // Linear term. Zero for pure minimum-snap; the path term below is the only
+  // thing that ever writes it, since every other cost here is a pure quadratic
+  // form in the coefficients.
+  Eigen::VectorXd q_vec = Eigen::VectorXd::Zero(n);
+
+  // Path-following term (see setPathWeight). Pull each segment's position
+  // control points toward the straight chord between its two waypoints:
+  //
+  //   lambda * sum_j || G_pos.row(j) . ct  -  chord(j) ||^2
+  //
+  // Expanded into OSQP's 0.5 x'Px + q'x that is P += 2*lambda*G'G and
+  // q += -2*lambda*G'chord, per segment per axis. The dropped constant
+  // lambda*||chord||^2 does not move the minimiser; the reported cost below is
+  // recomputed from the solution rather than read off obj_val, so it is not
+  // missing from the numbers either.
+  //
+  // Divided by kCoeffs so the weight means "per unit of MEAN squared deviation"
+  // and does not silently change meaning if the polynomial degree ever does, and
+  // weighted by each segment's CHORD LENGTH so the sum approximates the integral
+  // of squared deviation over path length. Without that length factor the term
+  // is extensive in the number of segments rather than in distance: every
+  // segment contributes eight control points whether it spans 2 m or 15 cm, so
+  // splitting a segment in two would double its share of the penalty. That is
+  // not hypothetical here — MAX_SEGMENT_LEN, the start relaxation's split at
+  // ESCAPE_RAMP_DIST and the thin-joint repair all change the segment count for
+  // reasons that have nothing to do with how direct the trajectory should be, and
+  // the weight would otherwise have to be retuned every time they did. Snap and
+  // the time penalty are both extensive in time, so this also makes all three
+  // terms scale consistently with the size of the problem.
+  //
+  // What this does NOT buy: a result invariant to how the path is chopped. More
+  // waypoints genuinely say more about the intended shape — each segment's eight
+  // targets cluster along its own chord — so a finely split corridor is pulled
+  // harder toward the plan at the same weight (measured: 0.19 m of corner
+  // deviation over two segments against 0.05 m over four). That is the term
+  // working, not a scaling bug. What the length factor fixes is the penalty
+  // DENSITY: cost per metre of path rather than per segment, so the weight keeps
+  // one meaning rather than drifting with the segment count.
+  //
+  // Note also that the targets are points along the chord, not the chord as a
+  // set, so the term penalises being at the wrong place ALONG the path as well as
+  // off it — it pulls toward a roughly uniform traversal of each segment too.
+  const bool use_path = path_weight_ > 0.0 && path_waypoints != nullptr &&
+                        static_cast<int>(path_waypoints->size()) == S + 1;
+  const double path_lambda = use_path ? path_weight_ / kCoeffs : 0.0;
+  // Per-segment weight, chord length included. Also read back after the solve to
+  // report the term, so it is computed once here.
+  std::vector<double> path_seg_lambda(use_path ? S : 0, 0.0);
+  if (use_path) {
+    const std::vector<Eigen::Vector3d>& wp = *path_waypoints;
+    // Same for every segment and axis: only the chord targets and length differ.
+    const Eigen::MatrixXd GtG = G_pos.transpose() * G_pos;
+    for (int s = 0; s < S; ++s) {
+      // A zero-length segment gets no pull, which is right: it has no chord to
+      // be pulled toward. resamplePath never emits consecutive duplicates, so
+      // this is a guard rather than a case.
+      path_seg_lambda[s] = path_lambda * (wp[s + 1] - wp[s]).norm();
+      if (path_seg_lambda[s] <= 0.0) continue;
+      for (int ax = 0; ax < kAxes; ++ax) {
+        Eigen::VectorXd chord(kCoeffs);
+        for (int j = 0; j < kCoeffs; ++j) {
+          const double u = static_cast<double>(j) / (kCoeffs - 1);
+          chord(j) = wp[s](ax) + u * (wp[s + 1](ax) - wp[s](ax));
+        }
+        P.block(idx(s, ax), idx(s, ax), kCoeffs, kCoeffs) += 2.0 * path_seg_lambda[s] * GtG;
+        q_vec.segment(idx(s, ax), kCoeffs) -=
+            2.0 * path_seg_lambda[s] * G_pos.transpose() * chord;
+      }
     }
   }
 
@@ -259,7 +337,6 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   // every face A_f . r_j <= b_f — one row per (face, control point) spanning
   // the three axis blocks. The Bezier hull property lifts the control-point
   // bound to the whole curve.
-  const Eigen::MatrixXd G_pos = bezierControlRows(0, 1.0);
   for (int s = 0; s < S; ++s) {
     for (int f = 0; f < regions[s].A.rows(); ++f) {
       for (int j = 0; j < kCoeffs; ++j) {
@@ -295,7 +372,7 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
                    const_cast<OSQPFloat*>(Pc.x.data()), static_cast<OSQPInt>(Pc.x.size()), -1, 0};
   OSQPCscMatrix Am{m, n, const_cast<OSQPInt*>(Ac.p.data()), const_cast<OSQPInt*>(Ac.i.data()),
                    const_cast<OSQPFloat*>(Ac.x.data()), static_cast<OSQPInt>(Ac.x.size()), -1, 0};
-  const std::vector<OSQPFloat> q(n, 0.0);
+  const std::vector<OSQPFloat> q(q_vec.data(), q_vec.data() + n);
 
   OSQPSettings settings;
   osqp_set_default_settings(&settings);
@@ -322,13 +399,13 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   }
 
   bool ok = true;
-  double cost = 0.0;
   Eigen::VectorXd sol;
   if (osqp_solve(solver) != 0) {
     // API-level failure (not a solve outcome) — always worth a line.
     DRONE_LOG_ERROR("[corridor-qp] OSQP solve error");
     ok = false;
   } else if (solver->info->status_val != OSQP_SOLVED) {
+    if (status_out) *status_out = solver->info->status;
     // Primal infeasible, or unconverged at the iteration cap (which only
     // happens bordering infeasibility) — either way there is no trustworthy
     // trajectory. Silent: the outer time search probes this region on every
@@ -338,10 +415,37 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   } else {
     sol = Eigen::Map<const Eigen::VectorXd>(
         reinterpret_cast<const double*>(solver->solution->x), n);
-    cost = solver->info->obj_val;
   }
   osqp_cleanup(solver);
   if (!ok) return false;
+
+  // Split the objective for the caller: the time search minimises their sum,
+  // the debug line wants them apart, and obj_val gives neither (it lumps the two
+  // together and is short by the path term's dropped constant). Recomputing from
+  // the solution is a handful of 8x8 quadratic forms, so it costs nothing next to
+  // the solve itself.
+  double snap_cost = 0.0;
+  double path_cost = 0.0;
+  {
+    const Eigen::MatrixXd Q1 = snapCostBlock(1.0);
+    for (int s = 0; s < S; ++s) {
+      const double inv_t7 = 1.0 / std::pow(times[s], 7);
+      for (int ax = 0; ax < kAxes; ++ax) {
+        const Eigen::VectorXd ct = sol.segment(idx(s, ax), kCoeffs);
+        // 0.5 x'Px with P = 2Q/T^7.
+        snap_cost += inv_t7 * ct.dot(Q1 * ct);
+        if (use_path) {
+          const std::vector<Eigen::Vector3d>& wp = *path_waypoints;
+          Eigen::VectorXd chord(kCoeffs);
+          for (int j = 0; j < kCoeffs; ++j) {
+            const double u = static_cast<double>(j) / (kCoeffs - 1);
+            chord(j) = wp[s](ax) + u * (wp[s + 1](ax) - wp[s](ax));
+          }
+          path_cost += path_seg_lambda[s] * (G_pos * ct - chord).squaredNorm();
+        }
+      }
+    }
+  }
 
   out = common::Trajectory{};
   out.segment_times = times;
@@ -355,7 +459,8 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
     out.coeffs_z.push_back(sol.segment(idx(s, 2), kCoeffs).cwiseProduct(rescale));
     out.total_duration += times[s];
   }
-  if (cost_out) *cost_out = cost;
+  if (cost_out) *cost_out = snap_cost;
+  if (path_cost_out) *path_cost_out = path_cost;
   return true;
 }
 
@@ -374,6 +479,9 @@ struct CorridorTimeContext {
   // through. The time search has to solve the SAME problem the final solve
   // will, or it optimises an allocation for a shape that is never built.
   const std::vector<Eigen::Vector3d>* pin_waypoints;
+  // The resampled waypoints, for the path-following term. Always set (unlike
+  // pin_waypoints); solveQP ignores it when the path weight is zero.
+  const std::vector<Eigen::Vector3d>* path;
   // Debug accounting, filled in by the objective. BOBYQA spends its first
   // `probe_evals` evaluations (2n+1, nlopt's default) building its quadratic
   // model before it takes a real step, so the time to that point is reported
@@ -398,8 +506,9 @@ double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& 
 
   common::Trajectory traj;
   double cost = 0.0;
+  double path_cost = 0.0;
   const bool ok = ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost,
-                                       ctx->pin_waypoints);
+                                       ctx->pin_waypoints, ctx->path, &path_cost);
   ++ctx->evals;
   if (!ok) ++ctx->infeasible;
   if (ctx->evals == ctx->probe_evals) {
@@ -407,7 +516,10 @@ double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& 
         std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx->search_start).count();
   }
   if (!ok) return ctx->infeasible_penalty;
-  return cost + ctx->time_penalty * total;
+  // The full QP objective, not just snap: the path term is part of what the
+  // allocation is being judged on, so leaving it out would search for times that
+  // suit a trajectory the final solve is not going to build.
+  return cost + path_cost + ctx->time_penalty * total;
 }
 
 }  // namespace
@@ -456,11 +568,21 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   double grown_total = 0.0;
   // Filled in once the search has run; the report below reads it on every exit.
   CorridorTimeContext ctx{this,         start,              waypoints.back(), &regions,
-                          kTimePenalty, kInfeasiblePenalty, pin};
+                          kTimePenalty, kInfeasiblePenalty, pin,              &waypoints};
   ctx.probe_evals = 2 * S + 1;
   double search_time = 0.0;
   double searched_total = 0.0;
   bool budget_hit = false;
+  // Snap cost of the FINAL solve, so the report can split the objective the time
+  // search was actually minimising into its two halves. The objective is
+  // snap + kTimePenalty * total_time, and which of the two dominates decides
+  // whether a slow trajectory is the solver refusing to hurry or the penalty
+  // being too weak to make it worth hurrying.
+  double final_snap = 0.0;
+  double final_path = 0.0;
+  // OSQP's own word for why the most recent solve was rejected; see the seed
+  // growth failure below.
+  std::string last_status;
   const auto report = [&](const char* outcome, double final_time, bool retried,
                           const common::Trajectory* result) {
     if (!debug_) return;
@@ -480,7 +602,14 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     }
     os << " | final solve: " << final_time << " s" << (retried ? " (retried at 1.5x)" : "")
        << " | total " << elapsed() << " s | " << outcome;
-    if (result) os << ", trajectory " << result->total_duration << " s";
+    if (result) {
+      const double time_term = kTimePenalty * result->total_duration;
+      const double objective = final_snap + final_path + time_term;
+      os << ", trajectory " << result->total_duration << " s | cost: snap " << final_snap;
+      if (path_weight_ > 0.0) os << " + path " << final_path;
+      os << " + time " << time_term << " = " << objective;
+      if (objective > 0.0) os << " (" << (100.0 * time_term / objective) << "% time)";
+    }
     DRONE_LOG_INFO(os.str());
   };
 
@@ -491,7 +620,9 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     bool feasible = false;
     while (true) {
       ++grow_solves;
-      feasible = solveQP(start, waypoints.back(), times, regions, probe, nullptr, pin);
+      last_status.clear();
+      feasible = solveQP(start, waypoints.back(), times, regions, probe, nullptr, pin, &waypoints,
+                         nullptr, &last_status);
       if (feasible || grow >= kMaxSeedGrowth) break;
       for (double& t : times) t *= 1.5;
       ++grow;
@@ -505,7 +636,17 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     // refusal (the committed prefix is shorter than the stopping distance) and
     // the caller must treat it as "no trajectory", not as a tuning failure.
     if (grow == kMaxSeedGrowth) {  // corridor unusable at any sane duration
-      report("FAILED (no feasible allocation within the seed growth)", 0.0, false, nullptr);
+      // Say WHICH rejection it was. OSQP reporting "primal infeasible" means the
+      // corridor genuinely admits no such curve; "maximum iterations reached" or
+      // a polish failure means the solver ran out of road on a hard problem and
+      // the code's treat-as-infeasible rule fired. Those want opposite responses
+      // — look at the geometry versus loosen the solver or whatever is driving
+      // the optimum onto a constraint boundary (TRAJ_PATH_WEIGHT, a start pinned
+      // millimetres inside region 0) — and they were indistinguishable in the log.
+      std::ostringstream why;
+      why << "FAILED (no feasible allocation within the seed growth; OSQP said \""
+          << (last_status.empty() ? "unknown" : last_status) << "\")";
+      report(why.str().c_str(), 0.0, false, nullptr);
       return false;
     }
   }
@@ -555,12 +696,14 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   const auto finalTime = [&t_final]() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_final).count();
   };
-  if (solveQP(start, waypoints.back(), times, regions, out, nullptr, pin)) {
+  if (solveQP(start, waypoints.back(), times, regions, out, &final_snap, pin, &waypoints,
+              &final_path)) {
     report("OK", finalTime(), false, &out);
     return true;
   }
   for (double& t : times) t *= 1.5;
-  const bool ok = solveQP(start, waypoints.back(), times, regions, out, nullptr, pin);
+  const bool ok = solveQP(start, waypoints.back(), times, regions, out, &final_snap, pin,
+                          &waypoints, &final_path);
   report(ok ? "OK" : "FAILED (final solve infeasible)", finalTime(), true, ok ? &out : nullptr);
   return ok;
 }

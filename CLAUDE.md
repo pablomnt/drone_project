@@ -161,6 +161,35 @@ What crosses the two threads, and how:
 - **distance fields** — `clearanceField` / `conservativeField` take `edt_mutex_` and now take their
   `maxdist` as an argument (each thread owns its own Config). `sampleClearanceField` picks the field up
   under the lock and samples outside it.
+  **Built by `setMap`, not by the planners (2026-09-25, NOT yet run on bench).** They used to be built
+  lazily by whichever planner thread asked first, *under* `edt_mutex_`, so every new map stalled
+  trajgen for the length of the build — directly, or by blocking on the lock while the search built
+  it. On the bench that was 1.36 s of a 2.10 s replan, pushing `since last staged` to 2.47 s, past
+  `STALE_TIMEOUT`. Now `setMap` calls `prebuildFields`, which builds the search field and (when the
+  conservative view is a distinct object) the conservative field with **no lock held**, swaps them in
+  under `edt_mutex_`, and only *then* publishes the map under `io_mutex_` — so any planner that sees
+  the new map finds its field already built, and planners keep running on the previous map + fields
+  meanwhile (never a new map with an old field). `setMap` therefore **blocks its caller** for the
+  build; the node calls it from `onOctomap` on the slow callback group, with no lock held.
+  Three details that are load-bearing:
+  - **Superseded maps are served the newer field**, not rebuilt. A planner that snapshotted the
+    previous map just before the swap asks for a field the cache no longer holds; rebuilding it would
+    put the build back on the planner thread. The newer field only knows about *more* obstacles.
+    Tracked as `weak_ptr`s (`edt_superseded_` / `cons_edt_superseded_`, last 8) so a freed map's
+    reused address can never match.
+  - **The fallback still builds on the planner thread, under the lock**: a live
+    `CLEARANCE_THRESHOLD` / `FRONTIER_MARGIN` change (the prebuilt field's saturation distance no
+    longer matches) or a map that did not come through `setMap`. Always for the newest map — a
+    superseded one must never become the cache's source. `plannerFieldBuildCount()` counts these.
+  - **`pending_config_` is now initialised from the constructor's Config.** `prebuildFields` reads
+    the saturation distances from it; left default, every prebuilt field would miss and the planners
+    would rebuild them all, silently undoing the fix.
+  The replan line now reports the fetch as its own term, `solve S s (field F s, corridor C s, QP Q s)`,
+  timed around the `conservativeField` call that used to sit unmeasured in `runTrajgen`'s argument
+  list; it should read ~0, and anything large is the fallback or lock contention. Covered in
+  `test_autonomy_core` (no planner build after `setMap`, including a second map; a live
+  `clearance_threshold` change still rebuilds), mutation-checked by removing the prebuild. The
+  superseded-map path is a race window and has no unit test.
 - **config** — three copies now: `cfg_` (trajgen + `planOnce`), `search_cfg_` (search), `control_cfg_`
   (`stepControl`), each with its own dirty flag. All three are initialised from the constructor's
   Config — forgetting `search_cfg_` there made every search run at the default 3 s budget.
@@ -370,6 +399,18 @@ Module roles:
   time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a `Trajectory`
   of **per-segment polynomial coefficients + durations** (not sampled points) so the flatness mapper
   can differentiate it analytically.
+  **The `[corridor-qp]` debug line reports the objective's split (NOT yet run on bench).** It ends
+  `cost: snap A [+ path B] + time C = D (N% time)`, recomputed from the solution rather than read off
+  OSQP's `obj_val` (which lumps snap and path together and omits the path term's dropped constant).
+  This is the number that says which term the time search is actually fighting: on the 2026-09-25
+  bench it read **99.7-99.98% time**, i.e. snap is negligible at multi-second durations and BOBYQA is
+  doing near-pure time minimisation and *still* landing at 7.6 s for 5.6 m. So a slow trajectory is
+  not the time penalty being too weak — `kTimePenalty` is already winning ~5000:1 — it is BOBYQA
+  being a poor fit for a linear objective with a feasibility cliff, starting from an overshot seed
+  and running out of `TRAJ_SOLVE_BUDGET` mid-descent. The candidate fix (not implemented) is to
+  bisect a uniform scale factor onto the feasibility boundary first, then let BOBYQA redistribute
+  time between segments with whatever budget is left.
+
   **Corridor-QP trajectory generation (Stage 1, gated by `USE_CORRIDOR_QP`)** replaces plain
   min-snap with a provably collision-free pipeline over a **dual map view** (see `setMap`): the
   geometric search runs on the raw **optimistic** map (unknown = free, so EIT*/BIT* accept a goal
@@ -428,8 +469,27 @@ Module roles:
   tightest conservative clearance C m vs required M m` — the parenthetical names the actual check
   that rejected it (two regions stopped overlapping, nothing past the start fits the shrunk
   corridor, or the drone is inside/touching an occupied or unknown cell), since the clearance figure is context, not
-  the cause — or `QP INFEASIBLE over S regions` (corridor fine, no trajectory fits it within
-  `VMAX/AMAX/JMAX`). These are distinct faults needing opposite fixes, hence distinct messages. A
+  the cause — or `QP INFEASIBLE over S regions` — which now also reports the corridor's SHAPE: how far the start
+  sits inside region 0, every region's inradius, and every joint's overlap depth
+  (`regionOverlapDepth` against itself gives the inradius; both are a microsecond LP, and only on a
+  tick that has already failed). Three bench stalls (2026-09-23/25) came back as `QP INFEASIBLE`
+  with nothing to say which region was at fault, and in each the seed growth had run all the way out
+  — infeasible from ~4.8 s to ~54 s. That pattern can only be geometric, because lengthening every
+  segment loosens the vel/acc/jerk rows and leaves the corridor rows untouched, so the old wording
+  naming `VMAX/AMAX/JMAX` pointed at the one thing it could not be. The three numbers that decide
+  whether a degree-7 C4 spline can thread the chain are: the start's slack in region 0 (a rest start
+  pins the first FOUR control points exactly at the start, so a start on the boundary has no room to
+  leave it), each region's inradius (a sliver cannot hold eight control points however roomy its
+  neighbours), and each joint's overlap depth (what C0 continuity must land the junction inside).
+  **And the `[corridor-qp]` seed-growth failure now quotes OSQP's own verdict** —
+  `FAILED (no feasible allocation within the seed growth; OSQP said "...")`. `primal infeasible`
+  means the corridor genuinely admits no such curve; `maximum iterations reached` or a polish failure
+  means the solver ran out of road and `solveQP`'s treat-as-infeasible rule fired. Opposite responses
+  (look at the geometry, versus find what is driving the optimum onto a constraint boundary), and
+  they read identically before. Seen on the bench 2026-09-25: raising `TRAJ_PATH_WEIGHT` from 0.5 to
+  8.0 with the drone 1 mm inside region 0 turned a solving corridor into a failing one, with every
+  inradius above 0.87 m and every joint overlap above 0.7 m — a soft cost cannot change the feasible
+  set, so that can only have been convergence. These are distinct faults needing opposite fixes, hence distinct messages. A
   successful corridor logs one line only when `DEBUG_PLANNER_VIZ` is on.
 
   **The start relaxation — why the first region is special.** `truncatePath` ramps its requirement to
@@ -663,8 +723,8 @@ passes the same overlap test, so full margin holds. `CorridorParams::bridge_join
 Regions are now grown one segment per DecompUtil call (equivalent: `dilate` handles segments
 independently). `regionOverlapDepth` can also return the ball centre (the dual's simplex multipliers).
 
-**Every replan logs one timing line (NOT yet run on bench):** `[trajgen] replan: solve S s (corridor C s,
-QP Q s) | splice|rest, lead L s -> ... | since last staged G s (STALE_TIMEOUT T s) | search this tick R s |
+**Every replan logs one timing line (NOT yet run on bench):** `[trajgen] replan: solve S s (field F s,
+corridor C s, QP Q s) | splice|rest, lead L s -> ... | since last staged G s (STALE_TIMEOUT T s) | search this tick R s |
 next lead s | OK|FAILED`. Corridor covers truncation + obstacle gathering + decomposition. The search
 field reports the **last completed** search's duration and whether one is running right now — since the
 thread split it cannot be "time spent searching this tick", and a search in flight no longer delays
@@ -1158,6 +1218,34 @@ publish nothing and cost nothing when the flag is off:
   (nothing feasible to fall back on yet), and the budget is checked between QP solves, so a call can
   overrun by one solve plus the final solve. Truncation and corridor building are not counted.
   `<= 0` = unlimited. NOT yet tried on bench.
+- `TRAJ_PATH_WEIGHT` (double, default `0.0` = off) — how hard the corridor QP pulls the trajectory
+  toward the geometric path. **The knob against wide, corner-cutting turns**, and the reason one is
+  needed: the QP scores snap and nothing else, so within a roomy corridor the cheapest curve is the
+  widest one, and the corridor is the *only* thing holding the trajectory near the plan. Shortening
+  the time cannot help — a uniform time scale leaves the snap minimiser unchanged (the cost scales by
+  a constant, the corridor rows carry no `T`, the continuity rows cancel), so a faster trajectory is
+  the identical curve flown faster, and once the accel/jerk rows bind they favour *wider* turns, not
+  tighter ones. The term is the squared distance from each position control point to the
+  corresponding point on the straight chord between its segment's two waypoints, averaged over the
+  control points, **weighted by each segment's chord length**, and summed over segments — the chord
+  rather than the junctions alone, since penalising junctions still lets the curve bulge between
+  them. The length factor makes the term a cost per metre of path rather than per segment, which
+  matters because the segment count is not a tuning decision: `MAX_SEGMENT_LEN`, the start
+  relaxation's split at `ESCAPE_RAMP_DIST` and the thin-joint repair all change it. It does **not**
+  make the result invariant to how the path is chopped — more waypoints genuinely say more about the
+  intended shape, so a finer corridor is pulled harder at the same weight (0.19 m of corner deviation
+  over two segments vs 0.05 m over four). Targets are points *along* the chord, so the term also
+  pulls toward a roughly uniform traversal, not only toward the line. Soft, so unlike `pin_waypoints`
+  it can never make a feasible corridor infeasible. Note it does not scale with the time allocation
+  while snap falls as `1/T^7`, so it dominates on a long relaxed trajectory (where the corner-cutting
+  is worst) and yields to snap on short segments in tight scenery. The two are therefore not in
+  comparable units and the weight is a pure tuning number. **Scale:** on the L-corridor unit test,
+  weight 2 leaves the junction parked on the region vertex where pure snap puts it, and weight 50
+  pulls the corner deviation from 0.30 m to 0.19 m. Against the ~3800 the time penalty contributes,
+  a path term of tens barely moves the time search. Reported in the `[corridor-qp]` line as
+  `+ path X` when non-zero. Verified in `ctest -R corridor` against an independent recomputation of
+  the formula from the solved Bezier control points (mutation-checked: dropping the quadratic half,
+  the linear half or the length factor each fail it). NOT yet tried on bench.
 - `ESCAPE_RAMP_DIST` (double, default `1.0` m) — distance over which truncation's required clearance
   ramps from 0 at the drone up to the full `FRONTIER_MARGIN`. **Deliberately independent of the
   margin.** Ramping over the margin itself makes the requirement climb at 1 m/m, so on a thinly

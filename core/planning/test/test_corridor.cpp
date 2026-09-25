@@ -6,11 +6,14 @@
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/corridor_trajectory.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 using drone_core::common::Trajectory;
@@ -59,6 +62,73 @@ ConvexRegion boxRegion(const Eigen::Vector3d& lo, const Eigen::Vector3d& hi) {
     r.b(2 * ax + 1) = -lo(ax);
   }
   return r;
+}
+
+// The path-following term, recomputed from scratch as the oracle for what
+// solveQP reports. Bernstein control points come from the tau-scaled monomial
+// coefficients by b_j = sum_{k<=j} (C(j,k)/C(n,k)) * ct_k, and each segment's
+// contribution is weighted by its chord length so the sum is a cost per metre of
+// path rather than per segment. Dropping that length factor is the mutation this
+// exists to catch.
+double expectedPathCost(const Trajectory& traj, const std::vector<Eigen::Vector3d>& path,
+                        double weight) {
+  const int n = 7;  // degree
+  const auto binom = [](int a, int b) {
+    double v = 1.0;
+    for (int i = 0; i < b; ++i) v = v * (a - i) / (i + 1);
+    return v;
+  };
+  double total = 0.0;
+  for (std::size_t sg = 0; sg < traj.segment_times.size(); ++sg) {
+    const double T = traj.segment_times[sg];
+    const double len = (path[sg + 1] - path[sg]).norm();
+    const std::array<const Eigen::VectorXd*, 3> c = {&traj.coeffs_x[sg], &traj.coeffs_y[sg],
+                                                     &traj.coeffs_z[sg]};
+    double seg = 0.0;
+    for (int j = 0; j <= n; ++j) {
+      const double u = static_cast<double>(j) / n;
+      for (int ax = 0; ax < 3; ++ax) {
+        double b = 0.0;
+        for (int k = 0; k <= j; ++k) {
+          // ct_k = c_k * T^k undoes the solver's time normalisation.
+          b += (binom(j, k) / binom(n, k)) * (*c[ax])(k) * std::pow(T, k);
+        }
+        const double target = path[sg](ax) + u * (path[sg + 1](ax) - path[sg](ax));
+        seg += (b - target) * (b - target);
+      }
+    }
+    total += (weight / (n + 1)) * len * seg;
+  }
+  return total;
+}
+
+// Largest distance from the solved curve to the planned polyline, sampled. This
+// is what "cuts the corner" means numerically: with the junctions free the QP is
+// scored on smoothness alone, so it leaves the polyline wherever the regions let
+// it. See CorridorTrajectoryOptimizer::setPathWeight.
+double maxDeviationFromPath(const Trajectory& traj, const std::vector<Eigen::Vector3d>& path) {
+  const auto pointToSegment = [](const Eigen::Vector3d& p, const Eigen::Vector3d& a,
+                                 const Eigen::Vector3d& b) {
+    const Eigen::Vector3d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    const double u = len2 > 0.0 ? std::clamp((p - a).dot(ab) / len2, 0.0, 1.0) : 0.0;
+    return (p - (a + u * ab)).norm();
+  };
+  double worst = 0.0;
+  for (std::size_t s = 0; s < traj.segment_times.size(); ++s) {
+    const double T = traj.segment_times[s];
+    for (int k = 0; k <= 50; ++k) {
+      const double t = T * static_cast<double>(k) / 50.0;
+      const Eigen::Vector3d p(evalDeriv(traj.coeffs_x[s], 0, t), evalDeriv(traj.coeffs_y[s], 0, t),
+                              evalDeriv(traj.coeffs_z[s], 0, t));
+      double best = std::numeric_limits<double>::infinity();
+      for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+        best = std::min(best, pointToSegment(p, path[i], path[i + 1]));
+      }
+      worst = std::max(worst, best);
+    }
+  }
+  return worst;
 }
 
 // Full validity audit of a solved corridor trajectory: boundary conditions,
@@ -290,11 +360,114 @@ int main() {
     }
   }
 
+  // A region against ITSELF is its own inradius — the largest ball it holds.
+  // The QP-failure diagnostic in runTrajgen reports exactly this per region to
+  // tell a sliver region (which cannot hold a segment's eight control points)
+  // from a roomy one, so it must not be an accident of the LP.
+  {
+    const std::pair<ConvexRegion, double> cases[] = {
+        {boxRegion({-0.3, -0.3, 0.7}, {2.3, 0.3, 1.3}), 0.3},  // tightest half-extent
+        {boxRegion({0.0, 0.0, 0.0}, {2.0, 0.02, 2.0}), 0.01},  // a sliver
+    };
+    for (const auto& c : cases) {
+      const double r = drone_core::planning::regionOverlapDepth(c.first, c.first);
+      if (std::abs(r - c.second) > kTol) {
+        std::cerr << "FAIL: self-overlap inradius " << r << " m, wanted " << c.second << " m\n";
+        ++failures;
+      }
+    }
+  }
+
+  // The path-following weight trades smoothness for directness. At weight 0 the
+  // QP scores snap alone, so it rounds the L as widely as the two boxes allow;
+  // raising the weight has to pull the curve back toward the polyline WITHOUT
+  // touching the corridor, and without breaking containment, the dynamic limits
+  // or the boundary conditions.
+  {
+    const std::vector<Eigen::Vector3d> path = {start, corner, goal};
+    CorridorTrajectoryOptimizer direct(limits);
+    // Enough to pull the junction OFF the corner vertex of the two boxes'
+    // overlap, which is where pure snap parks it: a small weight leaves it stuck
+    // there and the deviation unchanged, which is a property of the vertex, not
+    // a broken term.
+    direct.setPathWeight(50.0);
+    Trajectory loose, tight;
+    double loose_snap = 0.0, tight_snap = 0.0, tight_path = 0.0;
+    const bool ok_loose =
+        opt.solveQP(restAt(start), goal, times, regions, loose, &loose_snap, nullptr, &path);
+    const bool ok_tight = direct.solveQP(restAt(start), goal, times, regions, tight, &tight_snap,
+                                         nullptr, &path, &tight_path);
+    if (!ok_loose || !ok_tight) {
+      std::cerr << "FAIL: path-weight QP infeasible (loose=" << ok_loose << " tight=" << ok_tight
+                << ")\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(tight, restAt(start), goal, regions, limits, "path-weighted");
+      const double dev_loose = maxDeviationFromPath(loose, path);
+      const double dev_tight = maxDeviationFromPath(tight, path);
+      // Mutation guard: if the term never reached P and q, these would be equal.
+      if (dev_tight > 0.75 * dev_loose) {
+        std::cerr << "FAIL: path weight did not pull the curve in (deviation " << dev_tight
+                  << " m weighted vs " << dev_loose << " m free)\n";
+        ++failures;
+      }
+      // Passing `path` with the weight at zero must change nothing: the planner
+      // relies on the default being exactly the old pure-snap problem.
+      Trajectory ignored;
+      double ignored_snap = 0.0;
+      if (!opt.solveQP(restAt(start), goal, times, regions, ignored, &ignored_snap, nullptr,
+                       &path) ||
+          std::abs(ignored_snap - loose_snap) > kTol) {
+        std::cerr << "FAIL: waypoints changed the zero-weight solve (" << ignored_snap << " vs "
+                  << loose_snap << ")\n";
+        ++failures;
+      }
+      // The reported path term must match an independent recomputation from the
+      // solved coefficients, chord-length weighting included. This is what pins
+      // the formula: without the length factor the two disagree by the segment
+      // lengths (2 m here, so by 2x).
+      const double want_path = expectedPathCost(tight, path, 50.0);
+      if (std::abs(tight_path - want_path) > 1e-6 * std::max(1.0, want_path)) {
+        std::cerr << "FAIL: reported path cost " << tight_path << " but the length-weighted "
+                  << "formula gives " << want_path << "\n";
+        ++failures;
+      }
+      // Directness is bought with smoothness, and the reported split has to show
+      // it: a weighted solve is less smooth and its path term is real.
+      if (tight_snap <= loose_snap || tight_path <= 0.0) {
+        std::cerr << "FAIL: path-weighted cost split wrong (snap " << tight_snap << " vs "
+                  << loose_snap << ", path " << tight_path << ")\n";
+        ++failures;
+      }
+      std::cerr << "note: corner deviation " << dev_loose << " m free -> " << dev_tight
+                << " m at path weight 50\n";
+    }
+    // The whole pipeline, time search included, must still converge with the
+    // term on — it changes the objective BOBYQA sees, not just the final solve.
+    Trajectory searched;
+    if (!direct.optimizeTrajectory(restAt(start), path, regions, searched)) {
+      std::cerr << "FAIL: path-weighted time search found no trajectory\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(searched, restAt(start), goal, regions, limits, "path-searched");
+    }
+  }
+
   // Infeasible by time: 2 m per segment at vmax = 1 m/s cannot fit in 0.5 s.
   {
+    // The reported status must be OSQP's own verdict, not just "it failed": the
+    // seed-growth failure message prints it so a corridor that genuinely admits
+    // no curve can be told apart from a solver that ran out of iterations on a
+    // hard one. Those want opposite responses and used to read identically.
     Trajectory t2;
-    if (opt.solveQP(start, goal, {0.5, 0.5}, regions, t2)) {
+    std::string status;
+    if (opt.solveQP(restAt(start), goal, {0.5, 0.5}, regions, t2, nullptr, nullptr, nullptr,
+                    nullptr, &status)) {
       std::cerr << "FAIL: too-short time allocation reported feasible\n";
+      ++failures;
+    } else if (status.find("infeasible") == std::string::npos) {
+      std::cerr << "FAIL: rejection status was \"" << status
+                << "\", wanted OSQP's infeasibility verdict\n";
       ++failures;
     }
   }

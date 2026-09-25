@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -55,10 +56,20 @@ public:
   // every interior junction to the corresponding entry (see optimizeTrajectory).
   // It must hold regions.size() + 1 points. Null leaves the junctions free,
   // which is the planner's behaviour.
+  //
+  // `path_waypoints` (the same resampled list, size regions.size() + 1) enables
+  // the path-following term when a path weight is set — see setPathWeight. It is
+  // separate from `pin_waypoints` because the two are independent: pinning is a
+  // hard equality at the junctions, this is a soft pull over the whole curve, and
+  // the planner wants the second without the first. `cost_out` stays the SNAP
+  // cost alone whatever the weight; `path_cost_out` receives the path term, so a
+  // caller minimising the QP objective has to add the two.
   bool solveQP(const common::MotionState& start, const Eigen::Vector3d& goal,
                const std::vector<double>& times, const std::vector<ConvexRegion>& regions,
                common::Trajectory& out, double* cost_out = nullptr,
-               const std::vector<Eigen::Vector3d>* pin_waypoints = nullptr) const;
+               const std::vector<Eigen::Vector3d>* pin_waypoints = nullptr,
+               const std::vector<Eigen::Vector3d>* path_waypoints = nullptr,
+               double* path_cost_out = nullptr, std::string* status_out = nullptr) const;
 
   // Convenience overload: start from rest at `start`.
   bool solveQP(const Eigen::Vector3d& start, const Eigen::Vector3d& goal,
@@ -132,9 +143,35 @@ public:
   // reached), the final solve, and the trajectory duration.
   void setDebug(bool on) { debug_ = on; }
 
+  // How hard the trajectory is pulled toward the geometric path [cost per m^2 of
+  // mean squared control-point deviation, per segment]. 0 (the default) disables
+  // it and the QP is pure minimum-snap, which is what makes a corridor-QP round
+  // every corner as widely as the regions allow: snap is the ONLY thing scored,
+  // and a wide turn is smoother than a direct one. The corridor is then the sole
+  // thing holding the curve near the plan, so a roomy corridor buys wide turns.
+  //
+  // The term is the squared distance from each position control point to the
+  // corresponding point on the straight chord between its segment's two
+  // waypoints, averaged over the control points and summed over segments. The
+  // chord rather than the junctions alone: penalising junctions only still lets
+  // the curve bulge between them, which is the corner-cutting itself.
+  //
+  // Note it does NOT scale with the time allocation while the snap cost falls as
+  // 1/T^7, so on a long relaxed trajectory this term dominates and the curve
+  // hugs the plan, while in a tight spot with short segments snap takes over and
+  // the corridor is used for what it is for. That asymmetry is wanted. It also
+  // means the two are not in comparable units, so the weight is a pure tuning
+  // number with no physical reading.
+  //
+  // Soft by construction: it changes the objective only, never the constraints,
+  // so it can never make a feasible corridor infeasible the way pinning can.
+  void setPathWeight(double weight) { path_weight_ = weight; }
+  double pathWeight() const { return path_weight_; }
+
 private:
   CorridorLimits limits_;
   double time_budget_ = 0.0;
+  double path_weight_ = 0.0;
   bool debug_ = false;
 
   // Outer-loop tuning. The time penalty mirrors MinSnapTimeOptimizer's (cost
