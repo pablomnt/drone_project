@@ -423,6 +423,9 @@ private:
   // kCollisionMargin in general, ramped down to 0 within escape_ramp_ of the
   // start so a parked/lifting drone can root the search (see positionValid).
   static constexpr double kCollisionMargin = 0.5;
+  // Spacing [m] at which motions are validity-checked. Matches truncatePath's
+  // sample_step, so the search approves exactly the points truncation re-checks.
+  static constexpr double kValidityCheckStep = 0.05;
   double escape_ramp_ = 1.0;  // [m], see setEscapeRamp
 
   // Radius [m] around the drone the host leaves frontier-free when burning

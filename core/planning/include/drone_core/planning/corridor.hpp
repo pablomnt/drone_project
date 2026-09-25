@@ -166,11 +166,25 @@ std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& pa
 // The result is the safe prefix: the original waypoints passed, plus the last
 // safe sampled point as its endpoint. A result with fewer than 2 points means
 // nothing of the path is safely committable (the caller falls back / holds).
+//
+// `cut`, when non-null, is filled with where and why the walk stopped: the first
+// unsafe sample, its straight-line distance from the start, and either the
+// clearance there against the ramped requirement or that it lay in unobserved
+// space. `cut->cut` is false when the whole path was safe. Diagnostic only.
+struct TruncationCut {
+  bool cut = false;
+  bool unknown = false;           // stopped by is_unknown, not by clearance
+  Eigen::Vector3d point{0, 0, 0};
+  double from_start = 0.0;        // straight-line distance from path.front() [m]
+  double clearance = 0.0;         // conservative clearance at `point` [m]
+  double required = 0.0;          // ramped margin required at `point` [m]
+};
 std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservative_clearance,
                                           const std::vector<Eigen::Vector3d>& path,
                                           double margin, double escape_ramp = 1.0,
                                           double sample_step = 0.05,
-                                          const CorridorUnknownFn& is_unknown = {});
+                                          const CorridorUnknownFn& is_unknown = {},
+                                          TruncationCut* cut = nullptr);
 
 // Full corridor for a path: resample to the segment cap, then grow one convex
 // free region per segment via DecompUtil's ellipsoid decomposition against the

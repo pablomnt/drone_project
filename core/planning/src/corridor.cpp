@@ -262,7 +262,9 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
                                           const std::vector<Eigen::Vector3d>& path,
                                           double margin, double escape_ramp,
                                           double sample_step,
-                                          const CorridorUnknownFn& is_unknown) {
+                                          const CorridorUnknownFn& is_unknown,
+                                          TruncationCut* cut) {
+  if (cut) *cut = TruncationCut{};
   if (path.size() < 2) return path;
   const Eigen::Vector3d& start = path.front();
 
@@ -303,6 +305,16 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
     for (int k = 1; k <= n; ++k) {
       const Eigen::Vector3d q = a + (static_cast<double>(k) / n) * (b - a);
       if (!safe(q)) {
+        if (cut) {
+          cut->cut = true;
+          cut->unknown = is_unknown && is_unknown(q.x(), q.y(), q.z());
+          cut->point = q;
+          cut->from_start = (q - start).norm();
+          cut->clearance = conservative_clearance(q.x(), q.y(), q.z());
+          cut->required = escape_ramp <= 0.0
+                              ? margin
+                              : margin * std::min(1.0, cut->from_start / escape_ramp);
+        }
         // Cut just before the first unsafe sample. The previous sample is the
         // committed endpoint (unless it duplicates the tail, e.g. an unsafe
         // first sample of a segment cutting at the shared waypoint).

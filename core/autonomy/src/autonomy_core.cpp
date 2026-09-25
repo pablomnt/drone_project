@@ -27,6 +27,12 @@ namespace {
 // Slow enough not to bury the rest of the log, fast enough that a stalled bench
 // run explains itself while you are watching it.
 constexpr double kIdleLogPeriod = 5.0;
+// Fraction of FRONTIER_MARGIN truncation lets a point fall short by. The search
+// and truncation check the same points against the same ramp, but not quite
+// identically: the root is moved to the splice point, which shifts the first
+// segment's samples, and the map may have updated since the search. Without
+// slack a path the search accepted by a hair is cut a few millimetres later.
+constexpr double kTruncationTolerance = 0.05;
 
 double steadyNowSeconds() {
   const auto t = std::chrono::steady_clock::now().time_since_epoch();
@@ -527,7 +533,8 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                               const std::shared_ptr<DynamicEDTOctomap>& cons_edt,
                               const planning::MapHandle& cons_map,
                               const planning::CorridorUnknownFn& unknown_fn,
-                              common::Trajectory& traj, bool pin_waypoints) {
+                              common::Trajectory& traj, bool pin_waypoints,
+                              double root_shift) {
   trajgen_corridor_time_ = 0.0;
   trajgen_qp_time_ = 0.0;
   if (path.size() < 2) return false;
@@ -562,7 +569,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     // worst-case corner, so tell it the map's half-diagonal.
     params.voxel_half_diagonal = cons_map->getResolution() * std::sqrt(3.0) / 2.0;
 
-    // Truncation enforces the configured frontier margin exactly — it is NOT
+    // Truncation enforces the configured frontier margin (less kTruncationTolerance) — it is NOT
     // floored by the corridor margin, so FRONTIER_MARGIN means what it says and
     // the two stages can be tuned independently. Whatever it is set to, a
     // committed point must still have strictly positive clearance, so the
@@ -572,9 +579,31 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     // hazard whose distance we can measure, and unobserved space is not that.
     // When it did not — TREAT_FRONTIER_AS_OBSTACLE off — truncation is purely
     // the clearance walk it always was, and unmapped space reads as free.
+    planning::TruncationCut cut;
+    const double trunc_margin = cfg_.frontier_margin * (1.0 - kTruncationTolerance);
     const auto committed =
-        planning::truncatePath(cons_fn, epath, cfg_.frontier_margin, cfg_.escape_ramp_dist,
-                               /*sample_step=*/0.05, unknown_fn);
+        planning::truncatePath(cons_fn, epath, trunc_margin, cfg_.escape_ramp_dist,
+                               /*sample_step=*/0.05, unknown_fn, &cut);
+
+    // Why truncation stopped, for both log lines below. The escape ramp is
+    // centred on the path root, which the caller has moved to the splice point;
+    // the search centred its own ramp on where it started, so a large
+    // `root_shift` means the two stages held this point to different margins.
+    const auto describeCut = [&]() {
+      std::ostringstream os;
+      os << "cut at (" << cut.point.x() << ", " << cut.point.y() << ", " << cut.point.z()
+         << "), " << cut.from_start << " m from the root in a straight line: ";
+      if (cut.unknown) {
+        os << "never-observed space";
+      } else {
+        os << "clearance " << cut.clearance << " m < required " << cut.required
+           << " m (FRONTIER_MARGIN " << cfg_.frontier_margin << " m less "
+           << kTruncationTolerance * 100.0 << "% tolerance, ramped over ESCAPE_RAMP_DIST "
+           << cfg_.escape_ramp_dist << " m)";
+      }
+      if (root_shift >= 0.0) os << "; root " << root_shift << " m from the search start";
+      return os.str();
+    };
 
     // Debug viz snapshot, published by the host. Cleared on every corridor tick
     // and refilled only once a corridor is actually built, so a failed tick
@@ -620,16 +649,8 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       // and on a thinly mapped scene the first is much the more likely, since
       // an unobserved cell one sample ahead of the drone is enough. Costs one
       // predicate call, and only on the tick that already failed.
-      const char* why = "clearance below the ramped margin";
-      if (unknown_fn && epath.size() >= 2) {
-        const Eigen::Vector3d d = epath[1] - epath[0];
-        const double n = d.norm();
-        if (n > 1e-9) {
-          const Eigen::Vector3d q = epath[0] + (0.05 / n) * d;
-          if (unknown_fn(q.x(), q.y(), q.z())) why = "path leaves observed space at the drone";
-        }
-      }
-      DRONE_LOG_INFO("[trajgen] corridor: truncation empty (" << why
+      DRONE_LOG_INFO("[trajgen] corridor: truncation empty ("
+                     << (cut.cut ? describeCut() : std::string("degenerate path"))
                      << ") -> no new trajectory");
       trajgen_corridor_time_ = now() - t_corridor;
       return false;
@@ -666,7 +687,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     if ((committed.back() - epath.back()).norm() > 1e-6) {
       DRONE_LOG_INFO("[trajgen] corridor: truncated to " << committed.size() << " wp / "
                      << polylineLength(committed) << " m of " << polylineLength(epath)
-                     << " m (frontier margin " << cfg_.frontier_margin << " m)");
+                     << " m — " << describeCut());
     }
 
     // Obstacle points for the decomposition: occupied leaves of the
@@ -760,6 +781,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
       optimizer.setTimeBudget(cfg_.traj_solve_budget);
+      optimizer.setPathWeight(cfg_.traj_path_weight);
       optimizer.setDebug(cfg_.debug_trajgen);
       snapshotRegions(attempt, /*accepted=*/true);
       // `start` carries the splice state. Its position is path.front() by
@@ -1443,6 +1465,10 @@ void AutonomyCore::trajgenLoop() {
         // check — the predicate reads the RAW map, never the stamped copy, since
         // stamping writes voxels into that copy and a stamped point that did not
         // already exist would make genuinely unobserved space read as observed.
+        const double root_shift = std::sqrt(
+            std::pow(path.front()[0] - committed_path.front()[0], 2) +
+            std::pow(path.front()[1] - committed_path.front()[1], 2) +
+            std::pow(path.front()[2] - committed_path.front()[2], 2));
         const bool ok = runTrajgen(path, anchor.t0, anchor.start,
                                    conservativeField(cons,
                                                      std::max(cfg_.clearance_threshold,
@@ -1450,7 +1476,7 @@ void AutonomyCore::trajgenLoop() {
                                    cons,
                                    cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
                                                                 : planning::CorridorUnknownFn{},
-                                   traj);
+                                   traj, /*pin_waypoints=*/false, root_shift);
 
         // Re-measure the lead from what this solve actually cost. Timed around
         // the whole call, failures included: a corridor that fails late has

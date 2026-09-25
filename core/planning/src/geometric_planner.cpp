@@ -115,7 +115,12 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
   si_->setStateValidityChecker([this](const ompl::base::State* state) {
     return isStateValid(state);
   });
-  si_->setStateValidityCheckingResolution(0.01);
+  // OMPL takes this as a FRACTION of the space's maximum extent, not a distance:
+  // the old 0.01 over these bounds (~42.6 m diagonal) checked segments only every
+  // ~0.43 m, so a path could graze an obstacle between checks and then be cut by
+  // truncatePath, which samples every 5 cm. Convert the step to that fraction so
+  // the search checks the same points truncation will.
+  si_->setStateValidityCheckingResolution(kValidityCheckStep / space_->getMaximumExtent());
   si_->setup();
 }
 
@@ -158,9 +163,10 @@ bool GeometricPlanner::positionValid(double x, double y, double z) const {
 
   // Fallback for standalone use (no clearance field, e.g. unit tests): scan the
   // octree directly, inflating obstacles by `margin` in the horizontal plane.
-  // Unknown space (null node) is free. The motion checker samples finer (0.01 m)
-  // than the voxel size, so a segment cannot tunnel through an occupied voxel
-  // between samples even when margin is 0.
+  // Unknown space (null node) is free. The motion checker samples every
+  // kValidityCheckStep, which is not finer than a 5 cm voxel, so at margin 0
+  // (the start of the escape ramp) a segment could clip a voxel corner between
+  // samples; any margin above half the step closes that.
   if (!octree_ptr_) return false;
   const double res = octree_ptr_->getResolution();
   for (double dx = -margin; dx <= margin; dx += res) {

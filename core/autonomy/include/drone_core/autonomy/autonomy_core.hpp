@@ -154,6 +154,12 @@ public:
     // slow search yields a slower trajectory rather than a late one. Covers
     // the QP only, not truncation or corridor building. <= 0 = unlimited.
     double traj_solve_budget{1.0};
+    // How hard the corridor QP pulls the trajectory toward the geometric path.
+    // 0 (the default) is pure minimum-snap, which rounds corners as widely as
+    // the regions allow; raising it trades smoothness for directness without
+    // narrowing the corridor, so tight scenery keeps its options.
+    // See CorridorTrajectoryOptimizer::setPathWeight.
+    double traj_path_weight{0.0};
     // Log where each corridor QP solve spends its time (seed growth, BOBYQA
     // probe and search, final solve). See CorridorTrajectoryOptimizer::setDebug.
     bool debug_trajgen{true};
@@ -350,13 +356,17 @@ private:
   // waypoint instead of only its two ends. False for planning, where the
   // waypoints are a hint and letting the QP smooth across them is the whole
   // point of having a corridor. True for a preset, where they are the intent.
+  //
+  // `root_shift` is how far the caller moved path.front() off the point the
+  // search started from [m], reported in the truncation log; < 0 omits it.
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const common::MotionState& start,
                   const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
                   const planning::MapHandle& cons_map,
                   const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj,
-                  bool pin_waypoints = false);
+                  bool pin_waypoints = false,
+                  double root_shift = -1.0);
   void stagePending(const common::Trajectory& traj);
   // Build and stage a one-shot preset trajectory through `waypoints` (see
   // firePreset), splice-anchored at rest on the current state, and arm the
