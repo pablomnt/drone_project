@@ -125,17 +125,21 @@ bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
 }
 
 bool GeometricPlanner::positionValid(double x, double y, double z) const {
-  // Margin to enforce here: the full collision margin in general, the reduced
-  // start margin within the escape sphere so a parked/lifting drone sitting within
-  // the margin of the mapped floor can still root the search without ever entering
-  // an obstacle. The sphere centre (start_pos_) is anchored in planPath /
-  // isPathValid.
+  // Margin to enforce here: it ramps linearly from 0 at the start to the full
+  // collision margin escape_ramp_ metres out, so a parked/lifting drone sitting
+  // within the margin of the mapped floor can still root the search without ever
+  // entering an obstacle. This is the same ramp truncatePath applies, over the
+  // same distance, so a path the search accepts is not then cut near the drone
+  // for climbing away from an obstacle more slowly than truncation demands (a
+  // hard exemption sphere allowed exactly that). The ramp centre (start_pos_) is
+  // anchored in planPath / isPathValid.
   const double ex = x - start_pos_[0];
   const double ey = y - start_pos_[1];
   const double ez = z - start_pos_[2];
-  const bool near_start =
-      ex * ex + ey * ey + ez * ez <= kStartEscapeRadius * kStartEscapeRadius;
-  const double margin = near_start ? kStartMargin : kCollisionMargin;
+  const double from_start = std::sqrt(ex * ex + ey * ey + ez * ez);
+  const double margin =
+      escape_ramp_ > 0.0 ? kCollisionMargin * std::min(1.0, from_start / escape_ramp_)
+                         : kCollisionMargin;
 
   // Preferred path: a single O(1) clearance lookup when a clearance field is set
   // (the live planner always sets one). The field is the 3D Euclidean distance to
@@ -240,17 +244,17 @@ bool GeometricPlanner::projectGoal(const std::vector<double>& goal,
 
 double GeometricPlanner::minClearance(const std::vector<std::vector<double>>& path) const {
   if (!clearance_fn_ || path.size() < 2) return std::numeric_limits<double>::infinity();
-  // Only the region the validity check actually enforces is meaningful here:
-  // points within kStartEscapeRadius of the start are exempt (their margin drops
-  // to kStartMargin so a parked/lifting drone can root the search), so a tight
-  // clearance there is expected and would not block the path. Anchor the sphere
+  // Only the region where the validity check enforces the full margin is
+  // meaningful here: within escape_ramp_ of the start the required margin ramps
+  // down to 0 (so a parked/lifting drone can root the search), so a tight
+  // clearance there is expected and would not block the path. Anchor the ramp
   // at the first waypoint, mirroring isPathValid, and skip sampled points inside
-  // it so this reports the lowest clearance among the points that could actually
-  // flag the path. Returns +infinity if every sampled point is inside the sphere.
+  // it so this reports the lowest clearance among the points held to the full
+  // margin. Returns +infinity if every sampled point is inside the ramp.
   const std::array<double, 3> center{path.front()[0], path.front()[1], path.front()[2]};
   auto insideEscape = [&](double x, double y, double z) {
     const double dx = x - center[0], dy = y - center[1], dz = z - center[2];
-    return dx * dx + dy * dy + dz * dz <= kStartEscapeRadius * kStartEscapeRadius;
+    return dx * dx + dy * dy + dz * dz < escape_ramp_ * escape_ramp_;
   };
   double mind = std::numeric_limits<double>::infinity();
   for (std::size_t i = 0; i + 1 < path.size(); ++i) {

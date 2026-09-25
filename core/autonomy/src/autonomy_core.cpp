@@ -516,6 +516,7 @@ bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal&
   planning::GeometricPlanner planner(map, search_cfg_.rrt_solve_time);
   planner.setPlannerType(search_cfg_.planner_type);
   planner.setBestEffort(search_cfg_.best_effort_goal);
+  planner.setEscapeRamp(search_cfg_.escape_ramp_dist);
   const std::vector<double> start = {state.pos.x(), state.pos.y(), state.pos.z()};
   const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
   return planner.planPath(start, goal_vec, path);
@@ -1167,6 +1168,7 @@ void AutonomyCore::searchLoop() {
       planning::GeometricPlanner planner(search_map, search_cfg_.rrt_solve_time);
       planner.setPlannerType(search_cfg_.planner_type);
       planner.setBestEffort(search_cfg_.best_effort_goal);
+      planner.setEscapeRamp(search_cfg_.escape_ramp_dist);
       planner.setRecordTree(search_cfg_.debug_planner_viz);
       applyClearanceObjective(planner, search_map, conservative);
 

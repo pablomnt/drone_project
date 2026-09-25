@@ -60,7 +60,7 @@ struct CorridorParams {
   double voxel_half_diagonal = 0.0433;
   // Distance from the drone over which the FIRST region's margin may be
   // relaxed [m] — the corridor's counterpart to truncatePath's escape ramp and
-  // the planner's start-escape sphere, and the reason a drone parked close to
+  // the planner's validity ramp, and the reason a drone parked close to
   // the frontier can get a corridor at all.
   //
   // A convex region cannot be less safe at one end than the other: one plane

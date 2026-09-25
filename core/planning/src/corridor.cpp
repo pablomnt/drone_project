@@ -268,12 +268,11 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
 
   // A sampled point is safe when its conservative clearance covers the required
   // margin, which RAMPS LINEARLY from 0 at the drone to the full margin at
-  // `escape_ramp` metres out. This serves the same purpose as the planner's
-  // start-escape sphere (a drone parked near the mapped floor, or in a small
-  // pocket of known-free space, must be able to root a path) but without the
-  // sphere's cliff — a hard sphere leaves a dead band just outside it where the
-  // full margin applies at once, cutting even a path heading directly away from
-  // the hazard. Ramping over a distance INDEPENDENT of the margin is what keeps
+  // `escape_ramp` metres out, the same ramp the planner's validity check uses (a
+  // drone parked near the mapped floor, or in a small pocket of known-free
+  // space, must be able to root a path). A hard exemption sphere instead leaves
+  // a dead band just outside it where the full margin applies at once, cutting
+  // even a path heading directly away from the hazard. Ramping over a distance INDEPENDENT of the margin is what keeps
   // it usable: ramping over `margin` metres instead makes the requirement rise
   // at 1 m/m, which on a thinly-mapped scene meets the shrinking clearance
   // within centimetres and truncates the path to nothing. Clearance must

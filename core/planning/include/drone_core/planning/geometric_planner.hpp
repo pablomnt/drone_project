@@ -203,6 +203,14 @@ public:
   // short the returned path stops.
   void setBestEffort(bool on) { best_effort_ = on; }
 
+  // Distance [m] over which the validity margin ramps from 0 at the start to
+  // the full collision margin (see positionValid). The host passes the same
+  // ESCAPE_RAMP_DIST truncatePath uses, so the search and truncation agree on
+  // how much clearance a point near the drone needs. <= 0 disables the ramp
+  // (full margin everywhere, so a drone within the margin of an obstacle cannot
+  // root a path at all).
+  void setEscapeRamp(double dist) { escape_ramp_ = dist; }
+
   // Straight-line distance [m] from the endpoint of the most recent planPath
   // solution to the goal it was asked for: 0 for an exact solution, positive for
   // an approximate (best-effort) one that stops short, +infinity if the last
@@ -282,12 +290,12 @@ public:
 
   // Smallest clearance (distance to the nearest obstacle, metres) along the path,
   // sampled finely, considering only the points the validity check enforces —
-  // i.e. those outside the start escape sphere (points within kStartEscapeRadius
-  // of the first waypoint are exempt and skipped, mirroring isStateValid). So
+  // i.e. those held to the full margin (points within the escape ramp of the
+  // first waypoint have a reduced margin and are skipped, mirroring isStateValid). So
   // this reports the lowest clearance that could actually flag the path, not the
   // absolute minimum. Requires a clearance field (see setClearance); returns
   // +infinity when none is set, the path has fewer than two points, or every
-  // sampled point falls inside the escape sphere. Purely a diagnostic.
+  // sampled point falls inside the escape ramp. Purely a diagnostic.
   double minClearance(const std::vector<std::vector<double>>& path) const;
 
   // The hard clearance the validity check enforces away from the start [m].
@@ -321,8 +329,8 @@ private:
   bool isStateValid(const ompl::base::State* state);
 
   // The whole collision model in one place, in world coordinates: true when
-  // (x, y, z) clears the margin that applies there (see kCollisionMargin /
-  // kStartMargin). isStateValid is a thin adapter over this, and projectGoal
+  // (x, y, z) clears the margin that applies there (kCollisionMargin, ramped
+  // near the start; see setEscapeRamp). isStateValid is a thin adapter over this, and projectGoal
   // uses it directly so "valid goal" cannot drift from "valid state".
   bool positionValid(double x, double y, double z) const;
 
@@ -390,7 +398,7 @@ private:
   PlannerType planner_type_ = PlannerType::RRTstar;  // which OMPL planner to build
   PlannerConfig params_{};                           // per-planner tunables (header defaults)
 
-  // Centre of the start-state collision exemption (see isStateValid): the start
+  // Centre of the start-state escape ramp (see positionValid): the start
   // passed to planPath, or the first waypoint in isPathValid. Set transiently
   // before each validity sweep, hence mutable so the const isPathValid can
   // anchor it.
@@ -411,18 +419,17 @@ private:
   UnknownFn unknown_fn_;
   double unknown_weight_ = 0.0;
 
-  // Validity margins [m]. A state is free when its clearance exceeds the margin:
-  // kCollisionMargin in general, the reduced kStartMargin within kStartEscapeRadius
-  // of the start so a parked/lifting drone can root the search (see isStateValid).
+  // Validity margin [m]. A state is free when its clearance exceeds the margin:
+  // kCollisionMargin in general, ramped down to 0 within escape_ramp_ of the
+  // start so a parked/lifting drone can root the search (see positionValid).
   static constexpr double kCollisionMargin = 0.5;
-  static constexpr double kStartMargin = 0.0;
-  static constexpr double kStartEscapeRadius = 0.5;
+  double escape_ramp_ = 1.0;  // [m], see setEscapeRamp
 
   // Radius [m] around the drone the host leaves frontier-free when burning
   // frontier into the occupancy map (consumed by the ROS wrapper's frontier
-  // stamping, not the planner itself). Kept here beside kStartEscapeRadius since
+  // stamping, not the planner itself). Kept here beside the escape ramp since
   // it serves the same "let a drone boxed in by unknown space still root the
-  // search" purpose. Must stay well below kStartEscapeRadius/kCollisionMargin so
+  // search" purpose. Must stay well below kCollisionMargin so
   // the surrounding frontier's margin reseals the gap — otherwise the planner
   // could route out through the hole into (free-reading) unknown space.
   static constexpr double kFrontierKeepOutRadius = 0.5;
