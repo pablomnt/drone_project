@@ -467,6 +467,19 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
 
 namespace {
 
+// Extra time a jerk-limited ramp from rest to vmax takes over covering the same
+// distance at vmax. The ramp is symmetric in acceleration, so its average speed
+// is vmax / 2 and the extra is half its duration T. With a constant-acceleration
+// phase (vmax >= amax^2 / jmax) T = vmax / amax + amax / jmax; without one the
+// acceleration peaks at sqrt(vmax * jmax) and T = 2 * sqrt(vmax / jmax).
+double restAllowance(const CorridorLimits& lim) {
+  if (lim.vmax <= 0.0 || lim.amax <= 0.0 || lim.jmax <= 0.0) return 0.0;
+  const double ramp = lim.vmax >= lim.amax * lim.amax / lim.jmax
+                          ? lim.vmax / lim.amax + lim.amax / lim.jmax
+                          : 2.0 * std::sqrt(lim.vmax / lim.jmax);
+  return 0.5 * ramp;
+}
+
 // Partition the segments into groups that turn the same way, for the per-group
 // time cuts in optimizeTrajectory. Returns [first, last] segment index pairs
 // covering 0..S-1 in order. The decision is made at the joints (the turn from
@@ -588,15 +601,32 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   for (int s = 0; s < S; ++s) {
     times[s] = (waypoints[s + 1] - waypoints[s]).norm() / limits_.vmax + kSeedBuffer;
   }
-  // A moving start needs time to shed that speed on top of the traversal, and
-  // the seed above knows nothing about it. Charge the whole braking time to the
-  // first segment: it is only a seed. Without this a fast replan starts inside
-  // the infeasible region and burns growth iterations getting out.
-  times[0] += limits_.amax > 0.0 ? start.vel.cwiseAbs().maxCoeff() / limits_.amax : 0.0;
+  // Starting from or stopping at rest costs time the len/vmax seed knows nothing
+  // about. The seed's proportions matter more than its total: growth and
+  // bisection scale every segment alike, so an end segment seeded too short sets
+  // the factor for all of them and slows the middle down with it. The cost is
+  // what a jerk-limited ramp from rest to vmax takes over cruising the same
+  // distance — half the ramp's duration, since its average speed is vmax / 2
+  // (about 0.58 s at vmax 1, amax 1.5, jmax 3). Nearly all of it falls in the
+  // first ~0.3 m, where the vehicle is slowest, so it goes wholly to the end
+  // segment however short that is. The last segment always ends at rest; the
+  // first only starts there when the start is (near) stationary.
+  const double rest_allowance = restAllowance(limits_);
+  times.back() += rest_allowance;
+  if (start.vel.norm() < kRestSpeed) {
+    times[0] += rest_allowance;
+  } else if (limits_.amax > 0.0) {
+    // A moving start needs time to shed that speed on top of the traversal.
+    // Charge the whole braking time to the first segment: it is only a seed.
+    // Without this a fast replan starts inside the infeasible region and burns
+    // growth iterations getting out.
+    times[0] += start.vel.cwiseAbs().maxCoeff() / limits_.amax;
+  }
 
   // Debug accounting for the one-line breakdown below (debug_ only).
   const double seed_total = sum(times);
   int grow_solves = 0;
+  int shrink_steps = 0;  // x1/1.5 steps accepted when the seed was feasible at once
   double grow_time = 0.0;
   double grown_total = 0.0;
   int bisect_solves = 0;
@@ -610,6 +640,8 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     double before = 0.0;
     double after = 0.0;
     double time = 0.0;
+    // Per group, in path order: 1 accepted, 0 rejected, -1 not tried (budget).
+    std::vector<int> outcome;
   };
   std::vector<std::pair<int, int>> groups;
   std::vector<PassLog> passes;
@@ -618,7 +650,9 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     if (!debug_) return;
     std::ostringstream os;
     os << "[corridor-qp] " << S << " segments | stage 1: " << grow_time << " s, " << grow_solves
-       << " QP solve(s), seed " << seed_total << " s -> " << grown_total << " s | ";
+       << " QP solve(s), seed " << seed_total << " s -> " << grown_total << " s";
+    if (shrink_steps > 0) os << " (shrunk " << shrink_steps << "x)";
+    os << " | ";
     if (bisect_solves == 0) {
       os << "bisect: not run | ";
     } else {
@@ -636,8 +670,13 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
       os << "] | ";
     }
     for (const auto& p : passes) {
-      os << "cut " << 100.0 * p.cut << "%: " << p.accepted << "/" << p.tried << " accepted, "
-         << p.before << " s -> " << p.after << " s, " << p.time << " s | ";
+      os << "cut " << 100.0 * p.cut << "%: " << p.accepted << "/" << p.tried << " accepted [";
+      for (size_t g = 0; g < groups.size(); ++g) {
+        os << (g ? " " : "") << groups[g].first;
+        if (groups[g].second != groups[g].first) os << "-" << groups[g].second;
+        os << (p.outcome[g] > 0 ? " ✓" : p.outcome[g] == 0 ? " ✗" : " not tried");
+      }
+      os << "], " << p.before << " s -> " << p.after << " s, " << p.time << " s | ";
     }
     if (budget_hit) os << "[budget hit] | ";
     os << "total " << elapsed() << " s | " << outcome;
@@ -651,6 +690,8 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // Stage 1: grow until feasible. Not cut short by the budget: until a feasible
   // allocation exists there is nothing to fall back on.
   int grow = 0;
+  // Whether times / 1.5 is known infeasible, which is what the bisection needs.
+  bool bracketed = false;
   {
     const auto t_grow = std::chrono::steady_clock::now();
     bool feasible = false;
@@ -661,14 +702,15 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
       for (double& t : times) t *= 1.5;
       ++grow;
     }
-    grow_time = since(t_grow);
-    grown_total = sum(times);
+    bracketed = feasible && grow > 0;
     // Note this cannot rescue a corridor that is simply too SHORT to stop in:
     // braking from v0 inside distance d needs a >= v0^2/(2d) whatever the time
     // allocation, so stretching time does not help. That is a real physical
     // refusal (the committed prefix is shorter than the stopping distance) and
     // the caller must treat it as "no trajectory", not as a tuning failure.
     if (!feasible) {  // corridor unusable at any sane duration
+      grow_time = since(t_grow);
+      grown_total = sum(times);
       // Say WHICH rejection it was. OSQP reporting "primal infeasible" means the
       // corridor genuinely admits no such curve; "maximum iterations reached" or
       // a polish failure means the solver ran out of road on a hard problem and
@@ -681,6 +723,30 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
              nullptr);
       return false;
     }
+    // A seed feasible at once gives the bisection nothing to bracket from below,
+    // and may itself be well past the shortest feasible allocation. Shrink it
+    // x1/1.5 until the QP refuses, keeping each accepted step; the refusal is the
+    // bracket's lower end. Unlike growth this is cut short by the budget — there
+    // is already a feasible allocation to fall back on.
+    if (grow == 0) {
+      std::vector<double> trial(S);
+      while (shrink_steps < kMaxSeedGrowth) {
+        if (!withinBudget()) {
+          budget_hit = true;
+          break;
+        }
+        for (int s = 0; s < S; ++s) trial[s] = times[s] / 1.5;
+        ++grow_solves;
+        if (!trySolve(trial)) {
+          bracketed = true;
+          break;
+        }
+        times = trial;
+        ++shrink_steps;
+      }
+    }
+    grow_time = since(t_grow);
+    grown_total = sum(times);
   }
 
   // Stage 2: bisect the growth's last step. Growth multiplies every segment by
@@ -691,12 +757,12 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // switch. With a moving start the fixed start velocity breaks the scaling
   // slightly, so the switch is only approximately single — harmless, since `hi`
   // is always an allocation the QP accepted and a wrongly-rejected midpoint only
-  // leaves the result a little longer. Only possible when growth ran (grow > 0),
-  // which is what supplies the infeasible end.
-  if (grow > 0) {
+  // leaves the result a little longer. Needs a known-infeasible end: the step
+  // before growth's last, or the step shrinking refused.
+  if (bracketed) {
     const auto t_bisect = std::chrono::steady_clock::now();
     const std::vector<double> base = times;  // feasible, at factor 1
-    double lo = 1.0 / 1.5;                   // infeasible (the previous growth step)
+    double lo = 1.0 / 1.5;                   // infeasible (growth's previous or shrink's refused step)
     double hi = 1.0;
     std::vector<double> trial(S);
     while ((hi - lo) / lo > kBisectGap) {
@@ -739,6 +805,7 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
       PassLog log;
       log.cut = cut;
       log.before = sum(times);
+      log.outcome.assign(groups.size(), -1);
       const auto t_pass = std::chrono::steady_clock::now();
       std::vector<int> order(groups.size());
       std::vector<double> group_time(groups.size(), 0.0);
@@ -761,9 +828,11 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
           trial[s] = std::max(kMinSegmentTime, times[s] * (1.0 - frac));
         }
         ++log.tried;
+        log.outcome[g] = 0;
         if (trySolve(trial)) {
           times = trial;
           ++log.accepted;
+          log.outcome[g] = 1;
         }
       }
       log.after = sum(times);

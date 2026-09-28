@@ -402,16 +402,24 @@ Module roles:
   **The time search no longer uses BOBYQA (replaced 2026-09-28, NOT yet run on bench).** On the
   2026-09-25/28 benches its objective was 99.7-99.98% time term, i.e. near-pure time minimisation
   against a feasibility cliff, and its 2n+1-evaluation probe alone ate 0.15-0.7 s, so under the
-  budget it mostly returned the seed growth's overshot allocation. The search is now: grow the seed
-  x1.5 until feasible; bisect one scale factor for all segments between the last infeasible and first
-  feasible step (from rest the curve's shape is scale-invariant, so feasibility is monotone in it;
-  approximately so with a moving start); then cut groups of alike-turning segments
+  budget it mostly returned the seed growth's overshot allocation. The search is now: seed each
+  segment `len/vmax + 0.5 s`, plus the time a jerk-limited ramp to/from rest costs over cruising (half
+  the ramp's duration, ~0.58 s at the default limits) on the last segment and, when the start is below
+  0.1 m/s, the first; grow the seed x1.5 until feasible, or shrink it x1/1.5 until refused if it was
+  feasible at once; bisect one scale factor for all segments between the last infeasible and first
+  feasible step to within 7.5% (from rest the curve's shape is scale-invariant, so feasibility is
+  monotone in it; approximately so with a moving start); then cut groups of alike-turning segments
   (`TRAJ_GROUP_CUT`, `TRAJ_GROUP_EDGE_FACTOR`), full cut then half, keeping each the QP accepts. Every
   stage only keeps accepted allocations, so the last accepted solve is the result — no final re-solve.
   The `[corridor-qp]` line reports each stage (bisect bracket, the groups, each cut pass's accepted/
   tried and duration before/after) and ends `cost: snap A [+ path B]`; there is no time penalty.
   A scratch zigzag corridor: growth 22.95 s, bisection 21.04 s in 2 solves (36 ms), BOBYQA unbudgeted
-  only 20.93 s after another 0.56 s.
+  only 20.93 s after another 0.56 s; the start/stop allowance then took it to 12.79 s, since the end
+  segments had been forcing extra growth steps on every segment. **The seed's proportions matter,
+  its scale does not** (growth/shrink/bisection remove it). Tried on four scratch paths and rejected:
+  no buffer, a flat fraction of vmax, a length ramp (60% of vmax under 0.5 m to 85% over 1 m), and the
+  ramp plus a per-joint turn allowance — all 3-24% worse in total than the flat 0.5 s buffer, which
+  also acts as corner time and suits the Bézier bounds' growing cost on short segments.
 
   **Corridor-QP trajectory generation (Stage 1, gated by `USE_CORRIDOR_QP`)** replaces plain
   min-snap with a provably collision-free pipeline over a **dual map view** (see `setMap`): the

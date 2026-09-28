@@ -135,8 +135,9 @@ passed in by mistake. If you need a genuine measured acceleration, do not use th
   Because a Bézier curve lies inside the convex hull of its control points, bounding those points
   bounds the whole curve — the guarantee holds everywhere, not just at sampled instants. Interior
   waypoints are deliberately *not* pinned, so the trajectory is free to cut corners anywhere inside
-  its corridor. An outer loop searches the segment times for the shortest feasible duration: a
-  generous seed grown until the QP accepts it, a bisection of one scale factor for all segments, then
+  its corridor. An outer loop searches the segment times for the shortest feasible duration: a seed
+  that also budgets for starting from and stopping at rest, grown until the QP accepts it (or shrunk
+  until it refuses), a bisection of one scale factor for all segments, then
   cuts to groups of segments that turn alike (straights, arcs), each kept only if the QP still accepts
   it. Everything is written against a **clearance
   oracle** (`CorridorClearanceFn`, the same shape as the planner's `ClearanceFn`) rather than against

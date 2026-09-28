@@ -84,8 +84,11 @@ public:
   // Outer time-allocation search, aiming for the shortest feasible duration in
   // three stages, each of which only ever keeps an allocation the QP accepted:
   //   1. Seed velocity-consistent — t_i = segment length / vmax + buffer, plus
-  //      a braking allowance on the first segment for a moving start — and grow
-  //      every segment x1.5 until the QP accepts it.
+  //      the time a ramp to or from rest costs on the last segment and, when the
+  //      start is below kRestSpeed, the first (otherwise a braking allowance for
+  //      the moving start) — and grow every segment x1.5 until the QP accepts it,
+  //      or, if the seed is accepted at once, shrink it x1/1.5 until the QP
+  //      refuses, keeping the last accepted step.
   //   2. Bisect that last growth step on a single scale factor for all
   //      segments, until the bracket is within kBisectGap.
   //   3. Cut groups of segments that turn alike (straights, arcs; see
@@ -132,7 +135,8 @@ public:
   // unlimited. Counted from the start of the call and shared by all three
   // stages. When it runs out the last accepted allocation is used — feasible,
   // just slower. Seed growth itself is NOT cut short: until a feasible
-  // allocation exists there is nothing to fall back on. The budget is checked
+  // allocation exists there is nothing to fall back on (shrinking a seed that
+  // was feasible at once is). The budget is checked
   // before each QP solve, so a call can overrun it by one solve.
   void setTimeBudget(double seconds) { time_budget_ = seconds; }
   double timeBudget() const { return time_budget_; }
@@ -140,8 +144,9 @@ public:
   // When on, every optimizeTrajectory call logs one line breaking down where
   // its time went: seed growth (time, QP solves, seed and grown durations), the
   // bisection of growth's last step (time, solves, duration, final bracket),
-  // the segment groups, each group-cut pass (cuts accepted of tried, duration
-  // before and after, time), whether the budget cut it short, and the
+  // the segment groups, each group-cut pass (cuts accepted of tried, each
+  // group marked accepted / rejected / not tried, duration before and after,
+  // time), whether the budget cut it short, and the
   // trajectory duration.
   void setDebug(bool on) { debug_ = on; }
 
@@ -192,11 +197,16 @@ private:
   bool debug_ = false;
 
   static constexpr double kSeedBuffer = 0.5;  // per-segment slack over len/vmax [s]
+  // Start speed [m/s] below which the start counts as at rest for the seed's
+  // start-from-rest allowance.
+  static constexpr double kRestSpeed = 0.1;
   static constexpr double kMinSegmentTime = 0.1;  // floor under a group cut [s]
   static constexpr int kMaxSeedGrowth = 6;  // 1.5x seed stretches before giving up (~11x)
   // Bisection of the last growth step stops once the bracket's (hi - lo) / lo
-  // is within this: from 1.5x that is two midpoint solves in the usual case.
-  static constexpr double kBisectGap = 0.15;
+  // is within this: from 1.5x that is three midpoint solves in the usual case.
+  // Scratch paths (2026-09-28) showed 15% leaving up to ~6% of duration behind,
+  // more than any change to the seed's proportions was worth.
+  static constexpr double kBisectGap = 0.075;
   // Segment grouping (see setGroupCut). A joint turning at most
   // kGroupStraightAngle is straight and its direction is ignored — the turn
   // axis of a near-zero turn is noise. Two turning joints belong to the same
