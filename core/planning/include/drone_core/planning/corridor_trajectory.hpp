@@ -203,10 +203,10 @@ private:
   static constexpr double kMinSegmentTime = 0.1;  // floor under a group cut [s]
   static constexpr int kMaxSeedGrowth = 6;  // 1.5x seed stretches before giving up (~11x)
   // Bisection of the last growth step stops once the bracket's (hi - lo) / lo
-  // is within this: from 1.5x that is three midpoint solves in the usual case.
-  // Scratch paths (2026-09-28) showed 15% leaving up to ~6% of duration behind,
-  // more than any change to the seed's proportions was worth.
-  static constexpr double kBisectGap = 0.075;
+  // is within this: from 1.5x that is two midpoint solves in the usual case.
+  // 7.5% was tried (2026-09-28): one more solve for 44.1 s -> 43.8 s over four
+  // scratch paths, within the noise the group cuts add, so not kept.
+  static constexpr double kBisectGap = 0.15;
   // Segment grouping (see setGroupCut). A joint turning at most
   // kGroupStraightAngle is straight and its direction is ignored — the turn
   // axis of a near-zero turn is noise. Two turning joints belong to the same

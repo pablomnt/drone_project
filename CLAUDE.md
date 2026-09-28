@@ -407,7 +407,7 @@ Module roles:
   the ramp's duration, ~0.58 s at the default limits) on the last segment and, when the start is below
   0.1 m/s, the first; grow the seed x1.5 until feasible, or shrink it x1/1.5 until refused if it was
   feasible at once; bisect one scale factor for all segments between the last infeasible and first
-  feasible step to within 7.5% (from rest the curve's shape is scale-invariant, so feasibility is
+  feasible step to within 15% (from rest the curve's shape is scale-invariant, so feasibility is
   monotone in it; approximately so with a moving start); then cut groups of alike-turning segments
   (`TRAJ_GROUP_CUT`, `TRAJ_GROUP_EDGE_FACTOR`), full cut then half, keeping each the QP accepts. Every
   stage only keeps accepted allocations, so the last accepted solve is the result — no final re-solve.
