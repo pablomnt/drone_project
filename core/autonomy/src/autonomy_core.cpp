@@ -870,6 +870,8 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       planning::CorridorTrajectoryOptimizer optimizer(
           planning::CorridorLimits{cfg_.vmax, cfg_.amax, cfg_.jmax});
       optimizer.setTimeBudget(cfg_.traj_solve_budget);
+      optimizer.setGroupCut(cfg_.traj_group_cut);
+      optimizer.setGroupEdgeFactor(cfg_.traj_group_edge_factor);
       optimizer.setPathWeight(cfg_.traj_path_weight);
       optimizer.setDebug(cfg_.debug_trajgen);
       snapshotRegions(attempt, /*accepted=*/true);

@@ -265,7 +265,7 @@ private:
     // PRESET_WAYPOINTS fire from this hover adds no altitude step to its first
     // segment and the hand-back at completion is at the same height.
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.5});
-    declare_parameter("STALE_TIMEOUT", 2.0);
+    declare_parameter("STALE_TIMEOUT", 3.0);
     // Distance [m] from the tracked reference at which the vehicle gives up on
     // the trajectory: it holds its current position and the planner replans
     // from there. Catches a vehicle knocked off course, which STALE_TIMEOUT (a
@@ -309,7 +309,7 @@ private:
     // with the goal beyond the frontier, fraction of tree nodes near the direct
     // line: 0 -> 100%, 0.5 -> 91%, 1 -> 49%, 2 -> 17%, 10 -> 9%.
     declare_parameter("UNKNOWN_WEIGHT", 0.5);
-    declare_parameter("TRAJGEN_PERIOD", 1.0);
+    declare_parameter("TRAJGEN_PERIOD", 1.25);
     // Geometry-first bring-up: with this false the planner only runs RRT* and
     // publishes the geometric path; it does not generate a trajectory or feed
     // the controller, which keeps following POS_SP. Flip to true to enable the
@@ -403,10 +403,17 @@ private:
     // trajectory, never an infeasible one). The QP only — truncation and
     // corridor building are not counted. <= 0 disables the budget.
     declare_parameter("TRAJ_SOLVE_BUDGET", 1.0);
+    // Time-search group cuts: after the uniform bisection, each group of
+    // segments that turn alike (a straight, an arc) is tried with its middle
+    // segments' times cut by TRAJ_GROUP_CUT and its two end segments' by
+    // TRAJ_GROUP_EDGE_FACTOR of that, then again at half the cut. A cut is kept
+    // only if the whole trajectory stays feasible. <= 0 disables.
+    declare_parameter("TRAJ_GROUP_CUT", 0.25);
+    declare_parameter("TRAJ_GROUP_EDGE_FACTOR", 0.6);
     // 0 = pure minimum-snap (the corridor alone holds the curve near the path,
     // so wide turns wherever the regions are roomy). Raise to pull the
     // trajectory toward the planned waypoints without tightening the corridor.
-    declare_parameter("TRAJ_PATH_WEIGHT", 0.0);
+    declare_parameter("TRAJ_PATH_WEIGHT", 0.5);
     // Log one line per corridor QP solve breaking down its time: seed growth,
     // BOBYQA's initial probe, the rest of the search, the final solve. On for
     // now while the time search is being tuned.
@@ -509,6 +516,8 @@ private:
     cfg.corridor_margin = param("CORRIDOR_MARGIN").as_double();
     cfg.escape_ramp_dist = param("ESCAPE_RAMP_DIST").as_double();
     cfg.traj_solve_budget = param("TRAJ_SOLVE_BUDGET").as_double();
+    cfg.traj_group_cut = param("TRAJ_GROUP_CUT").as_double();
+    cfg.traj_group_edge_factor = param("TRAJ_GROUP_EDGE_FACTOR").as_double();
     cfg.traj_path_weight = param("TRAJ_PATH_WEIGHT").as_double();
     cfg.debug_trajgen = param("DEBUG_TRAJGEN").as_bool();
     cfg.max_segment_len = param("MAX_SEGMENT_LEN").as_double();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -80,20 +81,23 @@ public:
     return solveQP(s, goal, times, regions, out, cost_out);
   }
 
-  // Outer time-allocation search: BOBYQA over the per-segment durations,
-  // minimising the QP snap cost plus a total-time penalty, with an infeasible
-  // solve scored as a large penalty so the search is pushed back toward
-  // feasible (longer) times. Seeded velocity-consistent — t_i = segment length
-  // / vmax + buffer — then grown geometrically until the QP accepts it, so the
-  // search always starts on the feasible side of the flat penalty region. The
-  // seed also carries a braking floor per segment so a fast-moving start does
-  // not begin the search inside the infeasible region.
+  // Outer time-allocation search, aiming for the shortest feasible duration in
+  // three stages, each of which only ever keeps an allocation the QP accepted:
+  //   1. Seed velocity-consistent — t_i = segment length / vmax + buffer, plus
+  //      a braking allowance on the first segment for a moving start — and grow
+  //      every segment x1.5 until the QP accepts it.
+  //   2. Bisect that last growth step on a single scale factor for all
+  //      segments, until the bracket is within kBisectGap.
+  //   3. Cut groups of segments that turn alike (straights, arcs; see
+  //      setGroupCut): the full cut on every group, then half of it, keeping
+  //      each cut the QP accepts.
+  // Stages 2 and 3 stop early when the time budget runs out (setTimeBudget).
   // waypoints are the resampled corridor waypoints
   // (waypoints.size() == regions.size() + 1); the trajectory runs from `start`
   // to rest at waypoints.back(), free within the regions in between.
   // start.pos is used in place of waypoints.front(), which it must coincide
   // with for the corridor to contain it. Returns false when no feasible time
-  // allocation was found (the final QP at the best times fails).
+  // allocation was found (stage 1 ran out of growth steps).
   //
   // `pin_waypoints` decides what the waypoints are FOR. False (the planner's
   // case) uses them only to shape the corridor and seed the time allocation:
@@ -125,22 +129,20 @@ public:
   const CorridorLimits& limits() const { return limits_; }
 
   // Wall-clock budget for optimizeTrajectory's time search [s]; <= 0 means
-  // unlimited. Counted from the start of the call, so seed growth uses it up
-  // too. When it runs out BOBYQA stops and the best allocation evaluated so far
-  // is used — always feasible, since the search starts from a feasible seed and
-  // infeasible points score worse than any feasible one. Seed growth itself is
-  // NOT cut short: until a feasible allocation exists there is nothing to fall
-  // back on, so a budget spent there skips the search and uses the seed. The
-  // budget is checked between QP evaluations, so a call can overrun it by one
-  // solve plus the final solve.
+  // unlimited. Counted from the start of the call and shared by all three
+  // stages. When it runs out the last accepted allocation is used — feasible,
+  // just slower. Seed growth itself is NOT cut short: until a feasible
+  // allocation exists there is nothing to fall back on. The budget is checked
+  // before each QP solve, so a call can overrun it by one solve.
   void setTimeBudget(double seconds) { time_budget_ = seconds; }
   double timeBudget() const { return time_budget_; }
 
   // When on, every optimizeTrajectory call logs one line breaking down where
-  // its time went: seed growth (time, QP solves, seed and grown durations),
-  // BOBYQA's initial model-building probe (its first 2n+1 evaluations), the
-  // rest of the search (evaluations, how many were infeasible, the duration it
-  // reached), the final solve, and the trajectory duration.
+  // its time went: seed growth (time, QP solves, seed and grown durations), the
+  // bisection of growth's last step (time, solves, duration, final bracket),
+  // the segment groups, each group-cut pass (cuts accepted of tried, duration
+  // before and after, time), whether the budget cut it short, and the
+  // trajectory duration.
   void setDebug(bool on) { debug_ = on; }
 
   // How hard the trajectory is pulled toward the geometric path [cost per m^2 of
@@ -168,23 +170,41 @@ public:
   void setPathWeight(double weight) { path_weight_ = weight; }
   double pathWeight() const { return path_weight_; }
 
+  // Stage 3 of the time search. Segments are grouped by how the path turns:
+  // consecutive segments whose joints are all straight (<= kGroupStraightAngle)
+  // form one group, and so do consecutive segments whose joints all turn by the
+  // same amount in the same direction (an arc); a joint that breaks the pattern,
+  // such as a corner between two straights, starts a new group. Each group then
+  // has its segments' times cut by `cut` (a fraction, e.g. 0.25) in its middle
+  // and by `edge_factor` * `cut` at its two end segments, so the change of speed
+  // into the neighbouring groups is eased rather than stepped. Two passes over
+  // all groups, the full cut then half of it. A cut is kept only if the QP
+  // accepts the whole trajectory with it. <= 0 disables the stage.
+  void setGroupCut(double cut) { group_cut_ = cut; }
+  void setGroupEdgeFactor(double edge_factor) { group_edge_factor_ = edge_factor; }
+
 private:
   CorridorLimits limits_;
   double time_budget_ = 0.0;
   double path_weight_ = 0.0;
+  double group_cut_ = 0.25;
+  double group_edge_factor_ = 0.6;
   bool debug_ = false;
 
-  // Outer-loop tuning. The time penalty mirrors MinSnapTimeOptimizer's (cost
-  // per second of flight time, trading smoothness against duration); the
-  // infeasible penalty just has to dwarf any feasible score. The eval budget is
-  // bounded because each evaluation is a full (cold) OSQP solve and the whole
-  // search runs inside the ~1 Hz trajgen tick.
-  static constexpr double kTimePenalty = 500.0;
-  static constexpr double kInfeasiblePenalty = 1.0e7;
   static constexpr double kSeedBuffer = 0.5;  // per-segment slack over len/vmax [s]
-  static constexpr double kMinSegmentTime = 0.1;  // BOBYQA lower bound [s]
-  static constexpr int kMaxEvals = 100;
+  static constexpr double kMinSegmentTime = 0.1;  // floor under a group cut [s]
   static constexpr int kMaxSeedGrowth = 6;  // 1.5x seed stretches before giving up (~11x)
+  // Bisection of the last growth step stops once the bracket's (hi - lo) / lo
+  // is within this: from 1.5x that is two midpoint solves in the usual case.
+  static constexpr double kBisectGap = 0.15;
+  // Segment grouping (see setGroupCut). A joint turning at most
+  // kGroupStraightAngle is straight and its direction is ignored — the turn
+  // axis of a near-zero turn is noise. Two turning joints belong to the same
+  // arc when their angles differ by at most kGroupTurnTolerance and their turn
+  // axes by at most kGroupAxisTolerance. All in radians.
+  static constexpr double kGroupStraightAngle = 10.0 * M_PI / 180.0;
+  static constexpr double kGroupTurnTolerance = 10.0 * M_PI / 180.0;
+  static constexpr double kGroupAxisTolerance = 30.0 * M_PI / 180.0;
 };
 
 }  // namespace drone_core::planning

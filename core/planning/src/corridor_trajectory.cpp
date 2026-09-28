@@ -6,10 +6,11 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
-#include <nlopt.hpp>
 #include <osqp.h>
 
 #include "drone_core/common/logging.hpp"
@@ -382,7 +383,7 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   settings.eps_rel = 1e-5;
   // A well-conditioned (tau-normalized) solve converges quickly; only
   // near-infeasible probes from the outer time search grind longer. Cap them
-  // well below OSQP's 4000 default so a whole BOBYQA search stays cheap — an
+  // well below OSQP's 4000 default so a whole time search stays cheap — an
   // unconverged probe is treated as infeasible, which is what it borders on.
   settings.max_iter = 1000;
 
@@ -409,8 +410,8 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
     // Primal infeasible, or unconverged at the iteration cap (which only
     // happens bordering infeasibility) — either way there is no trustworthy
     // trajectory. Silent: the outer time search probes this region on every
-    // run and scores it as a penalty; the caller's fallback does the one-line
-    // reporting if a *final* solve ends up here.
+    // run and simply rejects the allocation; it reports the status itself if
+    // no allocation is ever accepted.
     ok = false;
   } else {
     sol = Eigen::Map<const Eigen::VectorXd>(
@@ -466,60 +467,70 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
 
 namespace {
 
-// Context handed to the NLopt objective (mirrors TimeOptimizerContext for the
-// plain min-snap optimiser).
-struct CorridorTimeContext {
-  const CorridorTrajectoryOptimizer* solver;
-  common::MotionState start;
-  Eigen::Vector3d goal;
-  const std::vector<ConvexRegion>* regions;
-  double time_penalty;
-  double infeasible_penalty;
-  // Null when junctions are free; otherwise the waypoints the curve must pass
-  // through. The time search has to solve the SAME problem the final solve
-  // will, or it optimises an allocation for a shape that is never built.
-  const std::vector<Eigen::Vector3d>* pin_waypoints;
-  // The resampled waypoints, for the path-following term. Always set (unlike
-  // pin_waypoints); solveQP ignores it when the path weight is zero.
-  const std::vector<Eigen::Vector3d>* path;
-  // Debug accounting, filled in by the objective. BOBYQA spends its first
-  // `probe_evals` evaluations (2n+1, nlopt's default) building its quadratic
-  // model before it takes a real step, so the time to that point is reported
-  // apart from the rest of the search.
-  int probe_evals = 0;
-  int evals = 0;
-  int infeasible = 0;
-  std::chrono::steady_clock::time_point search_start{};
-  double probe_time = -1.0;  // < 0 until the probe evaluations are done
-};
-
-// Feasibility-aware objective: QP snap cost + time penalty for a candidate
-// allocation, or a large flat penalty when the QP is infeasible at these times
-// (too short for the limits / corridor), which pushes BOBYQA back toward the
-// feasible region the generous seed starts in.
-double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& grad,
-                             void* data) {
-  (void)grad;
-  auto* ctx = static_cast<CorridorTimeContext*>(data);
-  double total = 0.0;
-  for (double t : x) total += t;
-
-  common::Trajectory traj;
-  double cost = 0.0;
-  double path_cost = 0.0;
-  const bool ok = ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost,
-                                       ctx->pin_waypoints, ctx->path, &path_cost);
-  ++ctx->evals;
-  if (!ok) ++ctx->infeasible;
-  if (ctx->evals == ctx->probe_evals) {
-    ctx->probe_time =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx->search_start).count();
+// Partition the segments into groups that turn the same way, for the per-group
+// time cuts in optimizeTrajectory. Returns [first, last] segment index pairs
+// covering 0..S-1 in order. The decision is made at the joints (the turn from
+// one segment's direction to the next):
+//   - a joint turning at most `straight_angle` is straight, and its direction is
+//     ignored (the turn axis of a near-zero turn is noise);
+//   - a straight joint continues the group, unless that group is an arc: then
+//     the arc's last segment runs from its final turn into this straight joint,
+//     so it opens the new straight group rather than closing the arc;
+//   - a turning joint continues the group only when the joint before it was the
+//     same turn (angle within `turn_tolerance`, axis within `axis_tolerance`) —
+//     an arc. Anything else opens a new group.
+// So a sharp corner between two straights is a boundary between two straight
+// groups, and an arc's group holds the segments that lie between two of its
+// matching turns.
+std::vector<std::pair<int, int>> groupSegments(const std::vector<Eigen::Vector3d>& waypoints,
+                                               double straight_angle, double turn_tolerance,
+                                               double axis_tolerance) {
+  const int S = static_cast<int>(waypoints.size()) - 1;
+  std::vector<Eigen::Vector3d> dir(S);
+  for (int s = 0; s < S; ++s) {
+    const Eigen::Vector3d d = waypoints[s + 1] - waypoints[s];
+    const double n = d.norm();
+    dir[s] = n > 1e-9 ? Eigen::Vector3d(d / n) : Eigen::Vector3d::Zero();
   }
-  if (!ok) return ctx->infeasible_penalty;
-  // The full QP objective, not just snap: the path term is part of what the
-  // allocation is being judged on, so leaving it out would search for times that
-  // suit a trajectory the final solve is not going to build.
-  return cost + path_cost + ctx->time_penalty * total;
+  struct Turn {
+    double angle;          // [rad]
+    Eigen::Vector3d axis;  // unit, zero when there is no turn to speak of
+  };
+  // Joint j sits between segments j - 1 and j.
+  const auto turnAt = [&dir](int j) {
+    const Eigen::Vector3d c = dir[j - 1].cross(dir[j]);
+    const double cn = c.norm();
+    return Turn{std::atan2(cn, dir[j - 1].dot(dir[j])),
+                cn > 1e-9 ? Eigen::Vector3d(c / cn) : Eigen::Vector3d::Zero()};
+  };
+  const auto isTurn = [straight_angle](const Turn& t) { return t.angle > straight_angle; };
+  const double cos_axis = std::cos(axis_tolerance);
+  const auto sameTurn = [&](const Turn& a, const Turn& b) {
+    return isTurn(a) && isTurn(b) && std::abs(a.angle - b.angle) <= turn_tolerance &&
+           a.axis.dot(b.axis) >= cos_axis;
+  };
+
+  std::vector<std::pair<int, int>> groups{{0, 0}};
+  enum class Kind { kSingle, kStraight, kArc } kind = Kind::kSingle;  // of groups.back()
+  for (int j = 1; j < S; ++j) {
+    const Turn t = turnAt(j);
+    if (!isTurn(t)) {
+      if (kind == Kind::kArc) {
+        --groups.back().second;  // an arc group has >= 2 segments, so this leaves one
+        groups.push_back({j - 1, j});
+      } else {
+        groups.back().second = j;
+      }
+      kind = Kind::kStraight;
+    } else if (j >= 2 && sameTurn(turnAt(j - 1), t)) {
+      groups.back().second = j;
+      kind = Kind::kArc;
+    } else {
+      groups.push_back({j, j});
+      kind = Kind::kSingle;
+    }
+  }
+  return groups;
 }
 
 }  // namespace
@@ -530,112 +541,134 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     bool pin_waypoints) const {
   if (waypoints.size() < 2 || regions.size() != waypoints.size() - 1) return false;
   const int S = static_cast<int>(regions.size());
-  // Passed to every solve below, the seed-growth probe and the BOBYQA objective
-  // included: the allocation being searched has to be an allocation for the
-  // shape actually being built.
+  // Passed to every solve below: the allocation being searched has to be an
+  // allocation for the shape actually being built.
   const std::vector<Eigen::Vector3d>* pin = pin_waypoints ? &waypoints : nullptr;
   const auto t_begin = std::chrono::steady_clock::now();
   const auto elapsed = [&t_begin]() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_begin).count();
   };
-
-  // Velocity-consistent seed: long enough to traverse each segment at vmax with
-  // some slack. BOBYQA must start on the feasible side (the infeasible region
-  // scores a flat penalty, so a search started inside it is blind), and
-  // "len/vmax + buffer" alone can still be infeasible once the accel/jerk ramps
-  // and the conservative Bezier hull bite — so grow the whole allocation
-  // geometrically until the QP accepts it before searching.
-  std::vector<double> times(S);
-  for (int s = 0; s < S; ++s) {
-    times[s] = (waypoints[s + 1] - waypoints[s]).norm() / limits_.vmax + kSeedBuffer;
-  }
-  // A moving start needs time to shed that speed on top of the traversal, and
-  // the seed above knows nothing about it — at the old rest start this term was
-  // always zero. Charge the whole braking time to the first segment: it is only
-  // a seed, and BOBYQA redistributes it. Without this a fast replan starts the
-  // search inside the infeasible region and burns growth iterations getting out.
-  times[0] += limits_.amax > 0.0 ? start.vel.cwiseAbs().maxCoeff() / limits_.amax : 0.0;
-
-  // Debug accounting for the one-line breakdown below (debug_ only).
+  const auto since = [](std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  };
+  const auto withinBudget = [&]() { return time_budget_ <= 0.0 || elapsed() < time_budget_; };
   const auto sum = [](const std::vector<double>& v) {
     double t = 0.0;
     for (double x : v) t += x;
     return t;
   };
+
+  // Every stage below only ever replaces `times` with an allocation the QP has
+  // just accepted, and solveQP leaves its output untouched on failure, so `best`
+  // always holds the trajectory for the current `times` — no final re-solve.
+  common::Trajectory best;
+  double best_snap = 0.0;
+  double best_path = 0.0;
+  // OSQP's own word for why the most recent solve was rejected; see the growth
+  // failure below.
+  std::string last_status;
+  const auto trySolve = [&](const std::vector<double>& t) {
+    double snap = 0.0;
+    double path = 0.0;
+    last_status.clear();
+    if (!solveQP(start, waypoints.back(), t, regions, best, &snap, pin, &waypoints, &path,
+                 &last_status)) {
+      return false;
+    }
+    best_snap = snap;
+    best_path = path;
+    return true;
+  };
+
+  // Velocity-consistent seed: long enough to traverse each segment at vmax with
+  // some slack. "len/vmax + buffer" alone can still be infeasible once the
+  // accel/jerk ramps and the conservative Bezier hull bite, so the whole
+  // allocation is then grown geometrically until the QP accepts it.
+  std::vector<double> times(S);
+  for (int s = 0; s < S; ++s) {
+    times[s] = (waypoints[s + 1] - waypoints[s]).norm() / limits_.vmax + kSeedBuffer;
+  }
+  // A moving start needs time to shed that speed on top of the traversal, and
+  // the seed above knows nothing about it. Charge the whole braking time to the
+  // first segment: it is only a seed. Without this a fast replan starts inside
+  // the infeasible region and burns growth iterations getting out.
+  times[0] += limits_.amax > 0.0 ? start.vel.cwiseAbs().maxCoeff() / limits_.amax : 0.0;
+
+  // Debug accounting for the one-line breakdown below (debug_ only).
   const double seed_total = sum(times);
   int grow_solves = 0;
   double grow_time = 0.0;
   double grown_total = 0.0;
-  // Filled in once the search has run; the report below reads it on every exit.
-  CorridorTimeContext ctx{this,         start,              waypoints.back(), &regions,
-                          kTimePenalty, kInfeasiblePenalty, pin,              &waypoints};
-  ctx.probe_evals = 2 * S + 1;
-  double search_time = 0.0;
-  double searched_total = 0.0;
+  int bisect_solves = 0;
+  double bisect_time = 0.0;
+  double bisected_total = 0.0;
+  double bisect_gap = 0.0;  // final (hi - lo) / lo of the bracket
+  struct PassLog {
+    double cut = 0.0;  // middle-segment fraction tried
+    int tried = 0;
+    int accepted = 0;
+    double before = 0.0;
+    double after = 0.0;
+    double time = 0.0;
+  };
+  std::vector<std::pair<int, int>> groups;
+  std::vector<PassLog> passes;
   bool budget_hit = false;
-  // Snap cost of the FINAL solve, so the report can split the objective the time
-  // search was actually minimising into its two halves. The objective is
-  // snap + kTimePenalty * total_time, and which of the two dominates decides
-  // whether a slow trajectory is the solver refusing to hurry or the penalty
-  // being too weak to make it worth hurrying.
-  double final_snap = 0.0;
-  double final_path = 0.0;
-  // OSQP's own word for why the most recent solve was rejected; see the seed
-  // growth failure below.
-  std::string last_status;
-  const auto report = [&](const char* outcome, double final_time, bool retried,
-                          const common::Trajectory* result) {
+  const auto report = [&](const std::string& outcome, const common::Trajectory* result) {
     if (!debug_) return;
     std::ostringstream os;
     os << "[corridor-qp] " << S << " segments | stage 1: " << grow_time << " s, " << grow_solves
        << " QP solve(s), seed " << seed_total << " s -> " << grown_total << " s | ";
-    if (ctx.evals == 0) {
-      os << "BOBYQA: not run";
+    if (bisect_solves == 0) {
+      os << "bisect: not run | ";
     } else {
-      const bool probed = ctx.probe_time >= 0.0;
-      const double probe = probed ? ctx.probe_time : search_time;
-      os << "BOBYQA probe: " << probe << " s (" << std::min(ctx.evals, ctx.probe_evals) << "/"
-         << ctx.probe_evals << " evals) | BOBYQA search: " << (search_time - probe) << " s ("
-         << std::max(0, ctx.evals - ctx.probe_evals) << " evals), " << ctx.infeasible
-         << " infeasible of " << ctx.evals << ", -> " << searched_total << " s"
-         << (budget_hit ? " [budget hit]" : "");
+      os << "bisect: " << bisect_time << " s, " << bisect_solves << " QP solve(s) -> "
+         << bisected_total << " s (bracket " << 100.0 * bisect_gap << "%) | ";
     }
-    os << " | final solve: " << final_time << " s" << (retried ? " (retried at 1.5x)" : "")
-       << " | total " << elapsed() << " s | " << outcome;
+    if (groups.empty()) {
+      os << "groups: not formed | ";
+    } else {
+      os << "groups: " << groups.size() << " [";
+      for (size_t g = 0; g < groups.size(); ++g) {
+        os << (g ? " " : "") << groups[g].first;
+        if (groups[g].second != groups[g].first) os << "-" << groups[g].second;
+      }
+      os << "] | ";
+    }
+    for (const auto& p : passes) {
+      os << "cut " << 100.0 * p.cut << "%: " << p.accepted << "/" << p.tried << " accepted, "
+         << p.before << " s -> " << p.after << " s, " << p.time << " s | ";
+    }
+    if (budget_hit) os << "[budget hit] | ";
+    os << "total " << elapsed() << " s | " << outcome;
     if (result) {
-      const double time_term = kTimePenalty * result->total_duration;
-      const double objective = final_snap + final_path + time_term;
-      os << ", trajectory " << result->total_duration << " s | cost: snap " << final_snap;
-      if (path_weight_ > 0.0) os << " + path " << final_path;
-      os << " + time " << time_term << " = " << objective;
-      if (objective > 0.0) os << " (" << (100.0 * time_term / objective) << "% time)";
+      os << ", trajectory " << result->total_duration << " s | cost: snap " << best_snap;
+      if (path_weight_ > 0.0) os << " + path " << best_path;
     }
     DRONE_LOG_INFO(os.str());
   };
 
+  // Stage 1: grow until feasible. Not cut short by the budget: until a feasible
+  // allocation exists there is nothing to fall back on.
+  int grow = 0;
   {
-    common::Trajectory probe;
-    int grow = 0;
     const auto t_grow = std::chrono::steady_clock::now();
     bool feasible = false;
     while (true) {
       ++grow_solves;
-      last_status.clear();
-      feasible = solveQP(start, waypoints.back(), times, regions, probe, nullptr, pin, &waypoints,
-                         nullptr, &last_status);
+      feasible = trySolve(times);
       if (feasible || grow >= kMaxSeedGrowth) break;
       for (double& t : times) t *= 1.5;
       ++grow;
     }
-    grow_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_grow).count();
+    grow_time = since(t_grow);
     grown_total = sum(times);
-    if (!feasible) grow = kMaxSeedGrowth;
     // Note this cannot rescue a corridor that is simply too SHORT to stop in:
     // braking from v0 inside distance d needs a >= v0^2/(2d) whatever the time
     // allocation, so stretching time does not help. That is a real physical
     // refusal (the committed prefix is shorter than the stopping distance) and
     // the caller must treat it as "no trajectory", not as a tuning failure.
-    if (grow == kMaxSeedGrowth) {  // corridor unusable at any sane duration
+    if (!feasible) {  // corridor unusable at any sane duration
       // Say WHICH rejection it was. OSQP reporting "primal infeasible" means the
       // corridor genuinely admits no such curve; "maximum iterations reached" or
       // a polish failure means the solver ran out of road on a hard problem and
@@ -643,69 +676,105 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
       // — look at the geometry versus loosen the solver or whatever is driving
       // the optimum onto a constraint boundary (TRAJ_PATH_WEIGHT, a start pinned
       // millimetres inside region 0) — and they were indistinguishable in the log.
-      std::ostringstream why;
-      why << "FAILED (no feasible allocation within the seed growth; OSQP said \""
-          << (last_status.empty() ? "unknown" : last_status) << "\")";
-      report(why.str().c_str(), 0.0, false, nullptr);
+      report("FAILED (no feasible allocation within the seed growth; OSQP said \"" +
+                 (last_status.empty() ? std::string("unknown") : last_status) + "\")",
+             nullptr);
       return false;
     }
   }
 
-  nlopt::opt optimizer(nlopt::LN_BOBYQA, S);
-  optimizer.set_min_objective(corridorTimeObjective, &ctx);
-  optimizer.set_lower_bounds(std::vector<double>(S, kMinSegmentTime));
-  optimizer.set_xtol_rel(1e-2);
-  optimizer.set_maxeval(kMaxEvals);
+  // Stage 2: bisect the growth's last step. Growth multiplies every segment by
+  // 1.5, so it can land up to 50% past the shortest feasible allocation. From
+  // rest, stretching every segment by one factor leaves the curve's shape
+  // unchanged and only scales its derivatives down, so feasibility is monotone
+  // in the factor and the bracket [previous step, this step] holds exactly one
+  // switch. With a moving start the fixed start velocity breaks the scaling
+  // slightly, so the switch is only approximately single — harmless, since `hi`
+  // is always an allocation the QP accepted and a wrongly-rejected midpoint only
+  // leaves the result a little longer. Only possible when growth ran (grow > 0),
+  // which is what supplies the infeasible end.
+  if (grow > 0) {
+    const auto t_bisect = std::chrono::steady_clock::now();
+    const std::vector<double> base = times;  // feasible, at factor 1
+    double lo = 1.0 / 1.5;                   // infeasible (the previous growth step)
+    double hi = 1.0;
+    std::vector<double> trial(S);
+    while ((hi - lo) / lo > kBisectGap) {
+      if (!withinBudget()) {
+        budget_hit = true;
+        break;
+      }
+      const double mid = 0.5 * (lo + hi);
+      for (int s = 0; s < S; ++s) trial[s] = base[s] * mid;
+      ++bisect_solves;
+      if (trySolve(trial)) {
+        hi = mid;
+      } else {
+        lo = mid;
+      }
+    }
+    for (int s = 0; s < S; ++s) times[s] = base[s] * hi;
+    bisect_gap = (hi - lo) / lo;
+    bisect_time = since(t_bisect);
+  }
+  bisected_total = sum(times);
 
-  // Whatever is left of the time budget after seed growth bounds the search.
-  if (time_budget_ > 0.0) {
-    const double remaining = time_budget_ - elapsed();
-    if (remaining <= 0.0) {
-      budget_hit = true;
-    } else {
-      optimizer.set_maxtime(remaining);
+  // Stage 3: per-group cuts. Uniform scaling makes every segment wait for the
+  // tightest one, so segments with slack — typically the straights either side
+  // of a corner — are left slower than they need to be. Cutting a segment on its
+  // own puts a speed step at both its joints, which the jerk limit often
+  // refuses even when cutting its neighbours with it would pass, so segments
+  // that turn alike are cut together (see groupSegments). A group's two end
+  // segments take only group_edge_factor_ of the cut, easing the speed change
+  // into its neighbours. Two passes, the full cut then half of it, each over
+  // every group, longest (in time) first so a budget cut-off drops the least
+  // valuable tries. Every try re-solves the whole trajectory, so a kept cut can
+  // never be broken by a later one.
+  if (!budget_hit && group_cut_ > 0.0) {
+    groups = groupSegments(waypoints, kGroupStraightAngle, kGroupTurnTolerance,
+                           kGroupAxisTolerance);
+    std::vector<double> trial(S);
+    for (const double cut : {group_cut_, 0.5 * group_cut_}) {
+      if (budget_hit) break;
+      PassLog log;
+      log.cut = cut;
+      log.before = sum(times);
+      const auto t_pass = std::chrono::steady_clock::now();
+      std::vector<int> order(groups.size());
+      std::vector<double> group_time(groups.size(), 0.0);
+      for (size_t g = 0; g < groups.size(); ++g) {
+        order[g] = static_cast<int>(g);
+        for (int s = groups[g].first; s <= groups[g].second; ++s) group_time[g] += times[s];
+      }
+      std::stable_sort(order.begin(), order.end(),
+                       [&](int a, int b) { return group_time[a] > group_time[b]; });
+      for (const int g : order) {
+        if (!withinBudget()) {
+          budget_hit = true;
+          break;
+        }
+        trial = times;
+        const auto [first, last] = groups[g];
+        for (int s = first; s <= last; ++s) {
+          const bool edge = s == first || s == last;
+          const double frac = edge ? group_edge_factor_ * cut : cut;
+          trial[s] = std::max(kMinSegmentTime, times[s] * (1.0 - frac));
+        }
+        ++log.tried;
+        if (trySolve(trial)) {
+          times = trial;
+          ++log.accepted;
+        }
+      }
+      log.after = sum(times);
+      log.time = since(t_pass);
+      passes.push_back(log);
     }
   }
 
-  double min_cost = 0.0;
-  ctx.search_start = std::chrono::steady_clock::now();
-  try {
-    // nlopt leaves the best point it evaluated in `times` on every positive
-    // result, MAXTIME_REACHED included.
-    if (!budget_hit) budget_hit = optimizer.optimize(times, min_cost) == nlopt::MAXTIME_REACHED;
-    if (budget_hit) {
-      DRONE_LOG_INFO("[corridor-qp] time search stopped at its " << time_budget_
-                     << " s budget (" << elapsed() << " s spent over " << S
-                     << " segments) — using the best allocation found so far");
-    }
-  } catch (const std::exception& e) {
-    // BOBYQA trouble is not fatal: fall through and try the QP at whatever
-    // times we have (the seed if it never improved).
-    DRONE_LOG_INFO("[corridor-qp] time search failed (" << e.what()
-                   << "), using current allocation");
-  }
-
-  search_time =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - ctx.search_start).count();
-  searched_total = sum(times);
-
-  // Final solve at the chosen allocation. The search started feasible, but
-  // BOBYQA returns its lowest evaluated point, which can sit just inside the
-  // infeasible boundary; retry once with a modest stretch before giving up.
-  const auto t_final = std::chrono::steady_clock::now();
-  const auto finalTime = [&t_final]() {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_final).count();
-  };
-  if (solveQP(start, waypoints.back(), times, regions, out, &final_snap, pin, &waypoints,
-              &final_path)) {
-    report("OK", finalTime(), false, &out);
-    return true;
-  }
-  for (double& t : times) t *= 1.5;
-  const bool ok = solveQP(start, waypoints.back(), times, regions, out, &final_snap, pin,
-                          &waypoints, &final_path);
-  report(ok ? "OK" : "FAILED (final solve infeasible)", finalTime(), true, ok ? &out : nullptr);
-  return ok;
+  out = best;
+  report("OK", &out);
+  return true;
 }
 
 }  // namespace drone_core::planning

@@ -135,8 +135,10 @@ passed in by mistake. If you need a genuine measured acceleration, do not use th
   Because a Bézier curve lies inside the convex hull of its control points, bounding those points
   bounds the whole curve — the guarantee holds everywhere, not just at sampled instants. Interior
   waypoints are deliberately *not* pinned, so the trajectory is free to cut corners anywhere inside
-  its corridor. An outer BOBYQA loop searches the segment times, scoring an infeasible QP as a large
-  penalty so it is pushed back toward feasibility. Everything is written against a **clearance
+  its corridor. An outer loop searches the segment times for the shortest feasible duration: a
+  generous seed grown until the QP accepts it, a bisection of one scale factor for all segments, then
+  cuts to groups of segments that turn alike (straights, arcs), each kept only if the QP still accepts
+  it. Everything is written against a **clearance
   oracle** (`CorridorClearanceFn`, the same shape as the planner's `ClearanceFn`) rather than against
   octomap directly, so region growth and truncation are unit-tested with analytic data. Any stage
   failing stages **nothing** — no trajectory is handed to the tracker, which rides out what it has
@@ -443,7 +445,7 @@ marked ⚑ and listed again at the end of this section.
 
 | Parameter | Type / default | What it does |
 |---|---|---|
-| `STALE_TIMEOUT` | double, `2.0` s | How long after a trajectory's *arrival* the tracker keeps tracking it before falling to `kHoverHold`. Guards against a dead planner, not a stale map. |
+| `STALE_TIMEOUT` | double, `3.0` s | How long after a trajectory's *arrival* the tracker keeps tracking it before falling to `kHoverHold`. Guards against a dead planner, not a stale map. |
 | `MAX_TRACKING_ERROR` | double, `1.0` m | If the vehicle gets further than this from the trajectory's reference, it gives up on that trajectory: it holds its current position, drops anything planned against the old reference, and the planner searches again and generates a new trajectory from there, starting at rest. Latched — it never resumes the abandoned trajectory. Catches what `STALE_TIMEOUT` cannot: guidance still arriving on time while the vehicle has been knocked off course. Logged as `[track] vehicle … m from the trajectory reference`. During a preset it holds until the preset's scheduled end, then returns to `POS_SP` (presets are never replanned). `≤ 0` disables. |
 | `BENCH_TEST_REPLAN_DISABLER` | bool, `false` | **Bench only.** Every replan starts at rest from the drone's measured position instead of splicing onto where the current trajectory says the drone should be by now. On a disarmed bench nothing flies the trajectory, so without this each replan starts further along it and the trajectory shrinks to nothing within its own duration. **Never fly with it on**: every replan would restart from zero velocity, a stutter every `TRAJGEN_PERIOD`. The node warns every 2 s if it is on while the controller is engaged. |
 | `SENSOR_TIMEOUT` | double, `0.5` s | A stream counts as healthy if it produced a sample within this window. Drives both guards below. |
@@ -467,7 +469,7 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 | `RRT_SOLVE_TIME` | double, `1.0` s | Optimisation budget per solve. All the planners are anytime, so this is a direct quality/latency dial. |
 | `REPLAN_IMPROVE_RATIO` | double, `0.85` | Hysteresis gate: adopt an improvement only if its cost ≤ ratio × the committed path's **remaining** cost from the drone's current position. Prevents replan chatter. |
 | `BEST_EFFORT_GOAL` | bool, `true` | Accept a path that stops short of an unreachable goal (closest reachable point) instead of reporting failure, and keep advancing the endpoint as the map grows. |
-| `TRAJGEN_PERIOD` | double, `1.0` s | Trajectory-generation cadence; each run re-anchors onto the outgoing trajectory. |
+| `TRAJGEN_PERIOD` | double, `1.25` s | Trajectory-generation cadence, start to start; each run re-anchors onto the outgoing trajectory. Keep it above `TRAJ_SOLVE_BUDGET` so a solve finishes before the next is due. |
 
 ### Cost shaping
 
@@ -489,8 +491,10 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 | `CORRIDOR_MARGIN` | double, `0.4` m | Clearance the corridor *regions* keep from obstacles. A strictly harder test than the planner's own check — it must hold over a whole 3D volume, not just a centreline. **This is the clearance you actually fly with**, so weigh it against the airframe's half-width. First suspect when a decomposition fails. |
 | `MAX_SEGMENT_LEN` | double, `2.0` m | Corridor resample cap; one convex region per piece. Lowering it is the lever against convex over-conservatism, but costs QP size — and needs `CORRIDOR_BBOX` pinned or you lose in region width what you gain in length. |
 | `CORRIDOR_BBOX` | double[3], `[1, 2, 2]` | Minimum usable half-extents of the region-growth window, in the **segment-aligned** frame (0 = along-track, 1/2 = lateral) — a floor, not a literal size. Exists to decouple window size from `MAX_SEGMENT_LEN`. All zeros restores purely derived behaviour. |
-| `TRAJ_PATH_WEIGHT` | double, `0.0` (off) | How hard the QP pulls the trajectory toward the planned path. The knob against wide, corner-cutting turns: the QP otherwise scores smoothness alone, so inside a roomy corridor the widest turn is the cheapest one and only the corridor holds the curve near the plan. Going faster cannot fix it — the same curve is simply flown faster. Soft, so unlike hard waypoint pinning it can never make a feasible corridor infeasible, and it leaves tight scenery its full set of options. Weighted by segment length, so the weight keeps one meaning however finely the corridor happens to be split. Try 20-100; the unit test's L-corner goes from 0.30 m to 0.19 m of deviation at 50. |
-| `TRAJ_SOLVE_BUDGET` | double, `1.0` s | Wall-clock cap on the QP's time-allocation search. When it runs out the best allocation found so far is used — feasible, just slower. Covers the QP only, not truncation or corridor building. `<= 0` = unlimited. |
+| `TRAJ_PATH_WEIGHT` | double, `0.5` | How hard the QP pulls the trajectory toward the planned path. The knob against wide, corner-cutting turns: the QP otherwise scores smoothness alone, so inside a roomy corridor the widest turn is the cheapest one and only the corridor holds the curve near the plan. Going faster cannot fix it — the same curve is simply flown faster. Soft, so unlike hard waypoint pinning it can never make a feasible corridor infeasible, and it leaves tight scenery its full set of options. Weighted by segment length, so the weight keeps one meaning however finely the corridor happens to be split. Try 20-100; the unit test's L-corner goes from 0.30 m to 0.19 m of deviation at 50. |
+| `TRAJ_SOLVE_BUDGET` | double, `1.0` s | Wall-clock cap on the QP's time-allocation search. When it runs out the last accepted allocation is used — feasible, just slower. Covers the QP only, not truncation or corridor building. `<= 0` = unlimited. |
+| `TRAJ_GROUP_CUT` | double, `0.25` | Last stage of the time search. Segments are grouped by how the path turns (a straight, an arc of steady turning; a corner starts a new group), and each group's middle segments are tried with their times cut by this fraction, its two end segments by `TRAJ_GROUP_EDGE_FACTOR` of it. Then all groups again at half the cut. A cut is kept only if the whole trajectory stays feasible. `<= 0` disables. |
+| `TRAJ_GROUP_EDGE_FACTOR` | double, `0.6` | Share of `TRAJ_GROUP_CUT` applied to a group's two end segments, easing the change of speed into the neighbouring groups. |
 
 ### Debug
 

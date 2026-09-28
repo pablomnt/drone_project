@@ -399,17 +399,19 @@ Module roles:
   time allocation, "mode A" of ETH's mav_trajectory_generation). The optimizer emits a `Trajectory`
   of **per-segment polynomial coefficients + durations** (not sampled points) so the flatness mapper
   can differentiate it analytically.
-  **The `[corridor-qp]` debug line reports the objective's split (NOT yet run on bench).** It ends
-  `cost: snap A [+ path B] + time C = D (N% time)`, recomputed from the solution rather than read off
-  OSQP's `obj_val` (which lumps snap and path together and omits the path term's dropped constant).
-  This is the number that says which term the time search is actually fighting: on the 2026-09-25
-  bench it read **99.7-99.98% time**, i.e. snap is negligible at multi-second durations and BOBYQA is
-  doing near-pure time minimisation and *still* landing at 7.6 s for 5.6 m. So a slow trajectory is
-  not the time penalty being too weak — `kTimePenalty` is already winning ~5000:1 — it is BOBYQA
-  being a poor fit for a linear objective with a feasibility cliff, starting from an overshot seed
-  and running out of `TRAJ_SOLVE_BUDGET` mid-descent. The candidate fix (not implemented) is to
-  bisect a uniform scale factor onto the feasibility boundary first, then let BOBYQA redistribute
-  time between segments with whatever budget is left.
+  **The time search no longer uses BOBYQA (replaced 2026-09-28, NOT yet run on bench).** On the
+  2026-09-25/28 benches its objective was 99.7-99.98% time term, i.e. near-pure time minimisation
+  against a feasibility cliff, and its 2n+1-evaluation probe alone ate 0.15-0.7 s, so under the
+  budget it mostly returned the seed growth's overshot allocation. The search is now: grow the seed
+  x1.5 until feasible; bisect one scale factor for all segments between the last infeasible and first
+  feasible step (from rest the curve's shape is scale-invariant, so feasibility is monotone in it;
+  approximately so with a moving start); then cut groups of alike-turning segments
+  (`TRAJ_GROUP_CUT`, `TRAJ_GROUP_EDGE_FACTOR`), full cut then half, keeping each the QP accepts. Every
+  stage only keeps accepted allocations, so the last accepted solve is the result — no final re-solve.
+  The `[corridor-qp]` line reports each stage (bisect bracket, the groups, each cut pass's accepted/
+  tried and duration before/after) and ends `cost: snap A [+ path B]`; there is no time penalty.
+  A scratch zigzag corridor: growth 22.95 s, bisection 21.04 s in 2 solves (36 ms), BOBYQA unbudgeted
+  only 20.93 s after another 0.56 s.
 
   **Corridor-QP trajectory generation (Stage 1, gated by `USE_CORRIDOR_QP`)** replaces plain
   min-snap with a provably collision-free pipeline over a **dual map view** (see `setMap`): the
@@ -453,8 +455,8 @@ Module roles:
   solves degree-7 min-snap as an **OSQP QP** — monomial coefficients (same snap `Q`), C0–C4
   continuity, rest-to-rest ends, Bézier control points of position confined to the regions and of
   vel/acc/jerk within per-axis `VMAX/AMAX/JMAX` (hull property ⇒ the whole curve complies; solved in
-  per-segment normalized time or OSQP stalls on conditioning), plus a feasibility-aware BOBYQA time
-  search (infeasible ⇒ flat penalty; velocity-consistent seed grown until feasible).
+  per-segment normalized time or OSQP stalls on conditioning), plus an outer time search
+  (velocity-consistent seed grown until feasible, bisected, then per-group cuts; see above).
 
   **Failure stages nothing — there is no min-snap fallback under `USE_CORRIDOR_QP`.** Any corridor
   failure (empty truncation, decomposition rejected, QP infeasible) makes `runTrajgen` return false,
@@ -1211,14 +1213,22 @@ publish nothing and cost nothing when the flag is off:
   unknown space (the truncation margin against the conservative EDT). Enforced exactly as set; a
   committed point must still have strictly positive clearance whatever the value, so the prefix can
   never reach into an occupied or unknown voxel.
-- `TRAJ_SOLVE_BUDGET` (double, default `1.0` s) — wall-clock budget for the corridor QP's BOBYQA
-  time-allocation search, counted from the start of `optimizeTrajectory` (seed growth included). When
-  it runs out the best allocation evaluated so far is used — feasible by construction, just slower —
-  and `[corridor-qp] time search stopped at its ... budget` is logged. Seed growth is never cut short
-  (nothing feasible to fall back on yet), and the budget is checked between QP solves, so a call can
-  overrun by one solve plus the final solve. Truncation and corridor building are not counted.
-  `<= 0` = unlimited. NOT yet tried on bench.
-- `TRAJ_PATH_WEIGHT` (double, default `0.0` = off) — how hard the corridor QP pulls the trajectory
+- `TRAJ_SOLVE_BUDGET` (double, default `1.0` s) — wall-clock budget for the corridor QP's
+  time-allocation search, counted from the start of `optimizeTrajectory` and shared by growth,
+  bisection and the group cuts. When it runs out the last accepted allocation is used — feasible by
+  construction, just slower — and `[budget hit]` appears in the `[corridor-qp]` line. Seed growth is
+  never cut short (nothing feasible to fall back on yet), and the budget is checked before each QP
+  solve, so a call can overrun by one solve. Truncation and corridor building are not counted.
+  `<= 0` = unlimited. Must stay below `TRAJGEN_PERIOD` (1.25 s).
+- `TRAJ_GROUP_CUT` (double, default `0.25`) / `TRAJ_GROUP_EDGE_FACTOR` (default `0.6`) — the time
+  search's last stage. Segments are grouped at their joints: straight joints (≤ 10°, direction
+  ignored) continue a group; a turning joint continues one only if the joint before it turned the
+  same (±10°, axis within 30°), i.e. an arc; anything else starts a new group, so a corner separates
+  two straight groups. Each group is tried with middle segments cut by the fraction and end segments
+  by edge-factor × it, then all again at half; kept only if the QP accepts the whole trajectory.
+  Grouping exists because cutting one segment alone steps the speed at both its joints and the jerk
+  limit refuses it even where cutting its neighbours too would pass. NOT yet tried on bench.
+- `TRAJ_PATH_WEIGHT` (double, default `0.5`; `0` = off) — how hard the corridor QP pulls the trajectory
   toward the geometric path. **The knob against wide, corner-cutting turns**, and the reason one is
   needed: the QP scores snap and nothing else, so within a roomy corridor the cheapest curve is the
   widest one, and the corridor is the *only* thing holding the trajectory near the plan. Shortening
@@ -1269,8 +1279,8 @@ publish nothing and cost nothing when the flag is off:
 - `MAX_SEGMENT_LEN` (double, default `2.0` m) — corridor resample cap; one free region per piece.
   **Lowering this is the lever against convex over-conservatism**: a region spanning a long segment
   gets a plane cut across its *entire* length by one obstacle near the middle, so shorter segments
-  recover free volume next to complex geometry. Costs `S`: the QP is `24·S` variables and BOBYQA
-  searches in `S` dimensions. Do not lower it without pinning `CORRIDOR_BBOX` (below), or you give
+  recover free volume next to complex geometry. Costs `S`: the QP is `24·S` variables, and every
+  solve in the time search gets slower with it. Do not lower it without pinning `CORRIDOR_BBOX` (below), or you give
   back in region width what you gained in region length. Note the first segment is additionally split
   at `ESCAPE_RAMP_DIST` for the start relaxation, so the true segment count can exceed
   `ceil(L / MAX_SEGMENT_LEN)`.
@@ -1395,9 +1405,9 @@ broadcasts `body→camera_link` (see *Frames & TF* above). Re-apply it if you re
    every bench solve on 2026-09-17 hit the budget (4-5 regions) and came out slow: 10.6 s for 4.25 m,
    16.6 s for 4.9 m (bridged). The seed starts long (len/vmax + 0.5 s per segment, then a uniform 1.5x
    stretch until feasible) and BOBYQA only shortens it from there, so a cut search leaves it near the
-   seed. If this holds up, change how segment times are searched so a fast allocation is reached
-   sooner (e.g. per-segment stretching of only the infeasible segments, a tighter seed, or shrinking
-   from feasible). Also check nothing stale gets staged: with ~1.05 s solves the gap between staged
+   seed. **Addressed 2026-09-28 (not yet benched):** BOBYQA replaced by bisection + per-group cuts
+   (see the corridor-QP notes), `TRAJGEN_PERIOD` raised to 1.25 s and `STALE_TIMEOUT` to 3 s. The
+   splice lead is still capped at `kLeadMax` = 0.5 s, below ~1 s solves — to revisit. Also check nothing stale gets staged: with ~1.05 s solves the gap between staged
    trajectories was 2.04-2.08 s even on ticks with no search, just over `STALE_TIMEOUT` (2 s), so in
    flight the tracker would drop into hover-hold between replans.
 2. **Planning stalls for tens of seconds.** On the same bench run the geometric search took 30.9 s,

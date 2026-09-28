@@ -155,6 +155,12 @@ public:
     // slow search yields a slower trajectory rather than a late one. Covers
     // the QP only, not truncation or corridor building. <= 0 = unlimited.
     double traj_solve_budget{1.0};
+    // Stage-3 group cuts of the corridor QP's time search: the fraction cut
+    // from the middle segments of each group of alike-turning segments, and the
+    // share of it applied to a group's end segments. <= 0 cut disables the stage.
+    // See CorridorTrajectoryOptimizer::setGroupCut.
+    double traj_group_cut{0.25};
+    double traj_group_edge_factor{0.6};
     // How hard the corridor QP pulls the trajectory toward the geometric path.
     // 0 (the default) is pure minimum-snap, which rounds corners as widely as
     // the regions allow; raising it trades smoothness for directness without

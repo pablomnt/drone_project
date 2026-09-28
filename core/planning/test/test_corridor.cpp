@@ -315,7 +315,7 @@ int main() {
     }
   }
 
-  // Outer BOBYQA time search from the velocity-consistent seed.
+  // Outer time search (growth, bisection, group cuts) from the velocity-consistent seed.
   {
     Trajectory opt_traj;
     if (!opt.optimizeTrajectory({start, corner, goal}, regions, opt_traj)) {
@@ -337,21 +337,34 @@ int main() {
   }
 
   // A time budget that runs out immediately still yields a feasible trajectory:
-  // the search is skipped and the feasible seed is used, which is slower than
-  // the unbudgeted result but never infeasible.
+  // bisection and group cuts are skipped and the grown seed is used, which is
+  // slower than the unbudgeted result but never infeasible. On a zigzag rather
+  // than the L above: there the grown seed (7.5 s) is already within 1% of the
+  // optimum, so there is nothing for the search to find and nothing to compare.
   {
+    std::vector<Eigen::Vector3d> zig = {{0, 0, 1}};
+    std::vector<ConvexRegion> zig_regions;
+    for (int i = 0; i < 6; ++i) {
+      const Eigen::Vector3d a = zig.back();
+      const Eigen::Vector3d b = a + (i % 2 == 0 ? Eigen::Vector3d(1.2, 0, 0)
+                                                : Eigen::Vector3d(0, 1.2, 0));
+      const Eigen::Vector3d pad(0.3, 0.3, 0.3);
+      zig_regions.push_back(boxRegion(a.cwiseMin(b) - pad, a.cwiseMax(b) + pad));
+      zig.push_back(b);
+    }
     CorridorTrajectoryOptimizer budgeted(limits);
     budgeted.setTimeBudget(1e-9);
     Trajectory full, cut;
-    if (!opt.optimizeTrajectory({start, corner, goal}, regions, full) ||
-        !budgeted.optimizeTrajectory({start, corner, goal}, regions, cut)) {
+    if (!opt.optimizeTrajectory(zig, zig_regions, full) ||
+        !budgeted.optimizeTrajectory(zig, zig_regions, cut)) {
       std::cerr << "FAIL: exhausted time budget produced no trajectory\n";
       ++failures;
     } else {
-      failures += checkTrajectory(cut, restAt(start), goal, regions, limits, "budget-exhausted");
-      // Strictly slower here: the seed (7.5 s after one growth step) is not the
-      // optimum (~7.45 s), so an equal duration means the budget was ignored.
-      if (cut.total_duration < full.total_duration + 0.02) {
+      failures += checkTrajectory(cut, restAt(zig.front()), zig.back(), zig_regions, limits,
+                                  "budget-exhausted");
+      // The grown seed is 22.95 s here and the search reaches ~21 s, so an equal
+      // duration means the budget was ignored.
+      if (cut.total_duration < full.total_duration + 0.5) {
         std::cerr << "FAIL: budget-cut duration " << cut.total_duration
                   << "s not slower than the full search's " << full.total_duration
                   << "s — was the search actually stopped?\n";
