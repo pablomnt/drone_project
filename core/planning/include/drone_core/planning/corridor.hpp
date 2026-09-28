@@ -149,15 +149,21 @@ std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& pa
 // everywhere). Clearance must always be strictly positive regardless, so the
 // prefix can never enter an occupied or unknown voxel.
 //
-// The ramp is floored at the start's own clearance less `start_floor_slack`,
-// and the result capped at `margin`:
-//   required = min(margin, max(clearance(start) - slack, ramp))
+// The ramp is floored at the start's own clearance less a tolerance, and the
+// result capped at `margin`:
+//   floor    = clearance(start) - max(start_floor_slack, start_floor_rel * clearance(start))
+//   required = min(margin, max(floor, ramp))
 // so leniency near the start only ever lets the drone move AWAY from what it is
-// already too close to, never closer. Without the floor a start 0.2 m from a
-// wall could head straight at it until clearance fell below the rising ramp.
-// The slack absorbs the field's quantisation (the host passes half a voxel).
-// This matches the planner's validity check and the corridor's first-region
-// shrink, which already cannot go below the drone's own slack.
+// already too close to, never (materially) closer. Without the floor a start
+// 0.2 m from a wall could head straight at it until clearance fell below the
+// rising ramp. The tolerance is whichever of the absolute and the relative one
+// is more lenient. The absolute one absorbs the field's quantisation: the host
+// passes one voxel, since the drone's reading can jump by more than half a
+// voxel when it moves a single cell (bench 2026-09-28: 0.5 vs 0.4743 on
+// alternate ticks, cutting the path at 0.25 m then committing it whole). The
+// relative one keeps truncation looser than the planner's own floor by the same
+// fraction as its margin (the host passes kTruncationTolerance), so a path the
+// search accepted is not cut near the drone.
 //
 // `is_unknown`, when supplied, is an ABSOLUTE stop: the prefix is cut before the
 // first sample lying in space that has never been observed, whatever the
@@ -188,6 +194,8 @@ struct TruncationCut {
   double from_start = 0.0;        // straight-line distance from path.front() [m]
   double clearance = 0.0;         // conservative clearance at `point` [m]
   double required = 0.0;          // ramped, floored margin required at `point` [m]
+  double root_clearance = 0.0;    // conservative clearance at path.front() [m]
+  double floor = 0.0;             // the floor that root clearance gave [m]
 };
 std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservative_clearance,
                                           const std::vector<Eigen::Vector3d>& path,
@@ -195,7 +203,8 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
                                           double sample_step = 0.05,
                                           const CorridorUnknownFn& is_unknown = {},
                                           TruncationCut* cut = nullptr,
-                                          double start_floor_slack = 0.0);
+                                          double start_floor_slack = 0.0,
+                                          double start_floor_rel = 0.0);
 
 // Full corridor for a path: resample to the segment cap, then grow one convex
 // free region per segment via DecompUtil's ellipsoid decomposition against the

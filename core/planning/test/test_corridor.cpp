@@ -1109,26 +1109,57 @@ int main() {
     }
   }
 
-  // The ramp is floored at the start's own clearance: from 0.2 m off a wall a
-  // path straight at it is cut at once (the bare ramp let it reach ~0.07 m),
-  // while one sliding along it at constant clearance commits until the ramp
-  // itself overtakes 0.2 m.
+  // The ramp is floored at the start's own clearance less the more lenient of a
+  // slack (one voxel here, as the host passes) and a fraction of it: from 0.2 m
+  // off a wall a path straight at it stops within the slack (the bare ramp let
+  // it reach ~0.07 m), while one sliding along it at constant clearance commits
+  // until the ramp itself overtakes 0.2 m.
   {
     const drone_core::planning::CorridorClearanceFn wall = [](double x, double, double) {
       return std::max(0.0, 2.0 - x);
     };
-    const auto toward = drone_core::planning::truncatePath(wall, {{1.8, 0, 1}, {2.5, 0, 1}}, 0.5,
-                                                           1.0, 0.05, {}, nullptr, 0.025);
-    if (toward.size() >= 2 && wall(toward.back().x(), 0, 1) < 0.2 - 0.025 - kTol) {
+    const auto toward = drone_core::planning::truncatePath(
+        wall, {{1.8, 0, 1}, {2.5, 0, 1}}, 0.5, 1.0, 0.05, {}, nullptr, 0.05, 0.05);
+    if (toward.size() >= 2 && wall(toward.back().x(), 0, 1) < 0.2 - 0.05 - kTol) {
       std::cerr << "FAIL: truncation let a close start approach the wall (clearance "
                 << wall(toward.back().x(), 0, 1) << ")\n";
       ++failures;
     }
-    const auto along = drone_core::planning::truncatePath(wall, {{1.8, 0, 1}, {1.8, 3, 1}}, 0.5,
-                                                          1.0, 0.05, {}, nullptr, 0.025);
+    const auto along = drone_core::planning::truncatePath(
+        wall, {{1.8, 0, 1}, {1.8, 3, 1}}, 0.5, 1.0, 0.05, {}, nullptr, 0.05, 0.05);
     if (along.size() < 2 || std::abs(along.back().y() - 0.4) > 0.06) {
       std::cerr << "FAIL: slide along a close wall cut wrong (end y="
                 << (along.size() >= 2 ? along.back().y() : -1.0) << ")\n";
+      ++failures;
+    }
+
+    // The bench case (2026-09-28): the drone reads 0.5 and the path dips to
+    // 0.4743 about 0.3 m out, i.e. the next value on the 5 cm distance grid. A
+    // half-voxel slack put the floor at 0.475 and cut it — then committed it
+    // whole on the ticks VIO jitter moved the drone into a 0.4743 cell. One
+    // voxel keeps it committed either way.
+    // It then bears away from the wall, so only the floor near the root decides.
+    const std::vector<Eigen::Vector3d> dip = {{1.5, 0, 1}, {1.5257, 0.296, 1}, {1.2, 1.0, 1},
+                                              {1.2, 2, 1}};
+    for (const double root_x : {1.5, 1.5257}) {
+      std::vector<Eigen::Vector3d> p = dip;
+      p.front().x() = root_x;
+      const auto t = drone_core::planning::truncatePath(wall, p, 0.475, 1.0, 0.05, {}, nullptr,
+                                                        0.05, 0.05);
+      if (t.size() < 2 || (t.back() - p.back()).norm() > kTol) {
+        std::cerr << "FAIL: a 2.6 cm dip below a " << wall(root_x, 0, 1)
+                  << " m root was cut — one grid step flips the result\n";
+        ++failures;
+      }
+    }
+
+    // Far from the wall the relative tolerance is the more lenient one: from
+    // 1.5 m (margin 2.0) the floor is 1.5 - max(0.05, 5% = 0.075) = 1.425.
+    const auto rel = drone_core::planning::truncatePath(
+        wall, {{0.5, 0, 1}, {0.6, 0, 1}}, 2.0, 1.0, 0.01, {}, nullptr, 0.05, 0.05);
+    if (rel.size() < 2 || std::abs(wall(rel.back().x(), 0, 1) - 1.43) > 0.011) {
+      std::cerr << "FAIL: relative floor tolerance not applied (end clearance "
+                << (rel.size() >= 2 ? wall(rel.back().x(), 0, 1) : -1.0) << ", want ~1.43)\n";
       ++failures;
     }
   }

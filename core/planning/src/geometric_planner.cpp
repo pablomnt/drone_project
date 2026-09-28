@@ -128,8 +128,11 @@ void GeometricPlanner::anchorStart(double x, double y, double z) const {
   start_pos_ = {x, y, z};
   // The start's clearance less half a voxel: the EDT reports cell-to-cell
   // distances, so sliding along a wall that is not axis-aligned reads a few
-  // centimetres of jitter that is quantisation, not approach. Without a field
-  // (standalone octree fallback) there is no clearance to floor at, and 0
+  // centimetres of jitter that is quantisation, not approach. Deliberately
+  // tighter than truncation's floor (one voxel or 5% of the clearance,
+  // whichever is more lenient; see truncatePath), so the search stays the
+  // stricter stage and a path it accepts is not cut near the drone. Without a
+  // field (standalone octree fallback) there is no clearance to floor at, and 0
   // leaves the plain ramp.
   start_floor_ = 0.0;
   if (clearance_fn_) {

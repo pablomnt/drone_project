@@ -1272,6 +1272,15 @@ publish nothing and cost nothing when the flag is off:
   2.47 m path). A longer ramp commits further before demanding full clearance. `<= 0` disables the
   ramp entirely. Clearance must still be strictly positive everywhere, so leniency near the start is
   never blindness — the prefix cannot enter an occupied or unknown voxel at any setting.
+  **The ramp is floored at the root's own clearance** (2026-09-28), so a drone already too close can
+  move away but not closer: `required = min(margin, max(floor, ramp))`. The search's floor is the
+  start's clearance less half a voxel; truncation's is the root's less the more lenient of one voxel
+  and 5% (`kTruncationTolerance`), keeping the search the stricter stage. Half a voxel in truncation
+  made the bench flip between cutting a path at 0.25 m and committing all 7.5 m on alternate ticks:
+  the drone's reading jumped between the neighbouring grid values 0.5 and 0.4743 with VIO jitter, and
+  the path's 0.4743 sat between the two floors. The two stages measure on different maps (optimistic
+  vs conservative), so "search is stricter" only holds exactly where the nearest hazard is a real
+  obstacle. The truncation cut line logs the root's clearance and the floor it gave.
   **Also drives the corridor's start relaxation**: `buildCorridor` splits the first segment here, so
   this one number is where "the vehicle is a special case" ends for both stages. `<= 0` disables the
   relaxation too (uniform `CORRIDOR_MARGIN` everywhere, and a drone closer than that to anything

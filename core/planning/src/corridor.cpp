@@ -263,15 +263,17 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
                                           double margin, double escape_ramp,
                                           double sample_step,
                                           const CorridorUnknownFn& is_unknown,
-                                          TruncationCut* cut, double start_floor_slack) {
+                                          TruncationCut* cut, double start_floor_slack,
+                                          double start_floor_rel) {
   if (cut) *cut = TruncationCut{};
   if (path.size() < 2) return path;
   const Eigen::Vector3d& start = path.front();
-  // Floor under the ramp: the start's own clearance, less the slack. See the
-  // header — it is what stops the ramp from letting a drone that is already
-  // close to something get closer still.
-  const double start_floor =
-      std::max(0.0, conservative_clearance(start.x(), start.y(), start.z()) - start_floor_slack);
+  // Floor under the ramp: the start's own clearance, less the more lenient of
+  // the two tolerances. See the header — it is what stops the ramp from letting
+  // a drone that is already close to something get closer still.
+  const double root_clearance = conservative_clearance(start.x(), start.y(), start.z());
+  const double start_floor = std::max(
+      0.0, root_clearance - std::max(start_floor_slack, start_floor_rel * root_clearance));
   const auto required = [&](double from_start) {
     if (escape_ramp <= 0.0) return margin;  // ramp disabled
     return std::min(margin, std::max(start_floor, margin * std::min(1.0, from_start / escape_ramp)));
@@ -320,6 +322,8 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
           cut->from_start = (q - start).norm();
           cut->clearance = conservative_clearance(q.x(), q.y(), q.z());
           cut->required = required(cut->from_start);
+          cut->root_clearance = root_clearance;
+          cut->floor = start_floor;
         }
         // Cut just before the first unsafe sample. The previous sample is the
         // committed endpoint (unless it duplicates the tail, e.g. an unsafe
