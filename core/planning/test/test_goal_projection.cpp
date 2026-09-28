@@ -178,6 +178,23 @@ int main() {
     }
   }
 
+  // 10. The escape ramp is floored at the start's own clearance: a drone already
+  //     inside the margin may move away or slide along, but never closer. Start
+  //     0.2 m off the wall; the floor is 0.2 less half a voxel (0.05 here).
+  //     Checked with isPathValid, which needs no solve.
+  {
+    GeometricPlanner planner(empty, /*planning_time=*/0.1);
+    planner.setClearance(wall, /*weight=*/1.0, /*threshold=*/1.0);
+    // 0.1 m toward the wall ends at clearance 0.1: the bare ramp asks only 0.05
+    // there, so this passed before the floor.
+    expect(!planner.isPathValid({{1.8, 0.0, 1.0}, {1.9, 0.0, 1.0}}),
+           "a path from 0.2 m off a wall was allowed to approach it");
+    expect(planner.isPathValid({{1.8, 0.0, 1.0}, {0.0, 0.0, 1.0}}),
+           "a path moving away from a close wall was refused");
+    expect(planner.isPathValid({{1.8, 0.0, 1.0}, {1.8, 0.3, 1.0}}),
+           "a short slide along a close wall at constant clearance was refused");
+  }
+
   if (failures == 0) {
     std::cout << "goal_projection: all checks passed\n";
     return 0;

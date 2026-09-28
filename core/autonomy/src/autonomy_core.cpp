@@ -671,7 +671,8 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     const double trunc_margin = cfg_.frontier_margin * (1.0 - kTruncationTolerance);
     const auto committed =
         planning::truncatePath(cons_fn, epath, trunc_margin, cfg_.escape_ramp_dist,
-                               /*sample_step=*/0.05, unknown_fn, &cut);
+                               /*sample_step=*/0.05, unknown_fn, &cut,
+                               /*start_floor_slack=*/0.5 * cons_map->getResolution());
 
     // Why truncation stopped, for both log lines below. The escape ramp is
     // centred on the path root, which the caller has moved to the splice point;
@@ -687,7 +688,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
         os << "clearance " << cut.clearance << " m < required " << cut.required
            << " m (FRONTIER_MARGIN " << cfg_.frontier_margin << " m less "
            << kTruncationTolerance * 100.0 << "% tolerance, ramped over ESCAPE_RAMP_DIST "
-           << cfg_.escape_ramp_dist << " m)";
+           << cfg_.escape_ramp_dist << " m, floored at the root's own clearance)";
       }
       if (root_shift >= 0.0) os << "; root " << root_shift << " m from the search start";
       return os.str();

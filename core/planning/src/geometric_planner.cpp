@@ -124,6 +124,20 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
   si_->setup();
 }
 
+void GeometricPlanner::anchorStart(double x, double y, double z) const {
+  start_pos_ = {x, y, z};
+  // The start's clearance less half a voxel: the EDT reports cell-to-cell
+  // distances, so sliding along a wall that is not axis-aligned reads a few
+  // centimetres of jitter that is quantisation, not approach. Without a field
+  // (standalone octree fallback) there is no clearance to floor at, and 0
+  // leaves the plain ramp.
+  start_floor_ = 0.0;
+  if (clearance_fn_) {
+    const double half_voxel = octree_ptr_ ? 0.5 * octree_ptr_->getResolution() : 0.0;
+    start_floor_ = std::max(0.0, clearance_fn_(x, y, z) - half_voxel);
+  }
+}
+
 bool GeometricPlanner::isStateValid(const ompl::base::State* state) {
   const auto* pos = state->as<ompl::base::RealVectorStateSpace::StateType>();
   return positionValid(pos->values[0], pos->values[1], pos->values[2]);
@@ -138,13 +152,23 @@ bool GeometricPlanner::positionValid(double x, double y, double z) const {
   // for climbing away from an obstacle more slowly than truncation demands (a
   // hard exemption sphere allowed exactly that). The ramp centre (start_pos_) is
   // anchored in planPath / isPathValid.
+  //
+  // The ramp is floored at the start's own clearance (start_floor_, see
+  // anchorStart): a drone already inside the margin may root a path that climbs
+  // away, but not one that brings it any closer to an obstacle than it already
+  // is. Without the floor, a start 0.2 m off a wall could head straight at it
+  // until clearance fell below the rising ramp, ~0.07 m. Capped at the full
+  // margin, so it only ever matters within escape_ramp_ of the start.
   const double ex = x - start_pos_[0];
   const double ey = y - start_pos_[1];
   const double ez = z - start_pos_[2];
   const double from_start = std::sqrt(ex * ex + ey * ey + ez * ez);
   const double margin =
-      escape_ramp_ > 0.0 ? kCollisionMargin * std::min(1.0, from_start / escape_ramp_)
-                         : kCollisionMargin;
+      escape_ramp_ > 0.0
+          ? std::min(kCollisionMargin,
+                     std::max(start_floor_,
+                              kCollisionMargin * std::min(1.0, from_start / escape_ramp_)))
+          : kCollisionMargin;
 
   // Preferred path: a single O(1) clearance lookup when a clearance field is set
   // (the live planner always sets one). The field is the 3D Euclidean distance to
@@ -286,7 +310,7 @@ bool GeometricPlanner::isPathValid(const std::vector<std::vector<double>>& path)
   // Anchor the start-state exemption at the path's first waypoint so a committed
   // path that begins on the floor (the takeoff pose) does not fail this periodic
   // re-check and force a needless replan. Mirrors what planPath exempted.
-  start_pos_ = {path.front()[0], path.front()[1], path.front()[2]};
+  anchorStart(path.front()[0], path.front()[1], path.front()[2]);
 
   auto makeState = [this](const std::vector<double>& p) {
     ompl::base::ScopedState<ompl::base::RealVectorStateSpace> s(space_);
@@ -442,7 +466,7 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
 
   // Anchor the start-state collision exemption at this solve's start. Must
   // precede projectGoal, which validates candidates under the same exemption.
-  start_pos_ = {start_vec[0], start_vec[1], start_vec[2]};
+  anchorStart(start_vec[0], start_vec[1], start_vec[2]);
 
   // Move the goal to the nearest state the collision check accepts, if it does
   // not accept the requested one. OMPL drops invalid goal states inside
@@ -583,7 +607,7 @@ void GeometricPlanner::shortcutClearanceAware(
   // Anchor the start-state collision exemption at the first waypoint, mirroring
   // isPathValid, so a bypass near the takeoff pose is judged with the same
   // relaxed margin the search used (motionValid -> isStateValid reads start_pos_).
-  start_pos_ = {waypoints.front()[0], waypoints.front()[1], waypoints.front()[2]};
+  anchorStart(waypoints.front()[0], waypoints.front()[1], waypoints.front()[2]);
 
   double current = costBreakdown(waypoints).total;
   bool changed = true;

@@ -1062,10 +1062,12 @@ int main() {
     }
 
     // The ramp distance is decoupled from the margin for a reason: ramping over
-    // the margin makes the requirement climb at 1 m/m and it meets the shrinking
-    // clearance almost immediately; ramping over 1 m commits measurably further.
+    // the margin makes the requirement climb at 1 m/m and it meets the slowly
+    // rising clearance almost immediately; ramping over 1 m commits measurably
+    // further. The start sits inside the margin (clearance 0.5) and the path
+    // climbs away at ~0.1 m/m, so neither the floor nor the cap decides it.
     {
-      const std::vector<Eigen::Vector3d> path = {{0, 0.8, 1}, {0, 3, 1}};
+      const std::vector<Eigen::Vector3d> path = {{0, 1.5, 1}, {-4, 1.1, 1}};
       const auto harsh = drone_core::planning::truncatePath(conservative, path,
                                                             frontier_margin, frontier_margin);
       const auto gentle =
@@ -1073,9 +1075,9 @@ int main() {
       if (harsh.size() < 2 || gentle.size() < 2) {
         std::cerr << "FAIL: ramp comparison truncated to nothing\n";
         ++failures;
-      } else if (gentle.back().y() <= harsh.back().y() + kTol) {
+      } else if (gentle.back().x() >= harsh.back().x() - kTol) {
         std::cerr << "FAIL: 1 m ramp did not commit further than a margin-length ramp ("
-                  << gentle.back().y() << " vs " << harsh.back().y() << ")\n";
+                  << gentle.back().x() << " vs " << harsh.back().x() << ")\n";
         ++failures;
       } else if (conservative(gentle.back().x(), gentle.back().y(), 1.0) <= 0.0) {
         std::cerr << "FAIL: gentle ramp committed into occupied/unknown space\n";
@@ -1091,6 +1093,30 @@ int main() {
         std::cerr << "FAIL: escape-ramp start could not root a path\n";
         ++failures;
       }
+    }
+  }
+
+  // The ramp is floored at the start's own clearance: from 0.2 m off a wall a
+  // path straight at it is cut at once (the bare ramp let it reach ~0.07 m),
+  // while one sliding along it at constant clearance commits until the ramp
+  // itself overtakes 0.2 m.
+  {
+    const drone_core::planning::CorridorClearanceFn wall = [](double x, double, double) {
+      return std::max(0.0, 2.0 - x);
+    };
+    const auto toward = drone_core::planning::truncatePath(wall, {{1.8, 0, 1}, {2.5, 0, 1}}, 0.5,
+                                                           1.0, 0.05, {}, nullptr, 0.025);
+    if (toward.size() >= 2 && wall(toward.back().x(), 0, 1) < 0.2 - 0.025 - kTol) {
+      std::cerr << "FAIL: truncation let a close start approach the wall (clearance "
+                << wall(toward.back().x(), 0, 1) << ")\n";
+      ++failures;
+    }
+    const auto along = drone_core::planning::truncatePath(wall, {{1.8, 0, 1}, {1.8, 3, 1}}, 0.5,
+                                                          1.0, 0.05, {}, nullptr, 0.025);
+    if (along.size() < 2 || std::abs(along.back().y() - 0.4) > 0.06) {
+      std::cerr << "FAIL: slide along a close wall cut wrong (end y="
+                << (along.size() >= 2 ? along.back().y() : -1.0) << ")\n";
+      ++failures;
     }
   }
 

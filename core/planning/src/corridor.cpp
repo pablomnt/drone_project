@@ -263,10 +263,19 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
                                           double margin, double escape_ramp,
                                           double sample_step,
                                           const CorridorUnknownFn& is_unknown,
-                                          TruncationCut* cut) {
+                                          TruncationCut* cut, double start_floor_slack) {
   if (cut) *cut = TruncationCut{};
   if (path.size() < 2) return path;
   const Eigen::Vector3d& start = path.front();
+  // Floor under the ramp: the start's own clearance, less the slack. See the
+  // header — it is what stops the ramp from letting a drone that is already
+  // close to something get closer still.
+  const double start_floor =
+      std::max(0.0, conservative_clearance(start.x(), start.y(), start.z()) - start_floor_slack);
+  const auto required = [&](double from_start) {
+    if (escape_ramp <= 0.0) return margin;  // ramp disabled
+    return std::min(margin, std::max(start_floor, margin * std::min(1.0, from_start / escape_ramp)));
+  };
 
   // A sampled point is safe when its conservative clearance covers the required
   // margin, which RAMPS LINEARLY from 0 at the drone to the full margin at
@@ -291,8 +300,7 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
     if (is_unknown && is_unknown(q.x(), q.y(), q.z())) return false;
     const double d = conservative_clearance(q.x(), q.y(), q.z());
     if (d <= 0.0) return false;
-    if (escape_ramp <= 0.0) return d >= margin;  // ramp disabled
-    return d >= margin * std::min(1.0, (q - start).norm() / escape_ramp);
+    return d >= required((q - start).norm());
   };
 
   std::vector<Eigen::Vector3d> out;
@@ -311,9 +319,7 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
           cut->point = q;
           cut->from_start = (q - start).norm();
           cut->clearance = conservative_clearance(q.x(), q.y(), q.z());
-          cut->required = escape_ramp <= 0.0
-                              ? margin
-                              : margin * std::min(1.0, cut->from_start / escape_ramp);
+          cut->required = required(cut->from_start);
         }
         // Cut just before the first unsafe sample. The previous sample is the
         // committed endpoint (unless it duplicates the tail, e.g. an unsafe

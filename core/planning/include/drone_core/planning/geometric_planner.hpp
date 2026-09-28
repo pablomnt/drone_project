@@ -206,9 +206,11 @@ public:
   // Distance [m] over which the validity margin ramps from 0 at the start to
   // the full collision margin (see positionValid). The host passes the same
   // ESCAPE_RAMP_DIST truncatePath uses, so the search and truncation agree on
-  // how much clearance a point near the drone needs. <= 0 disables the ramp
-  // (full margin everywhere, so a drone within the margin of an obstacle cannot
-  // root a path at all).
+  // how much clearance a point near the drone needs. The ramp never drops below
+  // the start's own clearance (less half a voxel), so a path from a drone that
+  // is already too close can move it away but never closer. <= 0 disables the
+  // ramp (full margin everywhere, so a drone within the margin of an obstacle
+  // cannot root a path at all).
   void setEscapeRamp(double dist) { escape_ramp_ = dist; }
 
   // Straight-line distance [m] from the endpoint of the most recent planPath
@@ -403,6 +405,12 @@ private:
   // before each validity sweep, hence mutable so the const isPathValid can
   // anchor it.
   mutable std::array<double, 3> start_pos_{};
+  // Floor under the escape ramp [m]: the start's clearance less half a voxel,
+  // so a path may not approach an obstacle more closely than the start already
+  // does (see positionValid). Cached with start_pos_ since positionValid is hot.
+  mutable double start_floor_ = 0.0;
+  // Set start_pos_ and start_floor_ together. Needs the clearance field set first.
+  void anchorStart(double x, double y, double z) const;
 
   // The validity field: what isStateValid tests against the margin, and what
   // minClearance reports. Null => optimise pure path length with the fallback

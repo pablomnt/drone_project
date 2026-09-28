@@ -149,6 +149,16 @@ std::vector<Eigen::Vector3d> resamplePath(const std::vector<Eigen::Vector3d>& pa
 // everywhere). Clearance must always be strictly positive regardless, so the
 // prefix can never enter an occupied or unknown voxel.
 //
+// The ramp is floored at the start's own clearance less `start_floor_slack`,
+// and the result capped at `margin`:
+//   required = min(margin, max(clearance(start) - slack, ramp))
+// so leniency near the start only ever lets the drone move AWAY from what it is
+// already too close to, never closer. Without the floor a start 0.2 m from a
+// wall could head straight at it until clearance fell below the rising ramp.
+// The slack absorbs the field's quantisation (the host passes half a voxel).
+// This matches the planner's validity check and the corridor's first-region
+// shrink, which already cannot go below the drone's own slack.
+//
 // `is_unknown`, when supplied, is an ABSOLUTE stop: the prefix is cut before the
 // first sample lying in space that has never been observed, whatever the
 // clearance there says and regardless of the escape ramp. This is a genuine hole
@@ -177,14 +187,15 @@ struct TruncationCut {
   Eigen::Vector3d point{0, 0, 0};
   double from_start = 0.0;        // straight-line distance from path.front() [m]
   double clearance = 0.0;         // conservative clearance at `point` [m]
-  double required = 0.0;          // ramped margin required at `point` [m]
+  double required = 0.0;          // ramped, floored margin required at `point` [m]
 };
 std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservative_clearance,
                                           const std::vector<Eigen::Vector3d>& path,
                                           double margin, double escape_ramp = 1.0,
                                           double sample_step = 0.05,
                                           const CorridorUnknownFn& is_unknown = {},
-                                          TruncationCut* cut = nullptr);
+                                          TruncationCut* cut = nullptr,
+                                          double start_floor_slack = 0.0);
 
 // Full corridor for a path: resample to the segment cap, then grow one convex
 // free region per segment via DecompUtil's ellipsoid decomposition against the
