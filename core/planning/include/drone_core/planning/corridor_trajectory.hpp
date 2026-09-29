@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -139,6 +140,13 @@ public:
   // was feasible at once is). The budget is checked
   // before each QP solve, so a call can overrun it by one solve.
   void setTimeBudget(double seconds) { time_budget_ = seconds; }
+
+  // Optional external stop for the same budget checks: while *flag reads true the
+  // search behaves as if its budget had run out and returns the last accepted
+  // allocation — feasible, just slower. Seed growth still runs to a feasible
+  // allocation. The trajectory monitor raises it when the trajectory being flown
+  // turns unsafe mid-solve, so the replacement is ready sooner. Null = none.
+  void setAbortFlag(const std::atomic<bool>* flag) { abort_flag_ = flag; }
   double timeBudget() const { return time_budget_; }
 
   // When on, every optimizeTrajectory call logs one line breaking down where
@@ -191,6 +199,7 @@ public:
 private:
   CorridorLimits limits_;
   double time_budget_ = 0.0;
+  const std::atomic<bool>* abort_flag_ = nullptr;
   double path_weight_ = 0.0;
   double group_cut_ = 0.25;
   double group_edge_factor_ = 0.6;

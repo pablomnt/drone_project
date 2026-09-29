@@ -564,7 +564,10 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   const auto since = [](std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   };
-  const auto withinBudget = [&]() { return time_budget_ <= 0.0 || elapsed() < time_budget_; };
+  const auto withinBudget = [&]() {
+    if (abort_flag_ && abort_flag_->load()) return false;
+    return time_budget_ <= 0.0 || elapsed() < time_budget_;
+  };
   const auto sum = [](const std::vector<double>& v) {
     double t = 0.0;
     for (double x : v) t += x;

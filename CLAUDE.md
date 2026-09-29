@@ -197,8 +197,7 @@ What crosses the two threads, and how:
 - `planOnce()` still runs both stages synchronously on the caller's thread, and still must not be
   used alongside the threads.
 Covered in `test_autonomy_core`: with the improve cadence at the monitor cadence (so a search is
-almost always running) trajgen must keep staging at roughly `trajgen_period` —
-`stagedTrajectoryCount()` is the hook. Mutation-checked by making trajgen wait on `search_running_`.
+almost always running) a trajectory must still get staged — `stagedTrajectoryCount()` is the hook.
 
 **The search loop (geometry-first phase):** ticks at the monitor cadence
 (`rrt_monitor_period`, ~2 Hz). Each tick builds **one** planner and does:
@@ -234,9 +233,51 @@ almost always running) trajgen must keep staging at roughly `trajgen_period` —
   reports the **resolved** map topic and its publisher count: zero publishers means the map source is
   silent (RTAB-Map only emits on motion-gated map-graph updates, so it needs camera motion *and*
   usable odometry), a non-zero count means a QoS or remap mismatch on our side.
-- **Trajectory generation (~1 Hz, `trajgen_period`, on its own thread):** re-anchors min-snap to
-  current position. **Gated by `plan_trajectory` flag** — when false the worker is a pure geometric planner and
-  control stays on `kDirect` / POS_SP.
+- **Trajectory monitor (`TRAJ_MONITOR_RATE`, 5 Hz, own thread) + solver (trajgen thread, on
+  request) — since 2026-09-29, replacing regeneration every `TRAJGEN_PERIOD`; NOT yet benched.** The
+  trajectory being flown is kept until there is a reason to replace it. Each monitor tick:
+  - re-checks the trajectory (and one staged after it, each over the stretch it will be flown)
+    against the current field (`planning::checkTrajectory`): the margins it was built with —
+    `CORRIDOR_MARGIN`, or the relaxed first-segment margin — less one voxel or 5%, samples every 5 cm
+    of travel with half a step subtracted (exact, the field is 1-Lipschitz), never-observed space
+    failing when `TREAT_FRONTIER_AS_OBSTACLE`. Truncation's `FRONTIER_MARGIN` would fail every fresh
+    trajectory (built to `CORRIDOR_MARGIN`, and it cuts corners off the path).
+  - works out the **needs** of what the tracker will fly: `OBSTACLE_EVASION` (the latest trajectory
+    fails that check; a failure in an earlier one's stretch is flown before anything new could engage,
+    so it is left to the emergency stop), `NEW_PLAN` (built for an older committed path —
+    `path_version_`, bumped by `setCommittedPath` — or none staged), `WAYPOINT_ADVANCED` (truncation
+    re-run rooted at the reference, sub-ms, has moved ≥ `TRAJ_EXTEND_DIST`, or at all within
+    `TRAJ_EXTEND_HORIZON` of the end). Unsafe with a point within `EMERGENCY_HORIZON` below
+    `EMERGENCY_FACTOR` × margin → `TrajectoryTracker::emergencyStop` (latched hold, released by the
+    next promoted trajectory) and everything staged/in flight is dropped.
+  - judges a solver result, and re-judges the one in the waiting room, against those needs, each
+    solve carrying a snapshot of the needs it was asked for (`SolveJob`). EVASION on: passes the
+    current-map check → goes through, satisfies EVASION, plus NEW_PLAN if asked for the current plan,
+    plus WAYPOINT if it reaches the advanced stop point (its *truncation* stop point, not its end,
+    which the corridor may pull back). Else NEW_PLAN on: goes through only if asked for the current
+    plan. Else WAYPOINT on: goes through if it reaches the advanced stop point or is better as an
+    improve. Else improve: only if it reaches the current stop point sooner. Always must pass the
+    current-map check. Needs it satisfies switch off; the waiting one is handed over once the previous
+    trajectory has engaged (t0 + 50 ms, time-based so it works on the disarmed bench too), scrapped if
+    < 0.2 s would be left before its start.
+  - health signal while neither EVASION nor NEW_PLAN is on. `HEALTH_TIMEOUT` (2.5 s, replaces
+    `STALE_TIMEOUT`) is what catches a dead planner now.
+  - decides the solver: cancels (checkpoints in `runTrajgen` + the QP abort flag; result discarded)
+    an improve when any need comes up, a WAYPOINT-only solve when EVASION or NEW_PLAN comes up, and a
+    NEW_PLAN solve when a newer plan arrives — unless it also carries EVASION, which is never cut
+    short (its NEW_PLAN is struck from the snapshot so NEW_PLAN stays on). EVASION and NEW_PLAN never
+    cancel each other. Starts a solve with the current needs if any is on, or an improve after
+    `TRAJ_IMPROVE_PERIOD` since the last uninterrupted solve; never while one is waiting.
+  The solver (`trajgenLoop`) only runs the job it is given: anchors at `max(now + kTrajgenLead
+  (1.3 s), previous t0 + 0.3 s)` and hands the result back. Divergence, emergency and `reset()` bump
+  `splice_epoch_`, invalidating anything spliced onto the abandoned trajectory. **Gated by
+  `plan_trajectory`** — when false the worker is a pure geometric planner and control stays on
+  `kDirect` / POS_SP. Logs: `[trajmon] needs: ...` on change, `solve started for ...`, `result for ...
+  ACCEPTED, satisfies ... | SCRAPPED: why`, `... CANCELLED: why`, `... trajectory STAGED`, `EMERGENCY
+  STOP`; `[trajgen] solve for <needs|improve>: timing | OK|FAILED|CANCELLED`. Scratch threaded run
+  (2026-09-29): first plan, improves scrapped as not better, obstacle dropped 2 s ahead → emergency
+  stop → rest re-solve staged, stop point advanced → WAYPOINT solve staged. EVASION without an
+  emergency not yet exercised.
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
 Module roles:
@@ -468,7 +509,7 @@ Module roles:
 
   **Failure stages nothing — there is no min-snap fallback under `USE_CORRIDOR_QP`.** Any corridor
   failure (empty truncation, decomposition rejected, QP infeasible) makes `runTrajgen` return false,
-  so the tracker rides out whatever it already has and latches hover-hold after `STALE_TIMEOUT`.
+  so the tracker rides out whatever it already has and latches hover-hold after `HEALTH_TIMEOUT`.
   There used to be a plain min-snap fallback on the truncated prefix; it was removed because min-snap
   ignores obstacles entirely, which makes it least defensible in exactly the situation that produces
   it — the corridor stage saying it cannot certify a safe trajectory. Standing still is the honest
@@ -660,7 +701,7 @@ presence as evidence that a staleness check exists.
   the first trajectory landed. It now clears them, so an interruption genuinely restores it.)
 
 **Divergence also drops to `kHoverHold` (`MAX_TRACKING_ERROR`, default 1 m; 2026-09-16, NOT yet
-flown).** A trajectory fresh by `STALE_TIMEOUT` is abandoned the moment the measured position is
+flown).** A trajectory healthy by `HEALTH_TIMEOUT` is abandoned the moment the measured position is
 further than the limit from its reference, checked before that tick's reference is set, so a
 diverged trajectory never produces a command. The reason it exists is the splice: replans sample the
 *outgoing reference*, not the vehicle, and only the time-based stale check ever overrode that, so a
@@ -686,7 +727,7 @@ tick, and not clearing the splice source each fail their check).
 rest-at-measured-position branch. Needed because on a disarmed bench nothing flies the trajectory,
 yet the splice samples it on the wall clock, so each replan starts further along and the trajectory
 shrinks to zero within its duration (observed 2026-09-16: 1.91 → 1.81 → 1.02 → 0.13 → 0 m, one
-`TRAJGEN_PERIOD` apart, with the geometric path unchanged). In flight it would restart every replan
+replan period apart, with the geometric path unchanged). In flight it would restart every replan
 from zero velocity, so the node warns every 2 s while it is on and the controller is engaged.
 Covered by the bench-flag block in `test_autonomy_core` (flag off must splice ahead, on must start
 at the measured position).
@@ -733,9 +774,9 @@ passes the same overlap test, so full margin holds. `CorridorParams::bridge_join
 Regions are now grown one segment per DecompUtil call (equivalent: `dilate` handles segments
 independently). `regionOverlapDepth` can also return the ball centre (the dual's simplex multipliers).
 
-**Every replan logs one timing line (NOT yet run on bench):** `[trajgen] replan: solve S s (field F s,
-corridor C s, QP Q s) | splice|rest, lead L s -> ... | since last staged G s (STALE_TIMEOUT T s) | search this tick R s |
-next lead s | OK|FAILED`. Corridor covers truncation + obstacle gathering + decomposition. The search
+**Every solve logs one timing line (format changed 2026-09-29):** `[trajgen] solve for
+<needs|improve>: S s (field F s, corridor C s, QP Q s) | splice|rest, starts L s after the solve began |
+search last R s[, one running now] | OK|FAILED|CANCELLED`; what happens to it is the `[trajmon]` line. Corridor covers truncation + obstacle gathering + decomposition. The search
 field reports the **last completed** search's duration and whether one is running right now — since the
 thread split it cannot be "time spent searching this tick", and a search in flight no longer delays
 this trajectory.
@@ -803,9 +844,10 @@ tracking starts exactly on the outgoing world trajectory — mutation-checked: s
 conversion fails four checks, skipping the splice conversion fails exactly the splice check), and a
 bench replay of the 2026-09-16 bag from 60 s in, where a preset square's three map-frame corners landed
 3–4 cm from their correctly converted world positions and 42–68 cm from a reversed lookup. **What is
-still open:** a trajectory planned just before a correction lands is flown in `world` on the old map
-until the next replan (≤ `TRAJGEN_PERIOD`) — the same "tracked trajectory is not re-validated" gap as
-before.
+still open:** a trajectory planned just before a correction lands is flown in `world` on the old map.
+Since 2026-09-29 the trajectory monitor re-checks it against the current map (through the current
+`map→world`) at 5 Hz and replaces it if it has become unsafe, but a correction that shifts the map
+without making anything unsafe leaves it in place.
 
 **Four known gaps in this area — read before flying tracked trajectories:**
 
@@ -816,7 +858,7 @@ before.
    fires partway into the trajectory instead of cleanly off the ground, holds the vehicle flat and
    climbing while the reference runs away horizontally, then hands back to the PID at z > 1.0 with a
    large accumulated error. `reset()` clearing trajectories narrows this but does not close it: the
-   worker re-stages within one `TRAJGEN_PERIOD`.
+   monitor sees no trajectory and the worker re-stages within about one solve.
 
    **Still open. The fix is a gate, not a tweak to any of the three parts** — each is individually
    correct and load-bearing. The disarmed state feed is what stops plans rooting at the map origin;
@@ -840,7 +882,7 @@ before.
    transition (`autonomy_node.cpp`, the `!controller_running_` branch) runs *before* `stepControl` is
    reached on that tick and clears `preset_pending_` / `preset_active_` along with the tracker's
    trajectories. Unlike a goal — which persists in `has_goal_` and makes the worker re-stage within
-   one `TRAJGEN_PERIOD` — a preset is a one-shot with no re-trigger, so once cleared it stays
+   about one solve — a preset is a one-shot with no re-trigger, so once cleared it stays
    cleared. That asymmetry is the whole difference: the goal path re-arms itself, the preset path
    does not.
 2. **The plain min-snap path (`USE_CORRIDOR_QP=false`) is still rest-to-rest.** It inherits the
@@ -1014,7 +1056,7 @@ low-pass at `IMU_ACCEL_CUTOFF`, but it is **not** in `uxrce_dds_client/dds_topic
 consumed at firmware build time — so using it needs a rebuild and reflash. (The trajectory splice
 deliberately uses none of this — see the control section.)
 
-**Sensor-health watchdog (node-level, distinct from the core's `kHoverHold` / `STALE_TIMEOUT`
+**Sensor-health watchdog (node-level, distinct from the core's `kHoverHold` / `HEALTH_TIMEOUT`
 planner-stale→hover path).** The node stamps a per-stream last-receive time (`t_px4_odom_ /
 t_sensor_ / t_vio_odom_`) in each estimator callback; `streamHealthy()` deems a stream healthy when
 its last sample is within `SENSOR_TIMEOUT` (default 0.5 s) and `streamsFresh()` ANDs the required set
@@ -1221,13 +1263,14 @@ publish nothing and cost nothing when the flag is off:
   unknown space (the truncation margin against the conservative EDT). Enforced exactly as set; a
   committed point must still have strictly positive clearance whatever the value, so the prefix can
   never reach into an occupied or unknown voxel.
-- `TRAJ_SOLVE_BUDGET` (double, default `1.0` s) — wall-clock budget for the corridor QP's
+- `TRAJ_SOLVE_BUDGET` (double, default `0.8` s) — wall-clock budget for the corridor QP's
   time-allocation search, counted from the start of `optimizeTrajectory` and shared by growth,
   bisection and the group cuts. When it runs out the last accepted allocation is used — feasible by
   construction, just slower — and `[budget hit]` appears in the `[corridor-qp]` line. Seed growth is
   never cut short (nothing feasible to fall back on yet), and the budget is checked before each QP
   solve, so a call can overrun by one solve. Truncation and corridor building are not counted.
-  `<= 0` = unlimited. Must stay below `TRAJGEN_PERIOD` (1.25 s).
+  `<= 0` = unlimited. Default `0.8` s since 2026-09-29: with overrun and corridor building a solve
+  is ~0.95 s worst case, inside the fixed 1.3 s splice lead (`kTrajgenLead`).
 - `TRAJ_GROUP_CUT` (double, default `0.25`) / `TRAJ_GROUP_EDGE_FACTOR` (default `0.6`) — the time
   search's last stage. Segments are grouped at their joints: straight joints (≤ 10°, direction
   ignored) continue a group; a turning joint continues one only if the joint before it turned the
@@ -1423,10 +1466,10 @@ broadcasts `body→camera_link` (see *Frames & TF* above). Re-apply it if you re
    16.6 s for 4.9 m (bridged). The seed starts long (len/vmax + 0.5 s per segment, then a uniform 1.5x
    stretch until feasible) and BOBYQA only shortens it from there, so a cut search leaves it near the
    seed. **Addressed 2026-09-28 (not yet benched):** BOBYQA replaced by bisection + per-group cuts
-   (see the corridor-QP notes), `TRAJGEN_PERIOD` raised to 1.25 s and `STALE_TIMEOUT` to 3 s. The
-   splice lead is still capped at `kLeadMax` = 0.5 s, below ~1 s solves — to revisit. Also check nothing stale gets staged: with ~1.05 s solves the gap between staged
-   trajectories was 2.04-2.08 s even on ticks with no search, just over `STALE_TIMEOUT` (2 s), so in
-   flight the tracker would drop into hover-hold between replans.
+   (see the corridor-QP notes). **2026-09-29:** trajectories are no longer regenerated on a period —
+   see the trajectory monitor — with a 0.8 s budget and a fixed 1.3 s splice lead, and staleness is
+   now a health signal from the monitor (`HEALTH_TIMEOUT`), so the old "gap between staged
+   trajectories vs `STALE_TIMEOUT`" concern no longer applies. Not yet benched.
 2. **Planning stalls for tens of seconds.** On the same bench run the geometric search took 30.9 s,
    46.5 s and 59.2 s (`search this tick` in the replan log) against `RRT_SOLVE_TIME` = 1 s, growing
    over the session, on BLOCKED replans and IMPROVE ticks (EIT*). Search and trajgen share the worker

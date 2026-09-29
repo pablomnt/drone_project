@@ -119,7 +119,7 @@ int checkDeferredEngage() {
   int failures = 0;
 
   TrajectoryTracker tracker;
-  tracker.setStaleTimeout(5.0);
+  tracker.setHealthTimeout(5.0);
   tracker.setHoverThrust(0.35);
   tracker.setPositionGains(Eigen::Vector3d(0.95, 0.95, 1.0));
   tracker.setVelocityGains(Eigen::Vector3d(1.8, 1.8, 2.0), Eigen::Vector3d(0.4, 0.4, 0.5),
@@ -197,7 +197,7 @@ int checkDeferredEngage() {
   // engages on the next update rather than being held.
   {
     TrajectoryTracker late;
-    late.setStaleTimeout(5.0);
+    late.setHealthTimeout(5.0);
     late.reset();
     late.setDirectSetpoint(direct, 0.0);
     late.update(state, 300.0, 0.02);
@@ -234,7 +234,7 @@ int checkDivergence() {
   };
 
   TrajectoryTracker tracker;
-  tracker.setStaleTimeout(5.0);  // generous: only distance can trip this
+  tracker.setHealthTimeout(5.0);  // generous: only distance can trip this
   tracker.setMaxTrackingError(1.0);
   tracker.setHoverThrust(0.35);
   tracker.reset();
@@ -299,7 +299,7 @@ int checkDivergence() {
 
   // <= 0 disables the check.
   TrajectoryTracker disabled;
-  disabled.setStaleTimeout(5.0);
+  disabled.setHealthTimeout(5.0);
   disabled.setMaxTrackingError(0.0);
   disabled.setHoverThrust(0.35);
   disabled.reset();
@@ -310,10 +310,75 @@ int checkDivergence() {
   return failures;
 }
 
+// Health signals and the emergency stop. A trajectory keeps being tracked for as
+// long as health signals (keepFresh) keep arriving, however long ago it was
+// installed; without them it falls to hover-hold after the health timeout. An
+// emergency stop holds at once, drops anything staged, and is released only by a
+// newly promoted trajectory.
+int checkHealthAndEmergency() {
+  int failures = 0;
+  auto fail = [&failures](const char* what) {
+    std::cerr << "FAIL: " << what << "\n";
+    ++failures;
+  };
+
+  TrajectoryTracker tracker;
+  tracker.setHealthTimeout(2.5);
+  tracker.setMaxTrackingError(0.0);
+  tracker.setHoverThrust(0.35);
+  tracker.reset();
+  const Trajectory traj = makeTraj(300.0, 20.0, poly({0.0, 0.1}), poly({0.0}), poly({1.5}));
+  tracker.setTrajectory(traj, 300.0);
+  State s;
+  s.pos = Eigen::Vector3d(0.0, 0.0, 1.5);
+
+  // Heartbeats every 0.2 s keep it tracking for 5 s, twice the timeout.
+  for (double t = 300.2; t <= 305.0; t += 0.2) {
+    tracker.keepFresh(t);
+    s.pos.x() = 0.1 * (t - 300.0);
+    tracker.update(s, t, 0.02);
+    if (tracker.mode() != TrajectoryTracker::Mode::kTracking) {
+      fail("dropped a trajectory that was still receiving health signals");
+      break;
+    }
+  }
+  // Heartbeats stop: still tracking inside the timeout, holding past it.
+  tracker.update(s, 307.0, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kTracking) fail("held before the health timeout");
+  tracker.update(s, 307.6, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) fail("no hold after the health timeout");
+
+  // Emergency stop: immediate, even with a fresh heartbeat, and drops the staged one.
+  tracker.keepFresh(307.6);
+  tracker.update(s, 307.61, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kTracking) fail("health signal did not resume tracking");
+  tracker.setTrajectory(makeTraj(308.5, 5.0, poly({0.8}), poly({0.0}), poly({1.5})), 307.62);
+  tracker.emergencyStop();
+  s.pos.x() = 0.76;
+  tracker.update(s, 307.63, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) fail("emergency stop did not hold");
+  if (!tracker.isEmergencyStopped()) fail("emergency stop not latched");
+  if ((tracker.controller().getPositionSetpoint() - s.pos).norm() > kTol) {
+    fail("emergency hold is not at the vehicle's position");
+  }
+  if (tracker.hasPendingTrajectory()) fail("trajectory staged before the emergency kept");
+  tracker.keepFresh(307.8);
+  tracker.update(s, 307.8, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) fail("health signal released the stop");
+
+  // A new trajectory releases it once promoted.
+  tracker.setTrajectory(makeTraj(308.0, 5.0, poly({0.76}), poly({0.0}), poly({1.5})), 307.9);
+  tracker.update(s, 308.01, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kTracking) fail("new trajectory did not release the stop");
+  if (tracker.isEmergencyStopped()) fail("stop latch not cleared by a new trajectory");
+  return failures;
+}
+
 }  // namespace
 
 int main() {
-  const int failures = checkSpliceContinuity() + checkDeferredEngage() + checkDivergence();
+  const int failures = checkSpliceContinuity() + checkDeferredEngage() + checkDivergence() +
+                       checkHealthAndEmergency();
   if (failures != 0) {
     std::cerr << "test_trajectory_tracker: " << failures << " check(s) failed\n";
     return 1;

@@ -5,6 +5,7 @@
 #include "drone_core/autonomy/autonomy_core.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -34,7 +35,7 @@ int main() {
   // Synchronous path: drive the core with a controllable clock.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 0.5;
+    cfg.health_timeout = 0.5;
     autonomy::AutonomyCore core(cfg);
 
     double fake_time = 100.0;
@@ -85,7 +86,7 @@ int main() {
   // trajectory's reference.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 5.0;
+    cfg.health_timeout = 5.0;
     cfg.max_tracking_error = 1.0;
     autonomy::AutonomyCore core(cfg);
 
@@ -144,7 +145,7 @@ int main() {
   // start at the measured position. Both run, so the check proves a difference.
   for (const bool bench : {false, true}) {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 5.0;
+    cfg.health_timeout = 5.0;
     cfg.rrt_solve_time = 0.2;
     cfg.bench_replan_from_state = bench;
     autonomy::AutonomyCore core(cfg);
@@ -185,7 +186,7 @@ int main() {
   // tick.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 0.5;
+    cfg.health_timeout = 0.5;
     autonomy::AutonomyCore core(cfg);
 
     double fake_time = 100.0;
@@ -236,7 +237,7 @@ int main() {
   //    is sampled in world and converted into map before solving.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 2.0;
+    cfg.health_timeout = 2.0;
     cfg.rrt_solve_time = 0.2;
     cfg.require_map_to_world = true;
     autonomy::AutonomyCore core(cfg);
@@ -264,6 +265,12 @@ int main() {
 
     check(core.planOnce(), "frames: plans once the transform is set");
     const auto first = core.sampledPlannedPath(0.01);
+    // Plain min-snap has no speed limits, so this trajectory can end before the
+    // splice instant; sampling past the end holds its final (rest) state, so the
+    // splice then lands on its last sample.
+    std::size_t splice_idx = static_cast<std::size_t>(
+        std::lround((0.46 + autonomy::AutonomyCore::kTrajgenLead) / 0.01));
+    if (!first.empty()) splice_idx = std::min(splice_idx, first.size() - 1);
     check(first.size() > 60, "frames: trajectory long enough to splice into");
     if (first.size() > 60) {
       const Eigen::Vector3d start(first.front()[0], first.front()[1], first.front()[2]);
@@ -277,7 +284,8 @@ int main() {
     }
 
     // Engage it (rest start: t0 = 100.04), then replan half a second in while
-    // it is being tracked. The new t0 is 100.54, i.e. 0.50 s into the old one.
+    // it is being tracked. The new t0 is 100.5 + kTrajgenLead, i.e.
+    // 0.46 s + kTrajgenLead into the old one.
     core.stepControl(0.02);
     fake_time += 0.1;
     core.setVehicleState(airborneAt(p_world));
@@ -289,7 +297,8 @@ int main() {
     check(core.planOnce(), "frames: replan while tracking");
     const auto second = core.sampledPlannedPath(0.01);
     if (first.size() > 60 && !second.empty()) {
-      const Eigen::Vector3d old_at_splice(first[50][0], first[50][1], first[50][2]);
+      const Eigen::Vector3d old_at_splice(first[splice_idx][0], first[splice_idx][1],
+                                          first[splice_idx][2]);
       const Eigen::Vector3d new_start(second.front()[0], second.front()[1], second.front()[2]);
       check((new_start - old_at_splice).norm() < 1e-4,
             "frames: replan starts where the outgoing world trajectory is at the splice");
@@ -420,7 +429,7 @@ int main() {
   // changed after launch.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 5.0;
+    cfg.health_timeout = 5.0;
     cfg.rrt_solve_time = 0.2;
     cfg.require_map_to_world = true;  // and no transform is ever set
     autonomy::AutonomyCore core(cfg);
@@ -442,7 +451,7 @@ int main() {
 
     // Control: a tighter stale timeout must be in force from the first tick.
     autonomy::AutonomyCore::Config tight = relaxed;
-    tight.stale_timeout = 0.05;
+    tight.health_timeout = 0.05;
     core.applyConfig(tight);
     core.stepControl(0.02);  // installs the trajectory, stamped now
     fake_time += 0.1;
@@ -480,10 +489,10 @@ int main() {
   }
 
   // Search and trajgen run on SEPARATE threads: a slow geometric search must not
-  // stop trajectories from being regenerated. With the improve cadence at the
-  // monitor cadence, a search is running almost all the time; trajgen must keep
-  // staging on the committed path meanwhile, at roughly trajgen_period. While the
-  // two shared one loop this produced one trajectory per search instead.
+  // stop a trajectory from being produced. And with the trajectory monitor, a
+  // trajectory is then FOLLOWED rather than regenerated on a timer: with nothing
+  // changing (no new plan, nothing unsafe, no stop point to advance), only the
+  // improve timer can produce another, and only once per traj_improve_period.
   {
     autonomy::AutonomyCore::Config cfg;
     cfg.require_map_to_world = false;
@@ -494,7 +503,7 @@ int main() {
     cfg.rrt_solve_time = 1.0;         // each search takes about a second
     cfg.rrt_monitor_period = 0.05;
     cfg.rrt_improve_period = 0.05;    // improve every tick => a search is ~always running
-    cfg.trajgen_period = 0.1;
+    cfg.traj_improve_period = 60.0;   // no trajectory improve inside this test
     autonomy::AutonomyCore core(cfg);
 
     auto octree = std::make_shared<octomap::OcTree>(0.1);
@@ -507,21 +516,14 @@ int main() {
     core.startPlanner();
 
     // Wait for the first search to produce a committed path and the first
-    // trajectory off it.
+    // trajectory off it, while the search thread stays busy.
     bool staged = false;
     for (int i = 0; i < 60 && !staged; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       staged = core.stagedTrajectoryCount() > 0;
     }
-    const std::uint64_t before = core.stagedTrajectoryCount();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    const std::uint64_t during = core.stagedTrajectoryCount() - before;
     core.stopPlanner();
-
-    check(staged, "split threads: a trajectory is staged at all");
-    // One second at a 0.1 s period is ~10 trajectories; one per ~1 s search is at
-    // most 2. Five leaves room for scheduling without admitting the old coupling.
-    check(during >= 5, "trajgen keeps staging while the search thread is busy");
+    check(staged, "split threads: a trajectory is staged while the search thread is busy");
   }
 
   // Background planner thread: should plan and stage without help.

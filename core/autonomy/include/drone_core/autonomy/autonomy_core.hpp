@@ -52,11 +52,15 @@ public:
     double int_err_limit{0.2};  // freeze the velocity integrator above this position error [m]; <= 0 disables
     double hover_thrust{0.35};
     bool enable_feedforward{false};
-    double stale_timeout{1.5};        // hover-hold fallback threshold [s]
+    // Seconds without a health signal before the tracker falls back to
+    // hover-hold. The trajectory monitor sends one every tick it re-checks the
+    // trajectory being flown against the current map and finds it safe; a newly
+    // staged trajectory counts as one too. A dead or hung planner stops them.
+    double health_timeout{2.5};
     // Distance between the tracked reference and the measured position above
-    // which the trajectory is abandoned, even though it is still fresh by
-    // stale_timeout: the tracker holds the vehicle's current position and the
-    // worker replans from there, starting at rest. stale_timeout only catches a
+    // which the trajectory is abandoned, even though it is still healthy: the
+    // tracker holds the vehicle's current position and the worker replans from
+    // there, starting at rest. health_timeout only catches a
     // planner that stopped producing, not a vehicle a gust, a snag or a bad
     // state estimate has put far from an on-time reference — and a replan
     // splices onto the reference, not the vehicle, so without this the corridor
@@ -67,7 +71,7 @@ public:
     // the trajectory, but a splice still assumes the vehicle moved along it on the
     // wall clock, so each replan starts further along and the trajectory shrinks
     // to nothing within its own duration. In flight this would restart every
-    // replan from zero velocity — a stutter every TRAJGEN_PERIOD — so the node
+    // replan from zero velocity — a stutter at every new trajectory — so the node
     // warns while it is on and the vehicle is flying.
     bool bench_replan_from_state{false};
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
@@ -114,7 +118,26 @@ public:
     // the raw octree, where a cell with no node has never been observed — so
     // they should stay on whenever the operator asked for them.
     bool treat_unknown_as_hazard{true};
-    double trajgen_period{1.0};       // local trajectory replan period [s]
+    // Trajectory monitor (see monitorLoop). The trajectory being flown is kept
+    // until there is a reason to replace it; the monitor looks for one this many
+    // times a second.
+    double traj_monitor_rate{5.0};     // [Hz]
+    // An improve solve is tried once this long has passed since the last
+    // generation, and adopted only if it reaches the current stop point sooner.
+    double traj_improve_period{3.0};   // [s]
+    // A new trajectory is generated when truncation's stop point on the
+    // committed path has moved this far past the current trajectory's, or moved
+    // at all once the current trajectory is within traj_extend_horizon of its
+    // end (so the drone does not start braking for an end it no longer needs).
+    double traj_extend_dist{0.5};      // [m]
+    double traj_extend_horizon{3.0};   // [s]
+    // Emergency stop: when the trajectory fails its safety check with a sample
+    // within emergency_horizon ahead below emergency_factor x its margin, the
+    // tracker holds at once instead of waiting for a replacement. Keep the
+    // horizon above kTrajgenLead: an unsafe trajectory is flown for up to that
+    // long before its replacement engages.
+    double emergency_horizon{2.0};     // [s]
+    double emergency_factor{0.7};
     // Corridor-QP trajectory generation (Stage 1). When true, runTrajgen
     // replaces plain min-snap with the safe-corridor pipeline: truncate the
     // committed path against the conservative map view (see setMap) so it never
@@ -123,8 +146,8 @@ public:
     // per-axis limits below. Any stage failing stages NOTHING — there is no
     // min-snap fallback here, since min-snap ignores obstacles and the only
     // thing that produces this path is the corridor reporting it cannot certify
-    // a safe trajectory. The tracker rides out what it has and hovers at
-    // stale_timeout. When false, trajgen is exactly the pre-corridor min-snap.
+    // a safe trajectory. The tracker rides out what it has and hovers once its
+    // health signals stop. When false, trajgen is exactly the pre-corridor min-snap.
     bool use_corridor_qp{false};
     double vmax{1.0};              // per-axis velocity limit [m/s]
     double amax{1.5};              // per-axis acceleration limit [m/s^2]
@@ -154,7 +177,7 @@ public:
     // it runs out the best feasible allocation found so far is used, so a
     // slow search yields a slower trajectory rather than a late one. Covers
     // the QP only, not truncation or corridor building. <= 0 = unlimited.
-    double traj_solve_budget{1.0};
+    double traj_solve_budget{0.8};
     // Stage-3 group cuts of the corridor QP's time search: the fraction cut
     // from the middle segments of each group of alike-turning segments, and the
     // share of it applied to a group's end segments. <= 0 cut disables the stage.
@@ -194,6 +217,12 @@ public:
     // gets identity.
     bool require_map_to_world{false};
   };
+
+  // How far ahead of a solve a spliced trajectory is anchored [s]: the 0.8 s
+  // solve budget, the overrun past it (one QP solve plus corridor building), and
+  // room for the hand-over. Fixed rather than measured: solves are budgeted, so
+  // their worst case is known.
+  static constexpr double kTrajgenLead = 1.3;
 
   explicit AutonomyCore(const Config& config);
   ~AutonomyCore();
@@ -238,7 +267,7 @@ public:
   // built lazily by whichever planner thread asked first, under edt_mutex_, so a
   // new map stalled trajectory generation for the length of the build (bench
   // 2026-09-25: a 2.10 s replan, 1.36 s of it the field, pushing "since last
-  // staged" past STALE_TIMEOUT). The node calls this from its slow callback
+  // staged" past what was then STALE_TIMEOUT). The node calls this from its slow callback
   // group, which exists for exactly this kind of blocking work. Meanwhile the
   // planners keep running on the previous map and its fields; they switch to the
   // new pair together, so a tick never mixes a new map with an old field.
@@ -383,6 +412,12 @@ private:
   //
   // `root_shift` is how far the caller moved path.front() off the point the
   // search started from [m], reported in the truncation log; < 0 omits it.
+  // What runTrajgen learned that the trajectory monitor needs later.
+  struct TrajgenInfo {
+    bool corridor{false};             // built by the corridor pipeline (else plain min-snap)
+    double start_margin{0.0};         // clearance the first region kept (see buildCorridor)
+    Eigen::Vector3d trunc_end{0, 0, 0};  // truncation's stop point on the path, MAP frame
+  };
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const common::MotionState& start,
                   const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
@@ -390,7 +425,8 @@ private:
                   const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj,
                   bool pin_waypoints = false,
-                  double root_shift = -1.0);
+                  double root_shift = -1.0,
+                  TrajgenInfo* info = nullptr);
   void stagePending(const common::Trajectory& traj);
   // Build and stage a one-shot preset trajectory through `waypoints` (see
   // firePreset), splice-anchored at rest on the current state, and arm the
@@ -404,18 +440,24 @@ private:
   // The two planner threads. They are deliberately separate: a geometric search
   // can take tens of seconds (EIT* overrunning its budget has been measured at
   // 59 s on the bench), and while they shared one loop that stalled trajectory
-  // generation too, so the tracker ran past STALE_TIMEOUT and latched
-  // hover-hold. Now a slow search only delays a BETTER path; trajgen keeps
-  // regenerating on the committed path every trajgen_period. That is safe while
-  // the search runs because every trajgen tick re-truncates and regrows the
-  // corridor against the CURRENT map, so a committed path running into
-  // something newly mapped is cut short of it rather than flown.
+  // generation too, so the tracker lost its guidance and latched hover-hold. Now
+  // a slow search only delays a BETTER path; the trajectory being flown keeps
+  // being checked against the CURRENT map by the monitor meanwhile.
   void searchLoop();
+  // The solver: runs the one trajectory solve the monitor asks for at a time
+  // (see SolveJob), stops at its checkpoints if cancelled, and hands the result
+  // back. It decides nothing about adopting it. Also runs presets.
   void trajgenLoop();
+  // The trajectory monitor (traj_monitor_rate, and at once when a result or a
+  // hand-over is due): works out the Needs of the trajectory being flown, judges
+  // solver results and the waiting room against them, hands trajectories to the
+  // tracker, sends health signals and emergency stops, and decides at the end of
+  // each tick whether to start, cancel or leave a solve. See the .cpp.
+  void monitorLoop();
 
   // The committed path, shared between the two threads: written by the search
   // loop when it adopts, read (by copy, never held across a solve) by trajgen.
-  std::vector<std::vector<double>> committedPath() const;
+  std::vector<std::vector<double>> committedPath(std::uint64_t* version = nullptr) const;
   void setCommittedPath(std::vector<std::vector<double>> path);
 
   // Which map the debug clearance samples were taken from. Guarded by
@@ -450,8 +492,11 @@ private:
   // `world_from_map`. Sampling a map-frame copy instead would place the splice
   // wherever the map said the vehicle was when that copy was planned, which is not
   // where it is once a correction has landed since.
+  //
+  // `min_t0` is a lower bound on the anchor time: a trajectory must engage at
+  // least kStageGap after the one staged before it, which may still be waiting.
   SpliceAnchor spliceAnchor(const common::State& state, double t_now,
-                            const Eigen::Isometry3d& world_from_map) const;
+                            const Eigen::Isometry3d& world_from_map, double min_t0 = 0.0) const;
 
   // Re-anchor a solved trajectory's start time to after the solve, for a start
   // at rest only (anchor.from_trajectory false). The lead exists so a splice
@@ -470,6 +515,25 @@ private:
   // and stage it. Returns the staged world-frame trajectory. Worker thread only.
   common::Trajectory stagePlanned(const SpliceAnchor& anchor, const common::Trajectory& map_traj,
                                   const Eigen::Isometry3d& world_from_map);
+
+  // A trajectory as the monitor tracks it: what was staged (WORLD frame), what
+  // it must be checked against, and which plan it belongs to.
+  struct TrajRecord {
+    common::Trajectory traj;          // WORLD frame, as staged
+    double first_segment_end{0.0};    // wall clock
+    double start_margin{0.0};
+    bool corridor{false};
+    std::uint64_t path_version{0};
+    double trunc_end_arc{0.0};        // truncation stop point, as arc length along the path [m]
+  };
+  // Record a just-staged trajectory for the monitor. Keeps the last two: the one
+  // being flown and the one staged after it (the monitor checks each over the
+  // stretch it will actually be flown).
+  void recordStaged(const common::Trajectory& staged, const TrajgenInfo& info,
+                    std::uint64_t path_version, const std::vector<std::vector<double>>& path);
+  // The monitor's check, with the corridor's margins and truncation's tolerance.
+  static planning::TrajectoryCheckParams checkParams(const Config& c, double start_margin,
+                                                     double first_segment_end, double resolution);
 
   // Configure `planner` with the shared clearance-aware objective used by BOTH
   // the monitor and improve passes, so a forced replan and an improvement
@@ -562,14 +626,15 @@ private:
   // Raised by stepControl when the tracker abandons a trajectory for divergence.
   // One flag per planner thread, because both have to react and each consumes
   // its own: the search thread drops the committed path and re-searches from the
-  // vehicle, the trajgen thread regenerates immediately instead of waiting out
-  // trajgen_period.
+  // vehicle, the trajgen side regenerates from the vehicle's position.
   std::atomic<bool> search_replan_requested_{false};
   std::atomic<bool> trajgen_replan_requested_{false};
   Config pending_config_;
   bool search_config_dirty_{false};
   bool trajgen_config_dirty_{false};
+  bool monitor_config_dirty_{false};
   bool control_config_dirty_{false};
+  Config monitor_cfg_;  // the monitor thread's copy
 
   // Guards the two cached distance fields below and everything derived from
   // them, now that both planner threads use them.
@@ -588,12 +653,60 @@ private:
 
   std::thread search_worker_;
   std::thread trajgen_worker_;
+  std::thread monitor_worker_;
   std::atomic<bool> running_{false};
 
   // The committed path (see committedPath/setCommittedPath). Distinct from
   // last_geometric_path_, which is viz only and is also written by presets.
   mutable std::mutex path_mutex_;
   std::vector<std::vector<double>> committed_path_;
+  std::uint64_t path_version_{0};  // bumped on every setCommittedPath; guarded by path_mutex_
+
+  // What the trajectory being flown lacks, worked out by the monitor at the
+  // start of every tick (see monitorLoop).
+  struct Needs {
+    bool evasion{false};   // OBSTACLE_EVASION: it runs too close to an obstacle on the current map
+    bool new_plan{false};  // NEW_PLAN: it was built for an older committed path (or there is none)
+    bool waypoint{false};  // WAYPOINT_ADVANCED: truncation's stop point has moved on enough
+    bool any() const { return evasion || new_plan || waypoint; }
+  };
+  // A solve the monitor has asked for, with the needs it was asked for — so a
+  // result can later be judged by what it was meant to fix. `new_plan` is
+  // cleared if a newer plan arrives while it runs, so it no longer counts as
+  // satisfying NEW_PLAN.
+  struct SolveJob {
+    std::uint64_t id{0};
+    Needs needs;
+    std::uint64_t version{0};  // committed-path version when asked
+  };
+  struct SolveResult {
+    SolveJob job;
+    bool ok{false};
+    bool cancelled{false};
+    SpliceAnchor anchor;
+    common::Trajectory traj;  // MAP frame
+    TrajgenInfo info;
+    Eigen::Isometry3d world_from_map{Eigen::Isometry3d::Identity()};
+    std::uint64_t version{0};  // committed-path version actually solved on
+    std::uint64_t epoch{0};
+    std::vector<std::vector<double>> path;
+  };
+  // Monitor -> solver (job) and solver -> monitor (result), guarded by job_mutex_.
+  std::mutex job_mutex_;
+  bool has_job_{false};
+  SolveJob job_;
+  bool has_result_{false};
+  SolveResult result_;
+  std::atomic<bool> solve_cancel_{false};  // stop the solve in flight and discard it
+  std::atomic<bool> solve_abort_{false};   // makes the QP time search return early (see setAbortFlag)
+  std::atomic<bool> heartbeat_{false};          // monitor -> control: health signal
+  std::atomic<bool> emergency_request_{false};  // monitor -> control: stop now
+  std::atomic<bool> tracker_holding_{false};    // control -> solver: hovering, do not splice
+  // Bumped whenever the trajectories in flight stop meaning anything (divergence,
+  // emergency, re-engage): a solve or waiting-room entry from an older epoch was
+  // spliced onto a reference that has been abandoned and is thrown away.
+  std::atomic<std::uint64_t> splice_epoch_{0};
+  std::vector<TrajRecord> records_;  // guarded by traj_mutex_
 
   // How the last geometric search went, for the trajgen log line: it can no
   // longer time the search itself, since the search runs on the other thread.
@@ -602,26 +715,14 @@ private:
   std::atomic<bool> search_running_{false};
   std::atomic<double> last_search_time_{0.0};
 
-  double last_trajgen_{-1.0e9};  // trajgen thread only
-
-  // Replan lead time (worker thread only). How far ahead of "now" a replan is
-  // anchored, so it is ready by the time it is due to engage. Measured rather
-  // than guessed: the corridor QP runs a BOBYQA search over cold OSQP solves and
-  // its cost swings with the number of regions, so a fixed number would be
-  // either wasteful or routinely wrong. Held as a decaying max of observed solve
-  // times, times a safety factor — a one-off slow solve raises it, and it falls
-  // back down if that was not representative.
-  //
-  // Overrunning the lead costs a small transient (the trajectory engages
-  // slightly past its start); overshooting it costs nothing at all, because the
-  // tracker holds a staged trajectory until its t0. So this is deliberately
-  // biased high.
-  static constexpr double kLeadSafetyFactor = 1.5;
-  static constexpr double kLeadMaxDecay = 0.9;   // per trajgen tick
-  static constexpr double kLeadMin = 0.04;       // two 50 Hz control ticks [s]
-  static constexpr double kLeadMax = 0.5;        // [s]
-  double trajgen_solve_max_{0.0};
-  double trajgen_lead_{kLeadMin};
+  // Minimum gap between the start of a trajectory and the start of the one
+  // staged before it [s], so the earlier one has engaged and been superseded
+  // cleanly; and how long before its start a trajectory must still be when it
+  // is handed to the tracker [s], or it is thrown away and re-solved.
+  static constexpr double kStageGap = 0.3;
+  static constexpr double kStageMargin = 0.2;
+  // Rest starts (nothing to splice onto) begin this soon after hand-over.
+  static constexpr double kLeadMin = 0.04;  // two 50 Hz control ticks [s]
 
   // Where the last runTrajgen call spent its time, for the per-replan timing log
   // (worker thread only). Corridor covers truncation, obstacle gathering and the

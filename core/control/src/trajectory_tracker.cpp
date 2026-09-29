@@ -43,6 +43,8 @@ void TrajectoryTracker::reset() {
   next_ = common::Trajectory{};
   diverged_ = false;
   divergence_event_ = false;
+  emergency_requested_ = false;
+  stopped_ = false;
 }
 
 void TrajectoryTracker::setDirectSetpoint(const Eigen::Vector3d& pos, double yaw) {
@@ -68,6 +70,8 @@ void TrajectoryTracker::clearTrajectory() {
   has_next_ = false;
   diverged_ = false;
   divergence_event_ = false;
+  emergency_requested_ = false;
+  stopped_ = false;
 }
 
 common::Command TrajectoryTracker::update(const common::State& state, double now, double dt) {
@@ -87,13 +91,31 @@ common::Command TrajectoryTracker::update(const common::State& state, double now
     // A new plan gets a fresh chance; it is checked against the vehicle below
     // before a single reference from it is used.
     diverged_ = false;
+    stopped_ = false;
     // Seed the held yaw to the vehicle's heading so the commanded yaw does not
     // jump when the new trajectory engages.
     mapper_needs_reset_ = true;
   }
 
   const bool has_fresh_traj =
-      has_traj_ && !traj_.empty() && (now - last_arrival_ <= stale_timeout_);
+      has_traj_ && !traj_.empty() && (now - last_arrival_ <= health_timeout_);
+
+  // Emergency stop (see emergencyStop): stop following at once and hold here.
+  // Latched explicitly, like a divergence, so an older hold point from before this
+  // trajectory was promoted is never reused.
+  if (emergency_requested_) {
+    emergency_requested_ = false;
+    if (has_traj_ && !stopped_) {
+      stopped_ = true;
+      has_next_ = false;
+      next_ = common::Trajectory{};
+      hold_pos_ = state.pos;
+      hold_yaw_ = state.yaw;
+      mode_ = Mode::kHoverHold;
+      DRONE_LOG_ERROR("[track] EMERGENCY STOP: the trajectory runs too close to an obstacle "
+                      "ahead; holding position until a new trajectory arrives");
+    }
+  }
 
   // A trajectory can be fresh by the clock and still be the wrong thing to
   // fly: stale_timeout only catches a planner that stopped producing, not a
@@ -103,7 +125,7 @@ common::Command TrajectoryTracker::update(const common::State& state, double now
   // abandon the trajectory instead. Checked before any reference is set, so a
   // diverged trajectory never produces a command. Sampled raw rather than
   // through the flatness mapper, which latches yaw as a side effect.
-  if (has_fresh_traj && !diverged_ && max_tracking_error_ > 0.0) {
+  if (has_fresh_traj && !diverged_ && !stopped_ && max_tracking_error_ > 0.0) {
     const double error = (common::sampleMotion(traj_, now).pos - state.pos).norm();
     if (error > max_tracking_error_) {
       diverged_ = true;
@@ -122,7 +144,7 @@ common::Command TrajectoryTracker::update(const common::State& state, double now
                       "position until a replan from here arrives");
     }
   }
-  const bool trust_traj = has_fresh_traj && !diverged_;
+  const bool trust_traj = has_fresh_traj && !diverged_ && !stopped_;
 
   if (trust_traj) {
     // A planner trajectory is available, fresh and being tracked: track it.

@@ -7,10 +7,10 @@
 namespace drone_core::control {
 
 // Drives the position controller from a trajectory and supervises it. While a
-// fresh trajectory is available it samples the flatness reference and tracks it;
-// if trajectories stop arriving (a stalled or dead planner) it latches the
+// healthy trajectory is available it samples the flatness reference and tracks
+// it; if health signals stop arriving (a stalled or dead planner) it latches the
 // current position and holds, so loss of guidance degrades to a safe hover
-// rather than tracking a stale path or losing the control stream.
+// rather than tracking an unchecked path or losing the control stream.
 class TrajectoryTracker {
 public:
   // kDirect    - hold an explicit commanded setpoint (manual hover, takeoff).
@@ -28,12 +28,16 @@ public:
   void setIntegratorErrorLimit(double max_pos_err);
   void enableFeedforward(bool enabled);
 
-  // Seconds without a new trajectory before falling back to hover-hold.
-  void setStaleTimeout(double seconds) { stale_timeout_ = seconds; }
+  // Seconds without a health signal before falling back to hover-hold. A health
+  // signal is a newly installed trajectory (setTrajectory) or keepFresh(): the
+  // planner's trajectory monitor calls the latter every tick it re-checks the
+  // trajectory against the current map and finds it safe, and stops while that
+  // trajectory is unsafe or superseded by a new plan.
+  void setHealthTimeout(double seconds) { health_timeout_ = seconds; }
 
   // Distance [m] between the tracked reference and the measured position above
   // which the trajectory is abandoned for a hover-hold, even though it is still
-  // fresh by setStaleTimeout — see isDiverged(). <= 0 disables the check.
+  // healthy by setHealthTimeout — see isDiverged(). <= 0 disables the check.
   void setMaxTrackingError(double meters) { max_tracking_error_ = meters; }
 
   // Re-arm the controller (and takeoff logic) on (re)engagement.
@@ -56,7 +60,8 @@ public:
   // next update, which is the graceful-degradation case.
   void setTrajectory(const common::Trajectory& traj, double arrival_time);
 
-  // Re-stamp the installed trajectory's freshness to `now` without re-staging it.
+  // Health signal: re-stamp the installed trajectory's freshness to `now` without
+  // re-staging it.
   // The trajectory is evaluated in absolute wall-clock time (mapper.sample uses
   // now vs traj_.t0), so a single long trajectory keeps playing correctly; the
   // only thing the stale timeout would otherwise trip is the planner-death
@@ -66,6 +71,16 @@ public:
   // hover-hold after stale_timeout. Does nothing useful unless a trajectory is
   // installed. Control thread only, like setTrajectory/update.
   void keepFresh(double now) { last_arrival_ = now; }
+
+  // Emergency stop: on the next update, stop following the trajectory at once and
+  // hold the vehicle's current position, without waiting for the health timeout,
+  // and drop any trajectory staged to follow it. The trajectory monitor raises it
+  // when the trajectory runs too close to an obstacle within the next couple of
+  // seconds — sooner than a replacement could engage. LATCHED like a divergence:
+  // only a newly promoted trajectory, clearTrajectory() or reset() releases it.
+  // Does nothing while no trajectory is being followed. Control thread only.
+  void emergencyStop() { emergency_requested_ = true; }
+  bool isEmergencyStopped() const { return stopped_; }
 
   // Drop any installed/staged trajectory, so the next update() with a direct
   // setpoint present falls straight to kDirect (POS_SP) rather than kHoverHold.
@@ -118,10 +133,12 @@ private:
   bool has_next_{false};
   bool mapper_needs_reset_{false};
   double last_arrival_{0.0};
-  double stale_timeout_{0.5};
+  double health_timeout_{0.5};
   double max_tracking_error_{1.0};
   bool diverged_{false};          // latched; see isDiverged()
   bool divergence_event_{false};  // one-shot; see takeDivergence()
+  bool emergency_requested_{false};  // see emergencyStop(); consumed by update()
+  bool stopped_{false};              // latched emergency stop
   bool feedforward_{false};
 
   Mode mode_{Mode::kHoverHold};

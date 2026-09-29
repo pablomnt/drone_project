@@ -206,12 +206,14 @@ and the mode follows.
 
 The three modes, in the order they are tested:
 
-1. **`kTracking` — a fresh trajectory exists, so follow it.** This is the only mode that flies a
+1. **`kTracking` — a healthy trajectory exists, so follow it.** This is the only mode that flies a
    trajectory, and the only one where differential-flatness feed-forward is active; the other two
-   explicitly disable it. "Fresh" means a trajectory is installed and the last one *arrived* within
-   `STALE_TIMEOUT` seconds. Freshness is stamped when the trajectory is handed over, not when it
-   starts playing, so a planner that has died trips the timeout even if the trajectory it last
-   produced is still perfectly valid and still running.
+   explicitly disable it. "Healthy" means a trajectory is installed and a health signal arrived
+   within `HEALTH_TIMEOUT` seconds. The trajectory monitor sends one each tick it re-checks the
+   trajectory against the current map and finds it safe, and none while it is unsafe or superseded
+   by a new plan; a newly handed-over trajectory counts as one. So a planner that has died or hung
+   trips the timeout even while the trajectory it last produced is still running. The monitor can
+   also order an **emergency stop**, which holds at once instead of waiting for the timeout.
 2. **`kHoverHold` — a trajectory is installed but guidance has gone stale, so latch the current
    position and hover.** This is the failsafe for the planner stalling or dying. It captures the
    position and yaw once on entry and holds them; it does **not** land, because PX4 rejects an
@@ -238,8 +240,8 @@ preset finishes: at completion it would be too late to matter on the tick it is 
 `POS_SP` mid-preset accomplishes nothing; the value that counts is the one set at the flip.
 
 **Second, returning to `kDirect` when the preset finishes is deliberate, not automatic.** A preset is
-solved once and never replanned, so nothing re-stamps its freshness the way normal planning does —
-left alone it would go stale within `STALE_TIMEOUT` and, by the precedence above, land in
+solved once and never replanned or monitored, so nothing sends it health signals the way normal
+planning does — left alone it would go stale within `HEALTH_TIMEOUT` and, by the precedence above, land in
 `kHoverHold`, latching wherever the vehicle happened to be. So `AutonomyCore::stepControl` does two
 things explicitly: it keeps the preset fresh for its whole duration so it holds `kTracking` to the
 end, and then calls `clearTrajectory()` at `preset_end_` so control drops to `kDirect` on `POS_SP`
@@ -387,9 +389,16 @@ timers) that we neither create nor tune.
  │     re-checks the committed path, runs the geometric search when it is blocked
  │     or on the improve cadence, adopts a new committed path
  │
- └─ TRAJGEN thread (AutonomyCore::trajgenLoop, ticks at TRAJGEN_PERIOD)
-       reads the committed path, truncates it, grows the corridor, solves the QP,
-       stages the trajectory for the tracker; also plays one-shot presets
+ ├─ MONITOR thread (AutonomyCore::monitorLoop, TRAJ_MONITOR_RATE)
+ │     re-checks the trajectory being flown against the current map, sends the
+ │     tracker health signals while it is safe (emergency stop when it is not and
+ │     there is no time to replace it), and asks the solver for a new trajectory
+ │     on a new plan, an unsafe trajectory, an advanced stop point, or the improve timer
+ │
+ └─ TRAJGEN (solver) thread (AutonomyCore::trajgenLoop, on request)
+       truncates the committed path, grows the corridor, solves the QP, decides
+       whether to adopt the result, and hands it over once the trajectory staged
+       before it has engaged; also plays one-shot presets
 ```
 
 **Why the two callback groups.** A single-threaded executor let `onOctomap` block the control tick
@@ -400,11 +409,28 @@ guarded (`cross_mutex_` in the node).
 
 **Why the search and trajgen threads are separate.** They used to be one loop, with the search
 first. A geometric search that overran its budget — measured at 30-59 s against a 1 s budget on the
-2026-09-17 bench — therefore stopped trajectory generation for as long as it ran, and past
-`STALE_TIMEOUT` the tracker latches hover-hold and the drone brakes. Split, a slow search only
-delays a *better* path: trajgen keeps regenerating on the committed path every `TRAJGEN_PERIOD`.
-That is safe because each trajgen tick re-truncates the path and regrows the corridor against the
-*current* map, so a path running into something newly mapped is cut short of it rather than flown.
+2026-09-17 bench — therefore stopped trajectory generation for as long as it ran, and the tracker
+lost its guidance and latched hover-hold. Split, a slow search only delays a *better* path: the
+trajectory being flown keeps being checked against the *current* map by the monitor, and replaced
+when it turns unsafe.
+
+**Why a trajectory is followed rather than regenerated on a timer (2026-09-29).** Trajgen used to
+regenerate and stage a new trajectory every `TRAJGEN_PERIOD`. Consecutive solves of the same scene
+differ (durations 5.3-5.8 s, group cuts landing differently), so the planned speed profile kept
+changing, and a trajectory being flown was never re-checked against a changed map. Now the monitor
+keeps the current one until there is a reason: a new plan, the trajectory failing its safety check
+(the margins it was built with — `CORRIDOR_MARGIN`, or the relaxed first-segment margin — less one
+voxel or 5%), truncation's stop point advancing (`TRAJ_EXTEND_DIST`, or at all within
+`TRAJ_EXTEND_HORIZON` of its end), or an improve solve every `TRAJ_IMPROVE_PERIOD` that reaches the
+current stop point sooner. A solve is anchored `kTrajgenLead` (1.3 s) ahead, at least 0.3 s after the
+trajectory staged before it; an adopted result waits until that one has engaged, and is thrown away
+and re-solved if less than 0.2 s would be left before its start. The result is re-checked against
+the latest map before it is adopted and again before it is handed over. The monitor tracks what the
+flown trajectory needs — `OBSTACLE_EVASION`, `NEW_PLAN`, `WAYPOINT_ADVANCED` — and each solve carries
+a snapshot of the needs it was started for, so a result is accepted only for what it actually fixes
+(evasion first, then a new plan, then an advanced stop point, else only if it is better). A solve
+started for less than the needs that later come up is cancelled and restarted; evasion and new-plan
+solves are never cancelled by each other. See `CLAUDE.md` for the exact rules.
 Shared state is small and each lock is held briefly: the committed path (`path_mutex_`), the two
 cached distance fields (`edt_mutex_`), the staged trajectory and viz snapshots (`traj_mutex_`), and
 the inputs from the host — state, map, goal, transform (`io_mutex_`). Each planner thread keeps its
@@ -446,9 +472,9 @@ marked ⚑ and listed again at the end of this section.
 
 | Parameter | Type / default | What it does |
 |---|---|---|
-| `STALE_TIMEOUT` | double, `3.0` s | How long after a trajectory's *arrival* the tracker keeps tracking it before falling to `kHoverHold`. Guards against a dead planner, not a stale map. |
-| `MAX_TRACKING_ERROR` | double, `1.0` m | If the vehicle gets further than this from the trajectory's reference, it gives up on that trajectory: it holds its current position, drops anything planned against the old reference, and the planner searches again and generates a new trajectory from there, starting at rest. Latched — it never resumes the abandoned trajectory. Catches what `STALE_TIMEOUT` cannot: guidance still arriving on time while the vehicle has been knocked off course. Logged as `[track] vehicle … m from the trajectory reference`. During a preset it holds until the preset's scheduled end, then returns to `POS_SP` (presets are never replanned). `≤ 0` disables. |
-| `BENCH_TEST_REPLAN_DISABLER` | bool, `false` | **Bench only.** Every replan starts at rest from the drone's measured position instead of splicing onto where the current trajectory says the drone should be by now. On a disarmed bench nothing flies the trajectory, so without this each replan starts further along it and the trajectory shrinks to nothing within its own duration. **Never fly with it on**: every replan would restart from zero velocity, a stutter every `TRAJGEN_PERIOD`. The node warns every 2 s if it is on while the controller is engaged. |
+| `HEALTH_TIMEOUT` | double, `2.5` s | How long without a health signal the tracker keeps tracking before falling to `kHoverHold`. The trajectory monitor sends one each tick the trajectory re-checks safe on the current map, none while it is unsafe or superseded by a new plan; a newly handed-over trajectory counts as one. Replaces `STALE_TIMEOUT`. |
+| `MAX_TRACKING_ERROR` | double, `1.0` m | If the vehicle gets further than this from the trajectory's reference, it gives up on that trajectory: it holds its current position, drops anything planned against the old reference, and the planner searches again and generates a new trajectory from there, starting at rest. Latched — it never resumes the abandoned trajectory. Catches what `HEALTH_TIMEOUT` cannot: health signals still arriving while the vehicle has been knocked off course. Logged as `[track] vehicle … m from the trajectory reference`. During a preset it holds until the preset's scheduled end, then returns to `POS_SP` (presets are never replanned). `≤ 0` disables. |
+| `BENCH_TEST_REPLAN_DISABLER` | bool, `false` | **Bench only.** Every replan starts at rest from the drone's measured position instead of splicing onto where the current trajectory says the drone should be by now. On a disarmed bench nothing flies the trajectory, so without this each replan starts further along it and the trajectory shrinks to nothing within its own duration. **Never fly with it on**: every replan would restart from zero velocity, a stutter at every new trajectory. The node warns every 2 s if it is on while the controller is engaged. |
 | `SENSOR_TIMEOUT` | double, `0.5` s | A stream counts as healthy if it produced a sample within this window. Drives both guards below. |
 | `SENSOR_WARMUP` | double, `5.0` s | Continuous stream health required before the controller will *engage*. Any lapse resets the streak, so every takeoff re-proves it. |
 
@@ -470,7 +496,12 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 | `RRT_SOLVE_TIME` | double, `1.0` s | Optimisation budget per solve. All the planners are anytime, so this is a direct quality/latency dial. |
 | `REPLAN_IMPROVE_RATIO` | double, `0.85` | Hysteresis gate: adopt an improvement only if its cost ≤ ratio × the committed path's **remaining** cost from the drone's current position. Prevents replan chatter. |
 | `BEST_EFFORT_GOAL` | bool, `true` | Accept a path that stops short of an unreachable goal (closest reachable point) instead of reporting failure, and keep advancing the endpoint as the map grows. |
-| `TRAJGEN_PERIOD` | double, `1.25` s | Trajectory-generation cadence, start to start; each run re-anchors onto the outgoing trajectory. Keep it above `TRAJ_SOLVE_BUDGET` so a solve finishes before the next is due. |
+| `TRAJ_MONITOR_RATE` | double, `5.0` Hz | How often the trajectory monitor re-checks the trajectory being flown and looks for a reason to replace it. Replaces the fixed `TRAJGEN_PERIOD`. |
+| `TRAJ_IMPROVE_PERIOD` | double, `3.0` s | Time since the last generation after which an improve solve is tried; adopted only if it reaches the current stop point sooner. |
+| `TRAJ_EXTEND_DIST` | double, `0.5` m | Regenerate when truncation's stop point on the committed path has moved this far past the current trajectory's. |
+| `TRAJ_EXTEND_HORIZON` | double, `3.0` s | Within this long of the current trajectory's end, regenerate whenever the stop point has moved at all. |
+| `EMERGENCY_HORIZON` | double, `2.0` s | An unsafe trajectory with a point this close ahead below `EMERGENCY_FACTOR` × its margin (or in never-observed space) stops the vehicle at once. Keep it above the 1.3 s splice lead. |
+| `EMERGENCY_FACTOR` | double, `0.7` | See `EMERGENCY_HORIZON`. |
 
 ### Cost shaping
 
@@ -493,7 +524,7 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 | `MAX_SEGMENT_LEN` | double, `2.0` m | Corridor resample cap; one convex region per piece. Lowering it is the lever against convex over-conservatism, but costs QP size — and needs `CORRIDOR_BBOX` pinned or you lose in region width what you gain in length. |
 | `CORRIDOR_BBOX` | double[3], `[1, 2, 2]` | Minimum usable half-extents of the region-growth window, in the **segment-aligned** frame (0 = along-track, 1/2 = lateral) — a floor, not a literal size. Exists to decouple window size from `MAX_SEGMENT_LEN`. All zeros restores purely derived behaviour. |
 | `TRAJ_PATH_WEIGHT` | double, `0.5` | How hard the QP pulls the trajectory toward the planned path. The knob against wide, corner-cutting turns: the QP otherwise scores smoothness alone, so inside a roomy corridor the widest turn is the cheapest one and only the corridor holds the curve near the plan. Going faster cannot fix it — the same curve is simply flown faster. Soft, so unlike hard waypoint pinning it can never make a feasible corridor infeasible, and it leaves tight scenery its full set of options. Weighted by segment length, so the weight keeps one meaning however finely the corridor happens to be split. Try 20-100; the unit test's L-corner goes from 0.30 m to 0.19 m of deviation at 50. |
-| `TRAJ_SOLVE_BUDGET` | double, `1.0` s | Wall-clock cap on the QP's time-allocation search. When it runs out the last accepted allocation is used — feasible, just slower. Covers the QP only, not truncation or corridor building. `<= 0` = unlimited. |
+| `TRAJ_SOLVE_BUDGET` | double, `0.8` s | Wall-clock cap on the QP's time-allocation search. When it runs out the last accepted allocation is used — feasible, just slower. Covers the QP only, not truncation or corridor building. `<= 0` = unlimited. |
 | `TRAJ_GROUP_CUT` | double, `0.25` | Last stage of the time search. Segments are grouped by how the path turns (a straight, an arc of steady turning; a corner starts a new group), and each group's middle segments are tried with their times cut by this fraction, its two end segments by `TRAJ_GROUP_EDGE_FACTOR` of it. Then all groups again at half the cut. A cut is kept only if the whole trajectory stays feasible. `<= 0` disables. |
 | `TRAJ_GROUP_EDGE_FACTOR` | double, `0.6` | Share of `TRAJ_GROUP_CUT` applied to a group's two end segments, easing the change of speed into the neighbouring groups. |
 

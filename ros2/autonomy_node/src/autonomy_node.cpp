@@ -265,11 +265,16 @@ private:
     // PRESET_WAYPOINTS fire from this hover adds no altitude step to its first
     // segment and the hand-back at completion is at the same height.
     declare_parameter<std::vector<double>>("POS_SP", {0.0, 0.0, 1.5});
-    declare_parameter("STALE_TIMEOUT", 3.0);
+    // Seconds without a health signal before the tracker holds position. The
+    // trajectory monitor sends one each tick it re-checks the trajectory being
+    // flown against the current map and finds it safe, and none while that
+    // trajectory is unsafe or superseded by a new plan; a new trajectory counts
+    // as one too. A dead or hung planner stops them.
+    declare_parameter("HEALTH_TIMEOUT", 2.5);
     // Distance [m] from the tracked reference at which the vehicle gives up on
     // the trajectory: it holds its current position and the planner replans
-    // from there. Catches a vehicle knocked off course, which STALE_TIMEOUT (a
-    // planner that stopped producing) cannot. <= 0 disables the check.
+    // from there. Catches a vehicle knocked off course, which HEALTH_TIMEOUT (a
+    // planner that stopped checking) cannot. <= 0 disables the check.
     declare_parameter("MAX_TRACKING_ERROR", 1.0);
     // BENCH ONLY. Replan from the drone's measured position at rest instead of
     // splicing onto where the current trajectory says it should be. On a disarmed
@@ -309,7 +314,21 @@ private:
     // with the goal beyond the frontier, fraction of tree nodes near the direct
     // line: 0 -> 100%, 0.5 -> 91%, 1 -> 49%, 2 -> 17%, 10 -> 9%.
     declare_parameter("UNKNOWN_WEIGHT", 0.5);
-    declare_parameter("TRAJGEN_PERIOD", 1.25);
+    // Trajectory monitor: the trajectory being flown is kept until there is a
+    // reason to replace it — a new plan, the monitor finding it unsafe on the
+    // current map, truncation's stop point moving on (TRAJ_EXTEND_DIST, or at all
+    // within TRAJ_EXTEND_HORIZON of its end), or an improve solve every
+    // TRAJ_IMPROVE_PERIOD that reaches the current stop point sooner.
+    declare_parameter("TRAJ_MONITOR_RATE", 5.0);
+    declare_parameter("TRAJ_IMPROVE_PERIOD", 3.0);
+    declare_parameter("TRAJ_EXTEND_DIST", 0.5);
+    declare_parameter("TRAJ_EXTEND_HORIZON", 3.0);
+    // Emergency stop: when the trajectory turns unsafe with a point within
+    // EMERGENCY_HORIZON ahead closer than EMERGENCY_FACTOR x its margin, the
+    // tracker holds at once instead of waiting for a replacement. Keep the
+    // horizon above the 1.3 s splice lead.
+    declare_parameter("EMERGENCY_HORIZON", 2.0);
+    declare_parameter("EMERGENCY_FACTOR", 0.7);
     // Geometry-first bring-up: with this false the planner only runs RRT* and
     // publishes the geometric path; it does not generate a trajectory or feed
     // the controller, which keeps following POS_SP. Flip to true to enable the
@@ -402,7 +421,7 @@ private:
     // it runs out the best feasible timing found so far is used (a slower
     // trajectory, never an infeasible one). The QP only — truncation and
     // corridor building are not counted. <= 0 disables the budget.
-    declare_parameter("TRAJ_SOLVE_BUDGET", 1.0);
+    declare_parameter("TRAJ_SOLVE_BUDGET", 0.8);
     // Time-search group cuts: after the uniform bisection, each group of
     // segments that turn alike (a straight, an arc) is tried with its middle
     // segments' times cut by TRAJ_GROUP_CUT and its two end segments' by
@@ -479,7 +498,7 @@ private:
 
     cfg.hover_thrust = param("MPC_HOVER_THRUST").as_double();
     cfg.enable_feedforward = param("ENABLE_FEEDFORWARD").as_bool();
-    cfg.stale_timeout = param("STALE_TIMEOUT").as_double();
+    cfg.health_timeout = param("HEALTH_TIMEOUT").as_double();
     cfg.max_tracking_error = param("MAX_TRACKING_ERROR").as_double();
     cfg.bench_replan_from_state = param("BENCH_TEST_REPLAN_DISABLER").as_bool();
     cfg.rrt_monitor_period = param("RRT_MONITOR_PERIOD").as_double();
@@ -500,7 +519,12 @@ private:
     // conservative map view: that view only exists once a frontier cloud has
     // arrived, and both guards work off the raw octree without one.
     cfg.treat_unknown_as_hazard = param("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
-    cfg.trajgen_period = param("TRAJGEN_PERIOD").as_double();
+    cfg.traj_monitor_rate = param("TRAJ_MONITOR_RATE").as_double();
+    cfg.traj_improve_period = param("TRAJ_IMPROVE_PERIOD").as_double();
+    cfg.traj_extend_dist = param("TRAJ_EXTEND_DIST").as_double();
+    cfg.traj_extend_horizon = param("TRAJ_EXTEND_HORIZON").as_double();
+    cfg.emergency_horizon = param("EMERGENCY_HORIZON").as_double();
+    cfg.emergency_factor = param("EMERGENCY_FACTOR").as_double();
     cfg.plan_trajectory = param("PLAN_TRAJECTORY").as_bool();
     cfg.debug_planner_viz = param("DEBUG_PLANNER_VIZ").as_bool();
     cfg.best_effort_goal = param("BEST_EFFORT_GOAL").as_bool();

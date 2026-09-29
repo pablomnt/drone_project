@@ -1178,6 +1178,78 @@ int main() {
     }
   }
 
+  // -------------------------------------------------- trajectory monitor -----
+  // checkTrajectory holds a trajectory to the margins it was built with, less
+  // the tolerance, and flags an emergency only for a close pass near the start
+  // of the checked window.
+  {
+    using drone_core::planning::checkTrajectory;
+    using drone_core::planning::TrajectoryCheckParams;
+    // Straight line along x at 0.5 m/s for 10 s, two 5 s segments, from t0 = 50.
+    Trajectory line;
+    line.t0 = 50.0;
+    line.segment_times = {5.0, 5.0};
+    line.total_duration = 10.0;
+    Eigen::VectorXd c0 = Eigen::VectorXd::Zero(8), c1 = Eigen::VectorXd::Zero(8);
+    c0(1) = 0.5;
+    c1(0) = 2.5;
+    c1(1) = 0.5;
+    Eigen::VectorXd zero = Eigen::VectorXd::Zero(8), one = Eigen::VectorXd::Zero(8);
+    one(0) = 1.0;
+    line.coeffs_x = {c0, c1};
+    line.coeffs_y = {zero, zero};
+    line.coeffs_z = {one, one};
+    const Eigen::Isometry3d I = Eigen::Isometry3d::Identity();
+    TrajectoryCheckParams p;
+    p.margin = 0.4;
+    p.start_margin = 0.4;
+    p.first_segment_end = 55.0;
+    p.max_speed = 0.5;
+    // Wide open: passes.
+    const auto open = [](double, double, double) { return 1.0; };
+    if (!checkTrajectory(open, {}, line, I, 50.0, 0.0, p).ok) {
+      std::cerr << "FAIL: trajectory in open space failed its check\n";
+      ++failures;
+    }
+    // An obstacle 0.3 m off the line between x = 3 and 4 (t = 56..58 s).
+    const auto pinch = [](double x, double, double) { return (x >= 3.0 && x <= 4.0) ? 0.3 : 1.0; };
+    const auto early = checkTrajectory(pinch, {}, line, I, 50.0, 0.0, p);
+    if (early.ok || early.emergency) {
+      std::cerr << "FAIL: pinch 6 s ahead should fail without an emergency\n";
+      ++failures;
+    }
+    const auto near = checkTrajectory(pinch, {}, line, I, 55.0, 0.0, p);
+    if (near.ok || !near.emergency) {
+      std::cerr << "FAIL: pinch 1 s ahead below 0.7 x margin is not an emergency\n";
+      ++failures;
+    }
+    // Stopping the window before the pinch (the next trajectory takes over) passes.
+    if (!checkTrajectory(pinch, {}, line, I, 50.0, 55.5, p).ok) {
+      std::cerr << "FAIL: the window end was not respected\n";
+      ++failures;
+    }
+    // Inside the first segment the relaxed start margin applies: 0.3 m clears a
+    // 0.3 m start margin less its tolerance, but not the full 0.4 m margin.
+    const auto tight_start = [](double x, double, double) { return x < 2.0 ? 0.3 : 1.0; };
+    p.start_margin = 0.3;
+    if (!checkTrajectory(tight_start, {}, line, I, 50.0, 0.0, p).ok) {
+      std::cerr << "FAIL: relaxed start margin not applied in the first segment\n";
+      ++failures;
+    }
+    p.start_margin = 0.4;
+    if (checkTrajectory(tight_start, {}, line, I, 50.0, 0.0, p).ok) {
+      std::cerr << "FAIL: 0.3 m passed a 0.4 m margin\n";
+      ++failures;
+    }
+    // Never-observed space fails, and is an emergency when close.
+    const auto unknown = [](double x, double, double) { return x > 0.5 && x < 0.7; };
+    const auto u = checkTrajectory(open, unknown, line, I, 50.0, 0.0, p);
+    if (u.ok || !u.emergency || !u.unknown) {
+      std::cerr << "FAIL: never-observed space 1 s ahead not an unsafe emergency\n";
+      ++failures;
+    }
+  }
+
   // ----------------------------------------------------- region overlap -----
   // regionOverlapDepth is exact: the radius of the largest ball inside both.
   {

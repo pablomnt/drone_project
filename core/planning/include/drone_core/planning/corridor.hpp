@@ -5,6 +5,9 @@
 #include <vector>
 
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
+
+#include "drone_core/common/types.hpp"
 
 namespace drone_core::planning {
 
@@ -205,6 +208,61 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
                                           TruncationCut* cut = nullptr,
                                           double start_floor_slack = 0.0,
                                           double start_floor_rel = 0.0);
+
+// Re-check a trajectory that is already being flown (or about to be) against
+// the CURRENT map, for the trajectory monitor. A trajectory is proved safe only
+// against the map it was built on; this is what notices that a newly observed
+// obstacle, or the frontier, has since come too close to it.
+//
+// Holds the trajectory to the clearance it was BUILT with, not to truncation's
+// numbers: the corridor keeps `margin` (CORRIDOR_MARGIN) everywhere except the
+// first segment, where buildCorridor may have relaxed it to `start_margin` for a
+// hemmed-in start. Truncation's FRONTIER_MARGIN would flag every fresh
+// trajectory, since the trajectory is only built to keep CORRIDOR_MARGIN and cuts
+// corners off the checked path. Each sample must clear its margin less the more
+// lenient of `slack` and `rel` x margin; with those at least half a sample step,
+// a trajectory straight out of the corridor QP passes by construction (the region
+// shrink leaves it >= margin from every voxel centre, which is what the field
+// measures).
+//
+// Samples every `sample_step` metres of travel at most — the step in time is
+// sample_step / max_speed — and subtracts half a step from each clearance: the
+// field is 1-Lipschitz, so the curve between two samples can be at most that
+// much closer than the samples show. The check is therefore exact, not
+// probabilistic.
+struct TrajectoryCheckParams {
+  double margin = 0.4;             // CORRIDOR_MARGIN [m]
+  double start_margin = 0.4;       // the relaxed first-segment margin buildCorridor reported [m]
+  double first_segment_end = 0.0;  // wall-clock end of the first segment [s]
+  double slack = 0.05;             // absolute tolerance [m]
+  double rel = 0.05;               // relative tolerance, fraction of the margin
+  double sample_step = 0.05;       // max travel between samples [m]
+  double max_speed = 1.0;          // bound on the trajectory's speed [m/s], sets the time step
+  double emergency_horizon = 2.0;  // how far ahead of `t_from` an emergency is looked for [s]
+  double emergency_factor = 0.7;   // emergency below this fraction of the (untolerated) margin
+};
+struct TrajectoryCheck {
+  bool ok = true;
+  // Some sample within emergency_horizon of `t_from` is below emergency_factor x
+  // its margin, in contact, or in never-observed space: too close to wait for a
+  // replacement trajectory.
+  bool emergency = false;
+  bool unknown = false;          // the worst sample lies in never-observed space
+  double worst_time = 0.0;       // wall-clock time of the worst sample [s]
+  double worst_clearance = 0.0;  // its clearance, less the half-step [m]
+  double worst_required = 0.0;   // what it had to clear [m]
+  Eigen::Vector3d worst_point{0, 0, 0};  // in the field's frame
+};
+// Checks `traj` from wall-clock `t_from` (clamped to its start) until
+// `t_until` or its end, whichever is first; pass t_until <= t_from for "to the
+// end". `field_from_traj` takes the trajectory's frame into the field's (the
+// monitor flies world-frame trajectories against map-frame fields). `is_unknown`
+// may be empty.
+TrajectoryCheck checkTrajectory(const CorridorClearanceFn& clearance,
+                                const CorridorUnknownFn& is_unknown,
+                                const common::Trajectory& traj,
+                                const Eigen::Isometry3d& field_from_traj, double t_from,
+                                double t_until, const TrajectoryCheckParams& params);
 
 // Full corridor for a path: resample to the segment cap, then grow one convex
 // free region per segment via DecompUtil's ellipsoid decomposition against the

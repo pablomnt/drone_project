@@ -67,6 +67,30 @@ std::shared_ptr<DynamicEDTOctomap> buildEdt(const std::shared_ptr<octomap::OcTre
 // which means nothing is mapped nearby, so report the saturation distance
 // instead. Shared rather than written out at each call site so the convention
 // cannot drift apart between them.
+// Arc length along a polyline [m] at the point closest to `q`: where on the
+// committed path a stop point sits, so two stop points can be compared as
+// progress along it.
+double arcLengthAlong(const std::vector<std::vector<double>>& path, const Eigen::Vector3d& q) {
+  if (path.empty()) return 0.0;
+  double best = std::numeric_limits<double>::infinity();
+  double best_arc = 0.0;
+  double acc = 0.0;
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    const Eigen::Vector3d a(path[i][0], path[i][1], path[i][2]);
+    const Eigen::Vector3d b(path[i + 1][0], path[i + 1][1], path[i + 1][2]);
+    const Eigen::Vector3d ab = b - a;
+    const double len = ab.norm();
+    const double u = len > 1e-9 ? std::clamp((q - a).dot(ab) / (len * len), 0.0, 1.0) : 0.0;
+    const double d = (a + u * ab - q).norm();
+    if (d < best) {
+      best = d;
+      best_arc = acc + u * len;
+    }
+    acc += len;
+  }
+  return best_arc;
+}
+
 planning::CorridorClearanceFn makeClearanceFn(std::shared_ptr<DynamicEDTOctomap> edt,
                                               double maxd) {
   return [edt = std::move(edt), maxd](double x, double y, double z) {
@@ -145,13 +169,14 @@ AutonomyCore::AutonomyCore(const Config& config)
       // threads would rebuild it themselves, which is the stall prebuilding
       // exists to remove.
       pending_config_(config) {
+  monitor_cfg_ = config;
   tracker_.setPositionGains(control_cfg_.pos_p);
   tracker_.setVelocityGains(control_cfg_.vel_p, control_cfg_.vel_i, control_cfg_.vel_d);
   tracker_.setDerivativeTau(control_cfg_.vel_d_tau);
   tracker_.setIntegratorErrorLimit(control_cfg_.int_err_limit);
   tracker_.setHoverThrust(control_cfg_.hover_thrust);
   tracker_.enableFeedforward(control_cfg_.enable_feedforward);
-  tracker_.setStaleTimeout(control_cfg_.stale_timeout);
+  tracker_.setHealthTimeout(control_cfg_.health_timeout);
   tracker_.setMaxTrackingError(control_cfg_.max_tracking_error);
 
   // Quiet OMPL's own console (the per-solve "RRTstar: ..." INFO/DEBUG spam) so the
@@ -303,6 +328,7 @@ void AutonomyCore::applyConfig(const Config& config) {
   pending_config_ = config;
   search_config_dirty_ = true;
   trajgen_config_dirty_ = true;
+  monitor_config_dirty_ = true;
   control_config_dirty_ = true;
 }
 
@@ -318,11 +344,14 @@ void AutonomyCore::reset() {
   }
   // The tracker just dropped its trajectories, so there is nothing left to
   // splice onto. Clearing this makes the next replan anchor at rest on the
-  // measured position, which is what a fresh engage needs.
+  // measured position, which is what a fresh engage needs; anything solved or
+  // waiting against the old ones is thrown away (splice_epoch_).
+  splice_epoch_.fetch_add(1);
   std::lock_guard<std::mutex> lock(traj_mutex_);
   has_pending_ = false;
   has_last_planned_ = false;
   last_planned_ = common::Trajectory{};
+  records_.clear();
 }
 
 common::Command AutonomyCore::stepControl(double dt) {
@@ -363,7 +392,7 @@ common::Command AutonomyCore::stepControl(double dt) {
     tracker_.setIntegratorErrorLimit(control_cfg_.int_err_limit);
     if (hover_thrust_changed) tracker_.setHoverThrust(control_cfg_.hover_thrust);
     tracker_.enableFeedforward(control_cfg_.enable_feedforward);
-    tracker_.setStaleTimeout(control_cfg_.stale_timeout);
+    tracker_.setHealthTimeout(control_cfg_.health_timeout);
     tracker_.setMaxTrackingError(control_cfg_.max_tracking_error);
   }
 
@@ -380,10 +409,19 @@ common::Command AutonomyCore::stepControl(double dt) {
     }
   }
 
-  // A preset one-shot is solved once and never replanned, so nothing re-stamps
-  // its freshness on the trajgen cadence the way normal planning does. Keep it
-  // fresh here for its whole duration so it holds kTracking instead of falling to
-  // hover-hold at stale_timeout (the trajectory plays in absolute time, so this
+  // Health signal from the trajectory monitor: the trajectory being flown was
+  // just re-checked against the current map and is safe.
+  if (heartbeat_.exchange(false)) tracker_.keepFresh(t);
+
+  // Emergency stop from the monitor: hold here now. The monitor has already
+  // dropped everything staged or solved against the abandoned trajectory, so the
+  // next one starts at rest from where the vehicle stops.
+  if (emergency_request_.exchange(false)) tracker_.emergencyStop();
+
+  // A preset one-shot is solved once and never replanned, so the monitor never
+  // checks it and sends no health signals for it. Keep it fresh here for its
+  // whole duration so it holds kTracking instead of falling to hover-hold at
+  // health_timeout (the trajectory plays in absolute time, so this
   // only defers the planner-death failsafe, which does not apply to a deliberate
   // one-shot). Once it has run its course, release the trajectory so control
   // drops back to the direct setpoint (POS_SP) rather than latching a hover.
@@ -397,6 +435,10 @@ common::Command AutonomyCore::stepControl(double dt) {
   }
 
   const common::Command cmd = tracker_.update(state, t, dt);
+  // Hovering over a trajectory it has stopped following (health timeout,
+  // emergency, divergence): the next solve must start at rest, not splice.
+  tracker_holding_.store(tracker_.mode() == control::TrajectoryTracker::Mode::kHoverHold &&
+                         tracker_.hasTrajectory());
 
   // The tracker has just abandoned its trajectory because the vehicle got too far
   // from the reference (see TrajectoryTracker::isDiverged). Once, on that edge:
@@ -409,11 +451,13 @@ common::Command AutonomyCore::stepControl(double dt) {
   // the recovery trajectory staged while the tracker is still holding, and the
   // plan after that would then start from rest while the vehicle is moving.
   if (tracker_.takeDivergence()) {
+    splice_epoch_.fetch_add(1);
     {
       std::lock_guard<std::mutex> lock(traj_mutex_);
       has_pending_ = false;
       has_last_planned_ = false;
       last_planned_ = common::Trajectory{};
+      records_.clear();
     }
     search_replan_requested_.store(true);
     trajgen_replan_requested_.store(true);
@@ -424,25 +468,29 @@ common::Command AutonomyCore::stepControl(double dt) {
 
 void AutonomyCore::startPlanner() {
   if (running_.exchange(true)) return;
-  // Two threads on purpose — see searchLoop/trajgenLoop.
+  // Separate threads on purpose — see searchLoop/trajgenLoop/monitorLoop.
   search_worker_ = std::thread(&AutonomyCore::searchLoop, this);
   trajgen_worker_ = std::thread(&AutonomyCore::trajgenLoop, this);
+  monitor_worker_ = std::thread(&AutonomyCore::monitorLoop, this);
 }
 
 void AutonomyCore::stopPlanner() {
   if (!running_.exchange(false)) return;
   if (search_worker_.joinable()) search_worker_.join();
   if (trajgen_worker_.joinable()) trajgen_worker_.join();
+  if (monitor_worker_.joinable()) monitor_worker_.join();
 }
 
-std::vector<std::vector<double>> AutonomyCore::committedPath() const {
+std::vector<std::vector<double>> AutonomyCore::committedPath(std::uint64_t* version) const {
   std::lock_guard<std::mutex> lock(path_mutex_);
+  if (version) *version = path_version_;
   return committed_path_;
 }
 
 void AutonomyCore::setCommittedPath(std::vector<std::vector<double>> path) {
   std::lock_guard<std::mutex> lock(path_mutex_);
   committed_path_ = std::move(path);
+  ++path_version_;  // a new plan: the monitor treats the trajectory built on the old one as invalid
 }
 
 planning::MapHandle AutonomyCore::vizSampledMap() const {
@@ -505,15 +553,18 @@ bool AutonomyCore::planOnce() {
   // Truncation stops at unobserved space only when the operator asked for it —
   // see the worker's copy of this for why it keys off the flag and not off
   // whether a conservative view exists. The predicate reads the RAW map.
+  TrajgenInfo info;
   if (!runTrajgen(path, anchor.t0, anchor.start,
                   conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin)),
                   cons,
                   cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
                                                : planning::CorridorUnknownFn{},
-                  traj))
+                  traj, /*pin_waypoints=*/false, /*root_shift=*/-1.0, &info))
     return false;
 
-  stagePlanned(anchor, traj, world_from_map);
+  std::uint64_t version = 0;
+  committedPath(&version);
+  recordStaged(stagePlanned(anchor, traj, world_from_map), info, version, path);
   return true;
 }
 
@@ -622,9 +673,10 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                               const planning::MapHandle& cons_map,
                               const planning::CorridorUnknownFn& unknown_fn,
                               common::Trajectory& traj, bool pin_waypoints,
-                              double root_shift) {
+                              double root_shift, TrajgenInfo* info) {
   trajgen_corridor_time_ = 0.0;
   trajgen_qp_time_ = 0.0;
+  if (info) *info = TrajgenInfo{};
   if (path.size() < 2) return false;
 
   if (cfg_.use_corridor_qp && cons_edt && cons_map) {
@@ -747,6 +799,12 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       return false;
     }
     snapshotCommitted(committed);
+    // Cancellation checkpoint (see SolveJob): nothing past here is worth doing
+    // for a solve the monitor has already given up on.
+    if (solve_cancel_.load()) {
+      trajgen_corridor_time_ = now() - t_corridor;
+      return false;
+    }
 
     // Numbers for the logs below. The corridor stage and the QP are separate
     // faults needing opposite fixes, so they report separately and quantified.
@@ -876,7 +934,9 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       optimizer.setGroupEdgeFactor(cfg_.traj_group_edge_factor);
       optimizer.setPathWeight(cfg_.traj_path_weight);
       optimizer.setDebug(cfg_.debug_trajgen);
+      optimizer.setAbortFlag(&solve_abort_);
       snapshotRegions(attempt, /*accepted=*/true);
+      if (solve_cancel_.load()) return false;  // cancellation checkpoint
       // `start` carries the splice state. Its position is path.front() by
       // construction (the caller rooted the path there), so it satisfies
       // regions[0]; the derivatives are what make the engage continuous.
@@ -885,6 +945,11 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       trajgen_qp_time_ = now() - t_qp;
       if (solved) {
         traj.t0 = t0;
+        if (info) {
+          info->corridor = true;
+          info->start_margin = start_margin;
+          info->trunc_end = committed.back();
+        }
         if (cfg_.debug_planner_viz) {
           DRONE_LOG_INFO("[trajgen] corridor: OK " << regions.size() << " regions / "
                          << polylineLength(committed) << " m / " << traj.total_duration << " s");
@@ -944,11 +1009,11 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     // that produced it — the corridor stage saying it cannot guarantee a safe
     // trajectory — is exactly the situation in which an unchecked polynomial is
     // least defensible. Staging nothing means the tracker rides out whatever it
-    // already has and, if this persists past STALE_TIMEOUT, latches the current
-    // position and holds. Standing still is the only honest answer when the
-    // corridor cannot certify moving. Note the caller does not advance
-    // last_trajgen_ on false, so this retries next tick and recovers the moment
-    // the map or the path allows a corridor again.
+    // already has. If that one is no longer valid the monitor sends no health
+    // signal and keeps asking for a replacement, so once HEALTH_TIMEOUT passes
+    // the tracker latches the current position and holds. Standing still is the
+    // only honest answer when the corridor cannot certify moving, and it
+    // recovers the moment the map or the path allows a corridor again.
     return false;
   }
 
@@ -963,6 +1028,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
   planning::MinSnapTimeOptimizer optimizer;
   if (!optimizer.optimizeTrajectory(path, traj)) return false;
   traj.t0 = t0;
+  if (info) info->trunc_end = Eigen::Vector3d(path.back()[0], path.back()[1], path.back()[2]);
   return true;
 }
 
@@ -1043,6 +1109,12 @@ void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d
   // A preset starts at rest, so staging moves t0 to after the solve; preset_end_
   // below then follows it rather than cutting the one-shot short by the solve time.
   const common::Trajectory staged = stagePlanned(anchor, traj, world_from_map);
+  {
+    // Presets are never monitored (they are kept fresh by stepControl), and what
+    // the monitor had recorded is superseded by this one.
+    std::lock_guard<std::mutex> lock(traj_mutex_);
+    records_.clear();
+  }
   // Hold the one-shot for its whole duration, then release (see stepControl). The
   // trajectory plays in absolute time from its t0, so its end is t0 + duration.
   preset_end_.store(staged.t0 + staged.total_duration);
@@ -1052,10 +1124,11 @@ void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d
 }
 
 AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state, double t_now,
-                                                      const Eigen::Isometry3d& world_from_map) const {
+                                                      const Eigen::Isometry3d& world_from_map,
+                                                      double min_t0) const {
   const Eigen::Isometry3d map_from_world = world_from_map.inverse();
   SpliceAnchor anchor;
-  anchor.t0 = t_now + trajgen_lead_;
+  anchor.t0 = std::max(t_now + kTrajgenLead, min_t0);
 
   common::Trajectory outgoing;
   bool have = false;
@@ -1069,11 +1142,12 @@ AutonomyCore::SpliceAnchor AutonomyCore::spliceAnchor(const common::State& state
     }
   }
 
-  // Only splice onto a trajectory the tracker is still following. Past the stale
-  // timeout it has latched a hover, so the vehicle is no longer on that curve
-  // and matching its state would step the reference rather than smooth it.
-  const bool still_tracked = have && !outgoing.empty() &&
-                             (t_now - staged_at) <= cfg_.stale_timeout &&
+  // Only splice onto a trajectory the tracker is still following. Once it has
+  // latched a hover over it (health timeout, emergency, divergence) the vehicle
+  // is no longer on that curve, and matching its state would step the reference
+  // rather than smooth it.
+  (void)staged_at;
+  const bool still_tracked = have && !outgoing.empty() && !tracker_holding_.load() &&
                              !cfg_.bench_replan_from_state;  // bench: always the measured state
   if (still_tracked) {
     // The outgoing trajectory is world-frame (it is what the tracker flies), so
@@ -1293,10 +1367,9 @@ void AutonomyCore::searchLoop() {
     // The tracker abandoned the trajectory (the vehicle got too far from its
     // reference) and is holding position. Same treatment as a new goal: drop the
     // committed path so this tick searches again from where the vehicle actually
-    // is. The trajgen thread consumes its own copy of the flag and regenerates
-    // immediately rather than waiting out TRAJGEN_PERIOD. stepControl has
-    // already cleared the splice source, so it starts from rest at the measured
-    // position.
+    // is. stepControl has already cleared the splice source and the monitor's
+    // records, so the monitor asks for a new trajectory at once and it starts
+    // from rest at the measured position.
     if (search_replan_requested_.exchange(false)) {
       setCommittedPath({});
       if (has_goal) {
@@ -1541,16 +1614,65 @@ void AutonomyCore::searchLoop() {
   }
 }
 
+void AutonomyCore::recordStaged(const common::Trajectory& staged, const TrajgenInfo& info,
+                                std::uint64_t path_version,
+                                const std::vector<std::vector<double>>& path) {
+  TrajRecord r;
+  r.traj = staged;
+  r.first_segment_end =
+      staged.t0 + (staged.segment_times.empty() ? 0.0 : staged.segment_times.front());
+  r.start_margin = info.start_margin;
+  r.corridor = info.corridor;
+  r.path_version = path_version;
+  r.trunc_end_arc = arcLengthAlong(path, info.trunc_end);
+  std::lock_guard<std::mutex> lock(traj_mutex_);
+  records_.push_back(std::move(r));
+  while (records_.size() > 2) records_.erase(records_.begin());
+}
+
+planning::TrajectoryCheckParams AutonomyCore::checkParams(const Config& c, double start_margin,
+                                                          double first_segment_end,
+                                                          double resolution) {
+  planning::TrajectoryCheckParams p;
+  p.margin = c.corridor_margin;
+  p.start_margin = start_margin;
+  p.first_segment_end = first_segment_end;
+  // The same tolerance truncation's floor uses: one voxel or 5%, whichever is
+  // more lenient.
+  p.slack = resolution;
+  p.rel = kTruncationTolerance;
+  p.sample_step = 0.05;
+  // Per-axis limits allow up to sqrt(3) x vmax in norm.
+  p.max_speed = std::sqrt(3.0) * c.vmax;
+  p.emergency_horizon = c.emergency_horizon;
+  p.emergency_factor = c.emergency_factor;
+  return p;
+}
+
+namespace {
+// "EVASION+NEW_PLAN", "WAYPOINT", or "improve" when nothing was needed.
+template <class N>
+std::string needsName(const N& n) {
+  std::string s;
+  const auto add = [&s](const char* x) {
+    if (!s.empty()) s += "+";
+    s += x;
+  };
+  if (n.evasion) add("OBSTACLE_EVASION");
+  if (n.new_plan) add("NEW_PLAN");
+  if (n.waypoint) add("WAYPOINT_ADVANCED");
+  return s.empty() ? std::string("improve") : s;
+}
+}  // namespace
+
 void AutonomyCore::trajgenLoop() {
   while (running_.load()) {
-    const double t = now();
-
     common::State state;
     planning::MapHandle map;
     planning::MapHandle conservative;
     bool preset_pending = false;
     std::vector<Eigen::Vector3d> preset_waypoints;
-    // One snapshot per cycle, used both to bring the state into the map frame and
+    // One snapshot per solve, used both to bring the state into the map frame and
     // to take the finished trajectory back out (see stagePlanned).
     Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
     bool has_frame = false;
@@ -1569,10 +1691,9 @@ void AutonomyCore::trajgenLoop() {
         trajgen_config_dirty_ = false;
       }
     }
-
-    // Divergence: regenerate now rather than waiting out TRAJGEN_PERIOD. The
-    // search thread has its own copy of the flag and drops the committed path.
-    if (trajgen_replan_requested_.exchange(false)) last_trajgen_ = -1.0e9;
+    // Divergence is handled through the records and the splice epoch (see
+    // stepControl); the monitor sees the trajectory gone and asks for a new one.
+    trajgen_replan_requested_.store(false);
 
     const bool frame_ok = has_frame || !cfg_.require_map_to_world;
 
@@ -1587,126 +1708,506 @@ void AutonomyCore::trajgenLoop() {
     } else if (preset_pending) {
       runPreset(state, world_from_map, map, conservative, preset_waypoints);
     }
+    if (preset_active_.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
 
-    // The committed path is produced by the search thread. Working on a copy is
-    // what decouples the two: a search that takes a minute no longer holds up a
-    // single trajectory, and this keeps regenerating on the last path it was
-    // given. Safe because every tick re-truncates and regrows the corridor
-    // against the CURRENT map, so a path that now runs into something newly
-    // mapped is cut short of it rather than flown.
-    const std::vector<std::vector<double>> committed_path = committedPath();
-    if (!preset_active_.load() && map && frame_ok) {
-      // Trajectory generation is the next pipeline stage; while plan_trajectory is
-      // false the worker is a pure geometric planner and control keeps following
-      // the direct setpoint (the tracker is never handed a trajectory). When
-      // enabled it re-anchors min-snap to where the vehicle is now, on its cadence.
-      if (cfg_.plan_trajectory && !committed_path.empty() &&
-          t - last_trajgen_ >= cfg_.trajgen_period) {
-        // Anchor the replan on the state the vehicle will be in when it
-        // engages, not on where it is now, and root the path there so the
-        // corridor is grown around the point the trajectory actually starts
-        // from. Rooting at the measured position instead would leave the splice
-        // point outside region 0 whenever there is tracking error, and the QP's
-        // start equality would then be infeasible against region 0's faces.
-        const double t_gen = now();
-        const SpliceAnchor anchor = spliceAnchor(state, t_gen, world_from_map);
-        std::vector<std::vector<double>> path = committed_path;
-        path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
-        common::Trajectory traj;
-        const planning::MapHandle cons = conservative ? conservative : map;
-        // Truncation stops at unobserved space only when the operator asked for
-        // it. With treat_unknown_as_hazard false the intended mode is the legacy
-        // one throughout: nothing distinguishes unknown from free, in the cost
-        // or in truncation.
-        //
-        // Keyed off the flag and NOT off `conservative` being non-null. The host
-        // only builds that view once a frontier cloud has arrived, so keying off
-        // it made a late or missing /octomap_frontier quietly drop this guard
-        // even with the flag on. Truncation needs no frontier cloud to make this
-        // check — the predicate reads the RAW map, never the stamped copy, since
-        // stamping writes voxels into that copy and a stamped point that did not
-        // already exist would make genuinely unobserved space read as observed.
-        const double root_shift = std::sqrt(
-            std::pow(path.front()[0] - committed_path.front()[0], 2) +
-            std::pow(path.front()[1] - committed_path.front()[1], 2) +
-            std::pow(path.front()[2] - committed_path.front()[2], 2));
-        // Fetched and timed on its own line: this is the one part of a replan
-        // that can wait on the other planner thread (edt_mutex_) or on a field
-        // build, and it happens before runTrajgen starts its own timers — so it
-        // used to show up only as solve time that corridor + QP did not account
-        // for (bench 2026-09-25: 1.36 s of a 2.10 s replan). setMap now builds
-        // fields before publishing a map, so this should read ~0; anything larger
-        // is the fallback build (a live CLEARANCE_THRESHOLD / FRONTIER_MARGIN
-        // change) or lock contention.
-        const double t_field = now();
-        const auto cons_field =
-            conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
-        const double field_time = now() - t_field;
-        const bool ok = runTrajgen(path, anchor.t0, anchor.start, cons_field, cons,
-                                   cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
-                                                                : planning::CorridorUnknownFn{},
-                                   traj, /*pin_waypoints=*/false, root_shift);
+    // Take the job the monitor posted, if any. The cancel flags are reset here,
+    // at the START of a job, so a cancel aimed at the previous job that arrives
+    // after it finished cannot hit this one.
+    SolveJob job;
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> lock(job_mutex_);
+      if (has_job_) {
+        job = job_;
+        has_job_ = false;
+        have = true;
+        solve_cancel_.store(false);
+        solve_abort_.store(false);
+      }
+    }
+    if (!have) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      continue;
+    }
 
-        // Re-measure the lead from what this solve actually cost. Timed around
-        // the whole call, failures included: a corridor that fails late has
-        // still burned the time, and the next replan has to budget for it.
-        const double solve_time = now() - t_gen;
-        trajgen_solve_max_ = std::max(solve_time, kLeadMaxDecay * trajgen_solve_max_);
-        trajgen_lead_ = std::clamp(kLeadSafetyFactor * trajgen_solve_max_, kLeadMin, kLeadMax);
-        // One line per replan, success or failure, so the solve-time budget can be
-        // read straight off a log. Everything that decides whether the reference
-        // stays continuous is here: what the solve cost and where, the lead it was
-        // anchored with and how late a splice therefore engages (a rest start is
-        // re-anchored after the solve, so it cannot be late — its lead is what a
-        // splice would have had), and how long the tracker has gone since the
-        // last staged trajectory, against the timeout that latches hover-hold.
-        const double lead_used = anchor.t0 - t_gen;
-        const double late = std::max(0.0, solve_time - lead_used);
-        double since_staged = -1.0;
-        {
-          std::lock_guard<std::mutex> lock(traj_mutex_);
-          if (has_last_planned_) since_staged = now() - last_planned_at_;
+    SolveResult result;
+    result.job = job;
+    result.epoch = splice_epoch_.load();
+    std::uint64_t version = 0;
+    const std::vector<std::vector<double>> committed_path = committedPath(&version);
+    result.version = version;
+    result.world_from_map = world_from_map;
+    result.path = committed_path;
+    if (cfg_.plan_trajectory && map && frame_ok && !committed_path.empty()) {
+      // Anchor the solve on the state the vehicle will be in when it engages, at
+      // least kStageGap after the trajectory staged before it (which may still be
+      // waiting in the tracker), and root the path there so the corridor is grown
+      // around the point the trajectory actually starts from. Rooting at the
+      // measured position instead would leave the splice point outside region 0
+      // whenever there is tracking error, and the QP's start equality would then
+      // be infeasible against region 0's faces.
+      const double t_gen = now();
+      double min_t0 = 0.0;
+      {
+        std::lock_guard<std::mutex> lock(traj_mutex_);
+        if (has_last_planned_) min_t0 = last_planned_.t0 + kStageGap;
+      }
+      result.anchor = spliceAnchor(state, t_gen, world_from_map, min_t0);
+      std::vector<std::vector<double>> path = committed_path;
+      path.front() = {result.anchor.start.pos.x(), result.anchor.start.pos.y(),
+                      result.anchor.start.pos.z()};
+      const double root_shift = std::sqrt(
+          std::pow(path.front()[0] - committed_path.front()[0], 2) +
+          std::pow(path.front()[1] - committed_path.front()[1], 2) +
+          std::pow(path.front()[2] - committed_path.front()[2], 2));
+      // Truncation stops at unobserved space only when the operator asked for
+      // it — keyed off the flag, not off a conservative view existing (the host
+      // builds that only once a frontier cloud has arrived). The predicate reads
+      // the RAW map: stamping writes voxels into the conservative copy.
+      const planning::MapHandle cons = conservative ? conservative : map;
+      const double t_field = now();
+      const auto cons_field =
+          conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
+      const double field_time = now() - t_field;
+      result.ok = runTrajgen(path, result.anchor.t0, result.anchor.start, cons_field, cons,
+                             cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+                                                          : planning::CorridorUnknownFn{},
+                             result.traj, /*pin_waypoints=*/false, root_shift, &result.info);
+      result.cancelled = solve_cancel_.load();
+      const double solve_time = now() - t_gen;
+      DRONE_LOG_INFO("[trajgen] solve for " << needsName(job.needs) << ": " << solve_time
+                     << " s (field " << field_time << " s, corridor " << trajgen_corridor_time_
+                     << " s, QP " << trajgen_qp_time_ << " s) | "
+                     << (result.anchor.from_trajectory ? "splice" : "rest") << ", starts "
+                     << result.anchor.t0 - t_gen << " s after the solve began | search last "
+                     << last_search_time_.load() << " s"
+                     << (search_running_.load() ? ", one running now" : "") << " | "
+                     << (result.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED"));
+    }
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    result_ = std::move(result);
+    has_result_ = true;
+  }
+}
+
+// The trajectory monitor. It is the one place that decides anything about
+// trajectories; the solver only runs the solves it is given. Each tick:
+//   1. Work out the NEEDS of what the tracker will fly (the trajectory being
+//      flown and any staged after it): OBSTACLE_EVASION (the latest one fails
+//      its safety check on the current map), NEW_PLAN (it was built for an older
+//      committed path, or there is none), WAYPOINT_ADVANCED (truncation's stop
+//      point has moved on TRAJ_EXTEND_DIST, or at all within TRAJ_EXTEND_HORIZON
+//      of its end). Plus an emergency stop when an unsafe point is too close.
+//   2. Judge a result the solver just returned, and re-judge the one in the
+//      waiting room, against those needs (see `judge` below). One that would go
+//      through switches off the needs it satisfies; one that no longer
+//      qualifies is scrapped. The waiting one is handed over once the
+//      trajectory staged before it has engaged.
+//   3. Health signal while neither OBSTACLE_EVASION nor NEW_PLAN is on.
+//   4. Decide the solver: cancel the solve in flight if a need it cannot meet
+//      has come up (see below), and start one, with a snapshot of the needs, if
+//      any need is on or TRAJ_IMPROVE_PERIOD has passed since the last solve that
+//      finished uninterrupted.
+// It ticks at traj_monitor_rate, and at once when a result arrives or a
+// hand-over is due, since those cannot wait up to a tick.
+void AutonomyCore::monitorLoop() {
+  bool in_flight = false;
+  SolveJob flight;  // the monitor's copy, the one whose `needs` are authoritative
+  std::uint64_t next_id = 1;
+  bool waiting = false;
+  SolveResult room;  // the waiting room
+  double last_completed = -1.0e9;
+  double next_tick = now();
+  std::string last_needs = "";
+  std::string last_evasion;
+  // How long after the previous trajectory's start the tracker's slot is free
+  // again: it promotes at t0 on its next control tick, and a hand-over read on
+  // that same tick must not overwrite it first.
+  constexpr double kSlotMargin = 0.05;
+  constexpr double kWaypointTol = 0.1;  // [m] a stop point this close counts as reached
+
+  const auto postJob = [&](const Needs& needs, std::uint64_t version) {
+    flight = SolveJob{next_id++, needs, version};
+    in_flight = true;
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    job_ = flight;
+    has_job_ = true;
+  };
+  const auto cancelJob = [&](const std::string& why) {
+    DRONE_LOG_INFO("[trajmon] solve for " << needsName(flight.needs) << " CANCELLED: " << why);
+    {
+      std::lock_guard<std::mutex> lock(job_mutex_);
+      has_job_ = false;  // not picked up yet: never start it
+    }
+    solve_cancel_.store(true);
+    solve_abort_.store(true);
+    in_flight = false;
+  };
+
+  while (running_.load()) {
+    double t = now();
+
+    // Collect a result — only the one for the job in flight; a cancelled job's
+    // leftovers are ignored.
+    SolveResult res;
+    bool got = false;
+    {
+      std::lock_guard<std::mutex> lock(job_mutex_);
+      if (has_result_) {
+        res = std::move(result_);
+        has_result_ = false;
+        got = in_flight && res.job.id == flight.id;
+      }
+    }
+    if (got) {
+      in_flight = false;
+      res.job = flight;  // its needs as the monitor last amended them
+      if (!res.cancelled) last_completed = t;
+    }
+    double prev_t0 = -1.0e9;
+    {
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      if (has_last_planned_) prev_t0 = last_planned_.t0;
+    }
+    const bool handover_due = waiting && t >= prev_t0 + kSlotMargin;
+    if (!got && !handover_due && t < next_tick) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      continue;
+    }
+
+    planning::MapHandle map;
+    planning::MapHandle conservative;
+    Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
+    {
+      std::lock_guard<std::mutex> lock(io_mutex_);
+      map = map_;
+      conservative = conservative_map_;
+      world_from_map = world_from_map_;
+      if (monitor_config_dirty_) {
+        monitor_cfg_ = pending_config_;
+        monitor_config_dirty_ = false;
+      }
+    }
+    const Config& c = monitor_cfg_;
+    if (t >= next_tick) next_tick = t + 1.0 / std::max(c.traj_monitor_rate, 0.5);
+    if (!c.plan_trajectory || preset_active_.load() || !map) {
+      waiting = false;
+      continue;
+    }
+
+    // ---- 1. Needs of what the tracker will fly ------------------------------
+    std::vector<TrajRecord> recs;
+    {
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      while (records_.size() > 1 && records_[1].traj.t0 <= t) records_.erase(records_.begin());
+      recs = records_;
+    }
+    std::uint64_t version = 0;
+    const std::vector<std::vector<double>> path = committedPath(&version);
+    const planning::MapHandle cons = conservative ? conservative : map;
+    const double maxd = std::max(c.clearance_threshold, c.frontier_margin);
+    const Eigen::Isometry3d map_from_world = world_from_map.inverse();
+    const bool corridor = c.use_corridor_qp;
+    const auto field = corridor ? conservativeField(cons, maxd) : nullptr;
+    const planning::CorridorClearanceFn clearance =
+        field ? makeClearanceFn(field, maxd) : planning::CorridorClearanceFn{};
+    const planning::CorridorUnknownFn unknown =
+        c.treat_unknown_as_hazard ? makeUnknownFn(map) : planning::CorridorUnknownFn{};
+
+    Needs needs;
+    bool emergency = false;
+    std::string evasion_note;
+    double trunc_arc_now = -1.0;  // truncation's stop point now, as arc length along the path
+    if (recs.empty()) {
+      needs.new_plan = !path.empty();
+    } else {
+      needs.new_plan = recs.back().path_version != version;
+      if (field && recs.back().corridor) {
+        // Each trajectory over the stretch it will actually be flown. Only a
+        // failure in the LAST one is an evasion need: an earlier one's stretch is
+        // flown before anything new could engage, so it is the emergency stop's.
+        bool latest_fails = false;
+        planning::TrajectoryCheck worst;
+        bool any_fail = false;
+        for (std::size_t i = 0; i < recs.size(); ++i) {
+          const bool last = i + 1 == recs.size();
+          const double until = last ? 0.0 : recs[i + 1].traj.t0;
+          if (!last && until <= t) continue;
+          auto p = checkParams(c, recs[i].start_margin, recs[i].first_segment_end,
+                               cons->getResolution());
+          p.emergency_horizon =
+              std::max(0.0, c.emergency_horizon - std::max(0.0, recs[i].traj.t0 - t));
+          const auto check = planning::checkTrajectory(clearance, unknown, recs[i].traj,
+                                                       map_from_world, t, until, p);
+          if (!check.ok) {
+            if (!any_fail || check.worst_time < worst.worst_time) worst = check;
+            any_fail = true;
+            if (last) latest_fails = true;
+          }
+          emergency = emergency || check.emergency;
         }
-        // What the search thread is doing. It no longer runs on this thread, so
-        // this cannot be "time spent searching this tick" — it is the duration of
-        // the last completed search, and whether one is in flight right now
-        // (in which case this trajectory is deliberately built on the older
-        // committed path rather than waiting for it).
-        std::ostringstream search_note;
-        search_note << "last " << last_search_time_.load() << " s"
-                    << (search_running_.load() ? ", one running now" : "");
-        std::ostringstream gap;
-        if (since_staged >= 0.0) {
-          gap << since_staged << " s";
-        } else {
-          gap << "none staged yet";
+        needs.evasion = latest_fails;
+        if (any_fail) {
+          std::ostringstream os;
+          os << (worst.unknown ? std::string("never-observed space")
+                               : "clearance " + std::to_string(worst.worst_clearance) +
+                                     " m < required " + std::to_string(worst.worst_required) + " m")
+             << " " << worst.worst_time - t << " s ahead at (" << worst.worst_point.x() << ", "
+             << worst.worst_point.y() << ", " << worst.worst_point.z() << ")";
+          evasion_note = os.str();
         }
-        DRONE_LOG_INFO("[trajgen] replan: solve " << solve_time << " s (field " << field_time
-                       << " s, corridor " << trajgen_corridor_time_ << " s, QP " << trajgen_qp_time_
-                       << " s) | " << (anchor.from_trajectory ? "splice" : "rest") << ", lead "
-                       << lead_used << " s"
-                       << (anchor.from_trajectory
-                               ? (late > 0.0 ? " -> ENGAGING LATE by " : " -> on time, spare ")
-                               : " -> splice would be late by ")
-                       << (anchor.from_trajectory && late <= 0.0 ? lead_used - solve_time : late)
-                       << " s | since last staged " << gap.str() << " (STALE_TIMEOUT "
-                       << cfg_.stale_timeout << " s) | search " << search_note.str()
-                       << " | next lead " << trajgen_lead_ << " s | "
-                       << (ok ? "OK" : "FAILED"));
-
-        if (ok) {
-          stagePlanned(anchor, traj, world_from_map);
-          last_trajgen_ = t;
+      }
+      // WAYPOINT_ADVANCED: truncation re-run on the committed path, rooted where
+      // the reference is now, against where it stopped when the latest
+      // trajectory was built. Meaningless across a plan change.
+      if (field && recs.back().corridor && !needs.new_plan && path.size() >= 2) {
+        const TrajRecord& active =
+            (recs.size() > 1 && t < recs.back().traj.t0) ? recs.front() : recs.back();
+        std::vector<Eigen::Vector3d> epath;
+        for (const auto& w : path) epath.emplace_back(w[0], w[1], w[2]);
+        epath.front() = map_from_world * common::sampleMotion(active.traj, t).pos;
+        const auto committed = planning::truncatePath(
+            clearance, epath, c.frontier_margin * (1.0 - kTruncationTolerance), c.escape_ramp_dist,
+            0.05, unknown, nullptr, cons->getResolution(), kTruncationTolerance);
+        if (committed.size() >= 2) {
+          constexpr double kMinAdvance = 0.05;  // below this it is noise, not progress [m]
+          trunc_arc_now = arcLengthAlong(path, committed.back());
+          const double advance = trunc_arc_now - recs.back().trunc_end_arc;
+          const double time_left = recs.back().traj.t0 + recs.back().traj.total_duration - t;
+          needs.waypoint = advance >= c.traj_extend_dist ||
+                           (advance > kMinAdvance && time_left <= c.traj_extend_horizon);
         }
       }
     }
 
-    // Tick faster than the trajgen period so the period itself is met closely and
-    // a preset or a divergence replan is picked up promptly, with a floor that
-    // keeps a mis-set period from turning this into a busy loop.
-    const double due = last_trajgen_ + cfg_.trajgen_period - now();
-    std::this_thread::sleep_for(
-        std::chrono::duration<double>(std::clamp(due, 0.01, 0.1)));
+    // ---- 2. Judge results against the needs ---------------------------------
+    // Whether `r` would go through now, and which needs it satisfies:
+    //  - OBSTACLE_EVASION on: it must pass the check on the current map; it then
+    //    goes through and satisfies EVASION, NEW_PLAN if it was asked for the
+    //    current plan, WAYPOINT_ADVANCED if it reaches the advanced stop point.
+    //  - else NEW_PLAN on: it goes through only if it was asked for the current
+    //    plan, whatever the other flags say; otherwise it is scrapped.
+    //  - else WAYPOINT_ADVANCED on: it goes through if it reaches the advanced
+    //    stop point, or if it is better as an improve (below).
+    //  - else: an improve — it goes through only if it reaches the current
+    //    trajectory's stop point sooner.
+    // Whatever the case it must pass the check on the current map, and it must
+    // not have been spliced onto a trajectory since abandoned.
+    const auto judge = [&](const SolveResult& r, Needs* satisfied, std::string* why) {
+      *satisfied = Needs{};
+      if (!r.ok) {
+        *why = "the solve failed";
+        return false;
+      }
+      if (r.epoch != splice_epoch_.load()) {
+        *why = "the trajectory it was spliced onto was abandoned";
+        return false;
+      }
+      if (field && r.info.corridor) {
+        const auto check = planning::checkTrajectory(
+            clearance, unknown, r.traj, Eigen::Isometry3d::Identity(), r.traj.t0, 0.0,
+            checkParams(c, r.info.start_margin,
+                        r.traj.t0 + (r.traj.segment_times.empty() ? 0.0
+                                                                  : r.traj.segment_times.front()),
+                        cons->getResolution()));
+        if (!check.ok) {
+          std::ostringstream os;
+          os << "not safe on the current map ("
+             << (check.unknown ? std::string("never-observed space")
+                               : "clearance " + std::to_string(check.worst_clearance) + " m < " +
+                                     std::to_string(check.worst_required) + " m")
+             << " " << check.worst_time - r.traj.t0 << " s into it)";
+          *why = os.str();
+          return false;
+        }
+      }
+      const bool current_plan = r.version == version;
+      const bool plan_ok = r.job.needs.new_plan && current_plan;
+      const bool wp_ok = needs.waypoint && current_plan && trunc_arc_now >= 0.0 &&
+                         arcLengthAlong(path, r.info.trunc_end) >= trunc_arc_now - kWaypointTol;
+      // Improve: reaches the current trajectory's stop point sooner. Not a
+      // comparison of total durations — one that goes further is longer overall.
+      // One that does not pass within kReach of that stop point is not better.
+      const auto better = [&](std::string* note) {
+        if (recs.empty() || !current_plan) return false;
+        const TrajRecord& cur = recs.back();
+        constexpr double kReach = 0.1;        // [m]
+        constexpr double kReachLoose = 0.25;  // closest approach still accepted [m]
+        constexpr double kMinGain = 0.05;     // [s]
+        const Eigen::Vector3d stop =
+            map_from_world *
+            common::sampleMotion(cur.traj, cur.traj.t0 + cur.traj.total_duration).pos;
+        double best_d = std::numeric_limits<double>::infinity();
+        double t_best = -1.0;
+        double t_reach = -1.0;
+        for (double tau = 0.0; tau <= r.traj.total_duration + 1e-9; tau += 0.02) {
+          const double d = (common::sampleMotion(r.traj, r.traj.t0 + tau).pos - stop).norm();
+          if (d < best_d) {
+            best_d = d;
+            t_best = tau;
+          }
+          if (d <= kReach) {
+            t_reach = tau;
+            break;
+          }
+        }
+        if (t_reach < 0.0 && best_d <= kReachLoose) t_reach = t_best;
+        std::ostringstream os;
+        if (t_reach < 0.0) {
+          os << "stops " << best_d << " m short of the current stop point";
+          *note = os.str();
+          return false;
+        }
+        const double arrival = r.traj.t0 + t_reach;
+        const double current_arrival = cur.traj.t0 + cur.traj.total_duration;
+        os << "reaches the current stop point in " << arrival - t << " s vs " << current_arrival - t
+           << " s";
+        *note = os.str();
+        return arrival < current_arrival - kMinGain;
+      };
+      std::string note;
+      if (needs.evasion) {
+        satisfied->evasion = true;
+        satisfied->new_plan = plan_ok;
+        satisfied->waypoint = wp_ok;
+        return true;
+      }
+      if (needs.new_plan) {
+        if (!plan_ok) {
+          *why = "NEW_PLAN is on and it was not built for the current plan";
+          return false;
+        }
+        satisfied->new_plan = true;
+        satisfied->waypoint = wp_ok;
+        return true;
+      }
+      if (needs.waypoint) {
+        if (wp_ok) {
+          satisfied->waypoint = true;
+          return true;
+        }
+        if (better(&note)) return true;
+        *why = "does not reach the advanced stop point and is not better (" + note + ")";
+        return false;
+      }
+      if (better(&note)) return true;
+      *why = "not better (" + note + ")";
+      return false;
+    };
+    const auto satisfy = [&needs](const Needs& s) {
+      if (s.evasion) needs.evasion = false;
+      if (s.new_plan) needs.new_plan = false;
+      if (s.waypoint) needs.waypoint = false;
+    };
+    const auto handOver = [&]() {
+      // A splice must still start at least kStageMargin from now, or it would
+      // reach the tracker too late to engage where it was spliced.
+      const double left = room.anchor.t0 - now();
+      if (room.anchor.from_trajectory && left < kStageMargin) {
+        DRONE_LOG_INFO("[trajmon] waiting " << needsName(room.job.needs)
+                       << " trajectory SCRAPPED at hand-over: only " << left
+                       << " s before its start (< " << kStageMargin << " s)");
+        waiting = false;
+        return;
+      }
+      const common::Trajectory staged = stagePlanned(room.anchor, room.traj, room.world_from_map);
+      recordStaged(staged, room.info, room.version, room.path);
+      DRONE_LOG_INFO("[trajmon] " << needsName(room.job.needs) << " trajectory STAGED: "
+                     << staged.total_duration << " s, starts in " << staged.t0 - now() << " s ("
+                     << (room.anchor.from_trajectory ? "splice" : "rest") << ")");
+      waiting = false;
+    };
+
+    if (got && !res.cancelled) {
+      Needs s;
+      std::string why;
+      if (judge(res, &s, &why)) {
+        satisfy(s);
+        room = std::move(res);
+        waiting = true;
+        DRONE_LOG_INFO("[trajmon] result for " << needsName(room.job.needs)
+                       << " ACCEPTED, satisfies " << (s.any() ? needsName(s) : std::string("none (better)"))
+                       << " -> waiting room");
+      } else {
+        DRONE_LOG_INFO("[trajmon] result for " << needsName(res.job.needs) << " SCRAPPED: " << why);
+      }
+    } else if (waiting) {
+      // Re-judged every tick it waits: the needs may have changed since.
+      Needs s;
+      std::string why;
+      if (judge(room, &s, &why)) {
+        satisfy(s);
+      } else {
+        DRONE_LOG_INFO("[trajmon] waiting " << needsName(room.job.needs)
+                       << " trajectory SCRAPPED: " << why);
+        waiting = false;
+      }
+    }
+    if (waiting) {
+      {
+        std::lock_guard<std::mutex> lock(traj_mutex_);
+        if (has_last_planned_) prev_t0 = last_planned_.t0;
+      }
+      t = now();
+      if (t >= prev_t0 + kSlotMargin) handOver();
+    }
+
+    // ---- 3. Emergency and health --------------------------------------------
+    if (emergency) {
+      DRONE_LOG_ERROR("[trajmon] EMERGENCY STOP: " << evasion_note);
+      emergency_request_.store(true);
+      // Everything in flight, waiting or staged was spliced onto the trajectory
+      // being abandoned: drop it all here (not in stepControl, which does not run
+      // on a disarmed bench), so the next trajectory starts at rest.
+      if (in_flight) cancelJob("emergency stop");
+      waiting = false;
+      splice_epoch_.fetch_add(1);
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      has_pending_ = false;
+      has_last_planned_ = false;
+      last_planned_ = common::Trajectory{};
+      records_.clear();
+    }
+    if (!recs.empty() && !needs.evasion && !needs.new_plan) heartbeat_.store(true);
+
+    // ---- 4. Decide the solver -----------------------------------------------
+    if (in_flight) {
+      const Needs& f = flight.needs;
+      if (!f.any() && needs.any()) {
+        cancelJob("an improve, and " + needsName(needs) + " came up");
+      } else if (!f.evasion && !f.new_plan && f.waypoint && (needs.evasion || needs.new_plan)) {
+        cancelJob("WAYPOINT_ADVANCED only, and " + needsName(needs) + " came up");
+      } else if (f.new_plan && version != flight.version) {
+        if (f.evasion) {
+          // Evasion is never cut short: let it finish, it can still go through
+          // as an evasion. It no longer satisfies NEW_PLAN, so that stays on.
+          flight.needs.new_plan = false;
+          DRONE_LOG_INFO("[trajmon] a newer plan arrived during an OBSTACLE_EVASION solve: it "
+                         "keeps running for the evasion; NEW_PLAN stays on");
+        } else {
+          cancelJob("a newer plan arrived");
+        }
+      }
+    }
+    if (!in_flight && !waiting && !path.empty() && !emergency) {
+      if (needs.any()) {
+        postJob(needs, version);
+        DRONE_LOG_INFO("[trajmon] solve started for " << needsName(needs)
+                       << (needs.evasion ? " (" + evasion_note + ")" : std::string()));
+      } else if (!recs.empty() && t - last_completed >= c.traj_improve_period) {
+        postJob(needs, version);
+      }
+    }
+
+    const std::string now_needs = needs.any() ? needsName(needs) : std::string("none");
+    if (now_needs != last_needs) {
+      DRONE_LOG_INFO("[trajmon] needs: " << now_needs
+                     << (needs.evasion || needs.new_plan ? " (no health signal)" : ""));
+      last_needs = now_needs;
+    }
   }
 }
 

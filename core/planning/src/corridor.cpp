@@ -1,5 +1,7 @@
 #include "drone_core/planning/corridor.hpp"
 
+#include "drone_core/common/trajectory_eval.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -336,6 +338,48 @@ std::vector<Eigen::Vector3d> truncatePath(const CorridorClearanceFn& conservativ
     out.push_back(b);
   }
   return out;  // whole path safe
+}
+
+TrajectoryCheck checkTrajectory(const CorridorClearanceFn& clearance,
+                                const CorridorUnknownFn& is_unknown,
+                                const common::Trajectory& traj,
+                                const Eigen::Isometry3d& field_from_traj, double t_from,
+                                double t_until, const TrajectoryCheckParams& p) {
+  TrajectoryCheck out;
+  if (traj.empty()) return out;
+  const double t_start = std::max(t_from, traj.t0);
+  double t_end = traj.t0 + traj.total_duration;
+  if (t_until > t_from) t_end = std::min(t_end, t_until);
+  if (t_end < t_start) return out;
+  // Per-axis limits allow up to sqrt(3) x vmax in norm; max_speed is the caller's
+  // bound on that.
+  const double dt = p.sample_step / std::max(p.max_speed, 1e-3);
+  const double half_step = 0.5 * p.sample_step;
+  double worst_margin_excess = std::numeric_limits<double>::infinity();
+  const int n = std::max(1, static_cast<int>(std::ceil((t_end - t_start) / dt)));
+  for (int k = 0; k <= n; ++k) {
+    const double t = t_start + (t_end - t_start) * static_cast<double>(k) / n;
+    const Eigen::Vector3d q = field_from_traj * common::sampleMotion(traj, t).pos;
+    const double margin = t < p.first_segment_end ? p.start_margin : p.margin;
+    const double required = margin - std::max(p.slack, p.rel * margin);
+    const bool unknown = is_unknown && is_unknown(q.x(), q.y(), q.z());
+    const double d = unknown ? 0.0 : clearance(q.x(), q.y(), q.z()) - half_step;
+    const bool fails = unknown || d < required;
+    if (fails && t - t_start <= p.emergency_horizon &&
+        (unknown || d <= 0.0 || d < p.emergency_factor * margin)) {
+      out.emergency = true;
+    }
+    if (d - required < worst_margin_excess) {
+      worst_margin_excess = d - required;
+      out.worst_time = t;
+      out.worst_clearance = d;
+      out.worst_required = required;
+      out.worst_point = q;
+      out.unknown = unknown;
+    }
+    if (fails) out.ok = false;
+  }
+  return out;
 }
 
 double corridorObstacleWindowPad(const CorridorParams& p) {
