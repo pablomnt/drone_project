@@ -348,11 +348,41 @@ int checkHealthAndEmergency() {
   tracker.update(s, 307.6, 0.02);
   if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) fail("no hold after the health timeout");
 
-  // Emergency stop: immediate, even with a fresh heartbeat, and drops the staged one.
+  // The timeout itself is reported once, on the update that stops following, so the
+  // caller can drop plans spliced onto the trajectory just abandoned. (The hold
+  // above happened at 307.6 with a fresh heartbeat still to come.)
+  {
+    TrajectoryTracker t2;
+    t2.setHealthTimeout(2.5);
+    t2.setMaxTrackingError(0.0);
+    t2.setHoverThrust(0.35);
+    t2.reset();
+    t2.setTrajectory(makeTraj(400.0, 20.0, poly({0.0, 0.1}), poly({0.0}), poly({1.5})), 400.0);
+    State q;
+    q.pos = Eigen::Vector3d(0.0, 0.0, 1.5);
+    t2.update(q, 401.0, 0.02);
+    if (t2.takeHealthTimeout()) fail("health timeout reported while healthy");
+    t2.update(q, 402.6, 0.02);  // 2.6 s since the last signal
+    if (t2.mode() != TrajectoryTracker::Mode::kHoverHold) fail("no hold after the timeout");
+    if (!t2.takeHealthTimeout()) fail("takeHealthTimeout() missed the timeout");
+    t2.update(q, 402.7, 0.02);
+    if (t2.takeHealthTimeout()) fail("takeHealthTimeout() fired twice for one timeout");
+  }
+
+  // A health signal arriving after the timeout must NOT bring the abandoned
+  // trajectory back (the monitor and the control thread run apart, so one sent just
+  // before the timeout can arrive just after it); only a new trajectory does.
   tracker.keepFresh(307.6);
   tracker.update(s, 307.61, 0.02);
-  if (tracker.mode() != TrajectoryTracker::Mode::kTracking) fail("health signal did not resume tracking");
-  tracker.setTrajectory(makeTraj(308.5, 5.0, poly({0.8}), poly({0.0}), poly({1.5})), 307.62);
+  if (tracker.mode() != TrajectoryTracker::Mode::kHoverHold) {
+    fail("a late health signal revived the abandoned trajectory");
+  }
+  tracker.setTrajectory(makeTraj(307.65, 5.0, poly({0.7}), poly({0.0}), poly({1.5})), 307.62);
+  tracker.update(s, 307.66, 0.02);
+  if (tracker.mode() != TrajectoryTracker::Mode::kTracking) fail("a new trajectory did not resume tracking");
+
+  // Emergency stop: immediate, even with a fresh heartbeat, and drops the staged one.
+  tracker.setTrajectory(makeTraj(308.5, 5.0, poly({0.8}), poly({0.0}), poly({1.5})), 307.67);
   tracker.emergencyStop();
   s.pos.x() = 0.76;
   tracker.update(s, 307.63, 0.02);

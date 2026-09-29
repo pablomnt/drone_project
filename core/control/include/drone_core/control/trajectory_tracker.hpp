@@ -70,7 +70,16 @@ public:
   // replanned) hold kTracking for the whole duration instead of falling to
   // hover-hold after stale_timeout. Does nothing useful unless a trajectory is
   // installed. Control thread only, like setTrajectory/update.
-  void keepFresh(double now) { last_arrival_ = now; }
+  //
+  // Ignored while the tracker is holding, diverged or emergency-stopped: only a
+  // newly installed trajectory ends those. A health signal sent just before the
+  // tracker stopped following (the monitor and the control thread run apart) would
+  // otherwise arrive after it and bring the abandoned trajectory back to life
+  // for a tick — a step of the reference (scratch run 2026-09-29: 0.5 m).
+  void keepFresh(double now) {
+    if (mode_ == Mode::kHoverHold || diverged_ || stopped_) return;
+    last_arrival_ = now;
+  }
 
   // Emergency stop: on the next update, stop following the trajectory at once and
   // hold the vehicle's current position, without waiting for the health timeout,
@@ -111,6 +120,19 @@ public:
   // reference that has just proved wrong.
   bool isDiverged() const { return diverged_; }
 
+  // True exactly once per health timeout: the update() on which the tracker
+  // stopped following a trajectory because no health signal arrived within
+  // setHealthTimeout, then false until the next one. The caller uses it like
+  // takeDivergence(): anything planned or staged by splicing onto the trajectory
+  // that was just abandoned no longer means anything (it assumes the reference
+  // kept moving; the tracker is now holding), so it is dropped and the next plan
+  // starts at rest. Control thread only.
+  bool takeHealthTimeout() {
+    const bool edge = health_timeout_event_;
+    health_timeout_event_ = false;
+    return edge;
+  }
+
   // True exactly once per divergence, on the update() that detected it, then
   // false until the next one. The caller uses it to act once: stop splicing onto
   // the abandoned trajectory and request a replan from the vehicle's position.
@@ -137,6 +159,7 @@ private:
   double max_tracking_error_{1.0};
   bool diverged_{false};          // latched; see isDiverged()
   bool divergence_event_{false};  // one-shot; see takeDivergence()
+  bool health_timeout_event_{false};  // one-shot; see takeHealthTimeout()
   bool emergency_requested_{false};  // see emergencyStop(); consumed by update()
   bool stopped_{false};              // latched emergency stop
   bool feedforward_{false};

@@ -630,6 +630,9 @@ private:
   // vehicle, the trajgen side regenerates from the vehicle's position.
   std::atomic<bool> search_replan_requested_{false};
   std::atomic<bool> trajgen_replan_requested_{false};
+  // Raised by the solver when a splice solve failed with the anchor far off the
+  // committed path: the path is stale, so the search thread drops it and re-plans.
+  std::atomic<bool> search_stale_path_{false};
   Config pending_config_;
   bool search_config_dirty_{false};
   bool trajgen_config_dirty_{false};

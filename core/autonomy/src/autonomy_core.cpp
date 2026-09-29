@@ -465,7 +465,13 @@ common::Command AutonomyCore::stepControl(double dt) {
   // Edge-triggered on purpose: clearing on every held tick would also discard
   // the recovery trajectory staged while the tracker is still holding, and the
   // plan after that would then start from rest while the vehicle is moving.
-  if (tracker_.takeDivergence()) {
+  // A health timeout is handled the same way: the tracker is now holding where the
+  // vehicle is, so a plan spliced onto the trajectory it abandoned would start
+  // ahead of the hold point and step the reference when it took over (scratch
+  // run 2026-09-29: 0.36 m).
+  const bool lost_reference = tracker_.takeDivergence();
+  const bool health_lapsed = tracker_.takeHealthTimeout();
+  if (lost_reference || health_lapsed) {
     splice_epoch_.fetch_add(1);
     {
       std::lock_guard<std::mutex> lock(traj_mutex_);
@@ -1386,10 +1392,13 @@ void AutonomyCore::searchLoop() {
     // is. stepControl has already cleared the splice source and the monitor's
     // records, so the monitor asks for a new trajectory at once and it starts
     // from rest at the measured position.
+    if (search_stale_path_.exchange(false)) {
+      setCommittedPath({});
+    }
     if (search_replan_requested_.exchange(false)) {
       setCommittedPath({});
       if (has_goal) {
-        DRONE_LOG_INFO("[plan] tracking diverged: replanning from the vehicle's position");
+        DRONE_LOG_INFO("[plan] the tracker abandoned its trajectory (diverged or no health signal): replanning from the vehicle's position");
       }
     }
 
@@ -1655,7 +1664,7 @@ void AutonomyCore::searchLoop() {
         std::lock_guard<std::mutex> lock(io_mutex_);
         if (new_goal_) break;
       }
-      if (search_replan_requested_.load()) break;
+      if (search_replan_requested_.load() || search_stale_path_.load()) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
@@ -1811,40 +1820,54 @@ void AutonomyCore::trajgenLoop() {
       // start", a 3.6 m path handed over as 5.8 m, corridors infeasible).
       const std::vector<double> root = {result.anchor.start.pos.x(), result.anchor.start.pos.y(),
                                         result.anchor.start.pos.z()};
-      std::vector<std::vector<double>> path = remainingCommittedSuffix(committed_path, root);
+      const std::vector<std::vector<double>> rooted =
+          remainingCommittedSuffix(committed_path, root);
       // Braking stub. A splice pins the start velocity; when the new path leaves
       // at a sharp angle to it (a goal to the side or behind, at cruise), the
       // corridor grown along the new path gives the vehicle ~1 m to brake in its
       // old direction and the QP is infeasible at every time allocation (0.6 m/s
       // reversal, measured). Lead the path in with a straight stub along the
-      // current velocity, as long as a jerk-limited stop from that speed, so the
-      // first corridor region holds the braking. Truncation checks the stub like
-      // the rest of the path, so it never commits into an obstacle; if there is
-      // no room to stop there, the solve fails as it did before.
-      std::ostringstream stub_note;
-      if (result.anchor.from_trajectory && path.size() >= 2) {
+      // current velocity so the first corridor region holds the braking.
+      // Truncation checks the stub like the rest of the path, so it never commits
+      // into an obstacle; if there is no room to stop there, the solve fails.
+      //
+      // How long it must be is not the physical stopping distance: the Bezier hull
+      // constraint is conservative, and on the bench (2026-09-29) stubs of 0.70-0.84
+      // m (1.5x the stop) were QP-infeasible while 1.13 m worked. So the solve
+      // tries a longer stub, in place, when one fails — each try ~0.1 s — rather
+      // than failing back to the monitor, whose retries moved the anchor along the
+      // old trajectory a little further from the (fixed) path every time.
+      double stub_ideal = 0.0;
+      Eigen::Vector3d stub_dir = Eigen::Vector3d::Zero();
+      if (result.anchor.from_trajectory && rooted.size() >= 2) {
         const Eigen::Vector3d v = result.anchor.start.vel;
         const double speed = v.norm();
         const Eigen::Vector3d first =
-            Eigen::Vector3d(path[1][0], path[1][1], path[1][2]) -
-            Eigen::Vector3d(path[0][0], path[0][1], path[0][2]);
-        constexpr double kStubMinSpeed = 0.1;     // [m/s]
-        constexpr double kStubCosAngle = 0.5;     // path leaving > 60 deg off the velocity
-        constexpr double kStubSafety = 1.5;       // x the ideal stopping distance
+            Eigen::Vector3d(rooted[1][0], rooted[1][1], rooted[1][2]) -
+            Eigen::Vector3d(rooted[0][0], rooted[0][1], rooted[0][2]);
+        constexpr double kStubMinSpeed = 0.1;  // [m/s]
+        constexpr double kStubCosAngle = 0.5;  // path leaving > 60 deg off the velocity
         if (speed > kStubMinSpeed && first.norm() > 1e-6 &&
             v.dot(first) / (speed * first.norm()) < kStubCosAngle) {
           const double a = std::max(cfg_.amax, 1e-3), j = std::max(cfg_.jmax, 1e-3);
           const double ramp = speed >= a * a / j ? speed / a + a / j : 2.0 * std::sqrt(speed / j);
-          const double stop = kStubSafety * 0.5 * speed * ramp;
-          const Eigen::Vector3d tip =
-              Eigen::Vector3d(path[0][0], path[0][1], path[0][2]) + (stop / speed) * v;
-          path.insert(path.begin() + 1, {tip.x(), tip.y(), tip.z()});
-          stub_note << " | braking stub " << stop << " m";
+          stub_ideal = 0.5 * speed * ramp;  // jerk-limited stopping distance
+          stub_dir = v / speed;
         }
       }
+      const auto pathWithStub = [&](double factor) {
+        std::vector<std::vector<double>> path = rooted;
+        if (stub_ideal > 0.0) {
+          const Eigen::Vector3d tip = Eigen::Vector3d(path[0][0], path[0][1], path[0][2]) +
+                                      factor * stub_ideal * stub_dir;
+          path.insert(path.begin() + 1, {tip.x(), tip.y(), tip.z()});
+        }
+        return path;
+      };
       // How far the anchor is off the committed path, for the truncation log.
-      const double root_shift = distanceToPath(
-          committed_path, Eigen::Vector3d(root[0], root[1], root[2]));
+      const double root_shift =
+          distanceToPath(committed_path, Eigen::Vector3d(root[0], root[1], root[2]));
+      std::ostringstream stub_note;
       // Truncation stops at unobserved space only when the operator asked for
       // it — keyed off the flag, not off a conservative view existing (the host
       // builds that only once a frontier cloud has arrived). The predicate reads
@@ -1854,11 +1877,35 @@ void AutonomyCore::trajgenLoop() {
       const auto cons_field =
           conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
       const double field_time = now() - t_field;
-      result.ok = runTrajgen(path, result.anchor.t0, result.anchor.start, cons_field, cons,
-                             cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
-                                                          : planning::CorridorUnknownFn{},
-                             result.traj, /*pin_waypoints=*/false, root_shift, &result.info);
+      const auto unknown_fn = cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+                                                           : planning::CorridorUnknownFn{};
+      const double factors_with_stub[] = {1.5, 2.25, 3.4};
+      const int tries = stub_ideal > 0.0 ? 3 : 1;
+      for (int k = 0; k < tries; ++k) {
+        const double factor = stub_ideal > 0.0 ? factors_with_stub[k] : 0.0;
+        result.ok = runTrajgen(pathWithStub(factor), result.anchor.t0, result.anchor.start,
+                               cons_field, cons, unknown_fn, result.traj,
+                               /*pin_waypoints=*/false, root_shift, &result.info);
+        if (stub_ideal > 0.0) {
+          stub_note.str("");
+          stub_note << " | braking stub " << factor * stub_ideal << " m (x" << factor << " the stop, try "
+                    << k + 1 << ")";
+        }
+        // Retry longer only while the deadline allows: the anchor is fixed, so a
+        // try must finish leaving the hand-over margin before it.
+        if (result.ok || solve_cancel_.load() || result.anchor.t0 - now() < 0.5) break;
+      }
       result.cancelled = solve_cancel_.load();
+      // A failure with the anchor far off the path means the path is stale (it was
+      // planned from a predicted start the trajectory has since left): drop it so
+      // the search re-plans from a fresh one, instead of retrying it.
+      constexpr double kStalePathShift = 1.0;  // [m]
+      if (!result.ok && !result.cancelled && root_shift > kStalePathShift) {
+        DRONE_LOG_INFO("[trajgen] the splice point is " << root_shift
+                       << " m off the committed path: dropping it so the search re-plans from "
+                          "where the trajectory is now");
+        search_stale_path_.store(true);
+      }
       const double solve_time = now() - t_gen;
       DRONE_LOG_INFO("[trajgen] solve for " << needsName(job.needs) << ": " << solve_time
                      << " s (field " << field_time << " s, corridor " << trajgen_corridor_time_
@@ -1902,6 +1949,7 @@ void AutonomyCore::monitorLoop() {
   bool waiting = false;
   SolveResult room;  // the waiting room
   double last_completed = -1.0e9;
+  double last_failed = -1.0e9;  // when a solve last FAILED; see the retry gap below
   double next_tick = now();
   std::string last_needs = "";
   std::string last_evasion;
@@ -2219,6 +2267,7 @@ void AutonomyCore::monitorLoop() {
                        << " -> waiting room");
       } else {
         DRONE_LOG_INFO("[trajmon] result for " << needsName(res.job.needs) << " SCRAPPED: " << why);
+        if (!res.ok) last_failed = t;
       }
     } else if (waiting) {
       // Re-judged every tick it waits: the needs may have changed since.
@@ -2278,7 +2327,11 @@ void AutonomyCore::monitorLoop() {
         }
       }
     }
-    if (!in_flight && !waiting && !path.empty() && !emergency) {
+    // A failed solve is not retried at once: the same inputs fail the same way, and
+    // the anchor moves along the outgoing trajectory meanwhile. The gap gives the
+    // map, the path or the trajectory time to change.
+    constexpr double kRetryGap = 0.3;  // [s]
+    if (!in_flight && !waiting && !path.empty() && !emergency && t - last_failed >= kRetryGap) {
       if (needs.any()) {
         postJob(needs, version);
         DRONE_LOG_INFO("[trajmon] solve started for " << needsName(needs)

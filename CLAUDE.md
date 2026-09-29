@@ -301,6 +301,18 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   allocation from 0.6 m/s (the first segment's control points are pushed out along it). The stub goes
   through truncation like any path, so it cannot commit into an obstacle. Logged as `| braking stub X m`
   on the `[trajgen] solve` line.
+  **Follow-ups the same day (bench: a reversal toward a wall, then jumps in the simulation).** The stub
+  must be longer than the physical stop: 0.70-0.84 m (1.5x) was QP-infeasible, 1.13 m worked (the
+  Bezier hull is conservative), so the solver retries in place at x1.5, x2.25, x3.4 (~0.1 s each,
+  while the anchor is 0.5 s or more ahead) instead of failing back to the monitor, whose retries moved
+  the anchor a little further from the fixed path each time (splice point 2 m off it). A failure with
+  the splice point more than 1 m off the committed path drops the path so the search re-plans
+  (`search_stale_path_`), and a failed solve is not retried for 0.3 s. A **health timeout** is now
+  treated like a divergence (`TrajectoryTracker::takeHealthTimeout`): plans spliced onto the abandoned
+  trajectory are discarded and the next one starts at rest; and `keepFresh` is ignored while the
+  tracker holds, since a heartbeat sent just before the timeout arrived just after it and revived the
+  abandoned trajectory for a tick (0.5 m step). Perfect-follower simulation, reversal toward a wall:
+  no reference step above 0.026 m over 9 completed runs (one run was cut short by my own mistake).
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
 Module roles:

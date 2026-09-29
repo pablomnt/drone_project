@@ -43,6 +43,7 @@ void TrajectoryTracker::reset() {
   next_ = common::Trajectory{};
   diverged_ = false;
   divergence_event_ = false;
+  health_timeout_event_ = false;
   emergency_requested_ = false;
   stopped_ = false;
 }
@@ -70,6 +71,7 @@ void TrajectoryTracker::clearTrajectory() {
   has_next_ = false;
   diverged_ = false;
   divergence_event_ = false;
+  health_timeout_event_ = false;
   emergency_requested_ = false;
   stopped_ = false;
 }
@@ -99,6 +101,15 @@ common::Command TrajectoryTracker::update(const common::State& state, double now
 
   const bool has_fresh_traj =
       has_traj_ && !traj_.empty() && (now - last_arrival_ <= health_timeout_);
+
+  // The health signals stopped while we were following a trajectory: from this
+  // update on it is held (below). Once, on that edge, for takeHealthTimeout().
+  if (mode_ == Mode::kTracking && has_traj_ && !traj_.empty() && !has_fresh_traj && !diverged_ &&
+      !stopped_) {
+    health_timeout_event_ = true;
+    DRONE_LOG_ERROR("[track] no health signal for " << (now - last_arrival_) << " s (limit "
+                    << health_timeout_ << " s): holding position until a new trajectory arrives");
+  }
 
   // Emergency stop (see emergencyStop): stop following at once and hold here.
   // Latched explicitly, like a divergence, so an older hold point from before this
