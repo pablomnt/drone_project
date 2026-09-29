@@ -266,8 +266,8 @@ planner roots at the drone's live position even on the disarmed bench (control o
 arm+offboard). Goals
 arrive on `/planner/goal`; a `POS_SP` parameter provides the default takeoff/hover setpoint. All PX4
 message types and frame conversions are confined to this file. It also exposes an **opt-in planner
-debug visualisation** — `/planner/search_tree` (the RRT* tree as a MarkerArray) and
-`/planner/clearance_field` (the EDT as an intensity-coloured PointCloud2) — behind the single
+debug visualisation** — `/planner/clearance_field` (the EDT as an intensity-coloured
+PointCloud2) — behind the single
 `DEBUG_PLANNER_VIZ` parameter (default off, zero-cost when off) for tuning planning by eye in
 Foxglove. The same switch exposes `/planner/corridor`, which draws the corridor pipeline's
 intermediate products — the free polyhedra as translucent face outlines, the truncated committed prefix as a
@@ -475,6 +475,7 @@ marked ⚑ and listed again at the end of this section.
 | `HEALTH_TIMEOUT` | double, `2.5` s | How long without a health signal the tracker keeps tracking before falling to `kHoverHold`. The trajectory monitor sends one each tick the trajectory re-checks safe on the current map, none while it is unsafe or superseded by a new plan; a newly handed-over trajectory counts as one. Replaces `STALE_TIMEOUT`. |
 | `MAX_TRACKING_ERROR` | double, `1.0` m | If the vehicle gets further than this from the trajectory's reference, it gives up on that trajectory: it holds its current position, drops anything planned against the old reference, and the planner searches again and generates a new trajectory from there, starting at rest. Latched — it never resumes the abandoned trajectory. Catches what `HEALTH_TIMEOUT` cannot: health signals still arriving while the vehicle has been knocked off course. Logged as `[track] vehicle … m from the trajectory reference`. During a preset it holds until the preset's scheduled end, then returns to `POS_SP` (presets are never replanned). `≤ 0` disables. |
 | `BENCH_TEST_REPLAN_DISABLER` | bool, `false` | **Bench only.** Every replan starts at rest from the drone's measured position instead of splicing onto where the current trajectory says the drone should be by now. On a disarmed bench nothing flies the trajectory, so without this each replan starts further along it and the trajectory shrinks to nothing within its own duration. **Never fly with it on**: every replan would restart from zero velocity, a stutter at every new trajectory. The node warns every 2 s if it is on while the controller is engaged. |
+| `BENCH_TEST_TRANSFER_TESTER` | bool, `false` | **Bench only, battery off.** Simulates a vehicle that has taken off to `POS_SP` and then follows the tracker's reference perfectly; the planner and tracker are fed that vehicle instead of the real one on the desk, so the search, splices, truncation and the trajectory monitor all see one consistent vehicle. Watch the hand-over from `POS_SP` onto a trajectory, and from one trajectory to the next, on the `/control/pos_ff` marker (and `pos_sp` in `/control/debug`). Bypasses the sensor warmup, the armed/offboard gate and the in-flight watchdog; overrides `BENCH_TEST_REPLAN_DISABLER` (replans splice, as in flight) and `MAX_TRACKING_ERROR`. **Sends PX4 no attitude or thrust commands**, and is refused while the vehicle is armed. Turning it off resets the tracker and the real vehicle state takes over again. |
 | `SENSOR_TIMEOUT` | double, `0.5` s | A stream counts as healthy if it produced a sample within this window. Drives both guards below. |
 | `SENSOR_WARMUP` | double, `5.0` s | Continuous stream health required before the controller will *engage*. Any lapse resets the streak, so every takeoff re-proves it. |
 
@@ -496,6 +497,7 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 | `RRT_SOLVE_TIME` | double, `1.0` s | Optimisation budget per solve. All the planners are anytime, so this is a direct quality/latency dial. |
 | `REPLAN_IMPROVE_RATIO` | double, `0.85` | Hysteresis gate: adopt an improvement only if its cost ≤ ratio × the committed path's **remaining** cost from the drone's current position. Prevents replan chatter. |
 | `BEST_EFFORT_GOAL` | bool, `true` | Accept a path that stops short of an unreachable goal (closest reachable point) instead of reporting failure, and keep advancing the endpoint as the map grows. |
+| `RRT_REPLAN_SOLVE_TIME` | double, `0.3` s | Search budget when a path is needed now — a new goal, or the committed path blocked or gone — instead of `RRT_SOLVE_TIME`, which improve searches keep. The search thread also wakes at once on a new goal. |
 | `TRAJ_MONITOR_RATE` | double, `5.0` Hz | How often the trajectory monitor re-checks the trajectory being flown and looks for a reason to replace it. Replaces the fixed `TRAJGEN_PERIOD`. |
 | `TRAJ_IMPROVE_PERIOD` | double, `3.0` s | Time since the last generation after which an improve solve is tried; adopted only if it reaches the current stop point sooner. |
 | `TRAJ_EXTEND_DIST` | double, `0.5` m | Regenerate when truncation's stop point on the committed path has moved this far past the current trajectory's. |

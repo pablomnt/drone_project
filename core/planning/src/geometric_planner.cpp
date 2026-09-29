@@ -6,11 +6,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <string>
 #include <limits>
 #include <utility>
 
 #include <ompl/base/PlannerData.h>
 #include <ompl/base/objectives/StateCostIntegralObjective.h>
+#include <ompl/base/samplers/informed/PathLengthDirectInfSampler.h>
 #include <ompl/geometric/PathGeometric.h>
 #include <ompl/geometric/PathSimplifier.h>
 #include <ompl/geometric/planners/rrt/RRTstar.h>
@@ -77,6 +79,22 @@ public:
     return ompl::base::Cost(si_->distance(s1, s2));
   }
 
+  // Sample the informed set directly. Without this OMPL falls back to rejection
+  // sampling for a state-cost integral: it draws from the whole state space and
+  // keeps only states inside the informed set. Once the best solution is short —
+  // an improve search with the vehicle near the end of its path — that set is a
+  // tiny fraction of the space, almost every draw is rejected, and the sampling
+  // loop does not check the planner's stop condition, so the solve hangs far past
+  // its budget (bench 2026-09-28/29: 59-63 s with EIT*, and ABIT* too; reproduced
+  // offline with start and goal 2-30 cm apart). The path-length ellipsoid is a
+  // valid superset here: the integrand is >= 1, so any state on a path of cost c
+  // lies within length c of start plus goal. Sampling it directly loses no
+  // candidates and costs one draw per sample.
+  ompl::base::InformedSamplerPtr allocInformedStateSampler(
+      const ompl::base::ProblemDefinitionPtr& probDefn, unsigned int maxNumberCalls) const override {
+    return std::make_shared<ompl::base::PathLengthDirectInfSampler>(probDefn, maxNumberCalls);
+  }
+
 private:
   GeometricPlanner::ClearanceFn clearance_;
   double weight_;
@@ -98,16 +116,13 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
   // bare start-goal edge even when a cheaper bend existed.
   space_ = std::make_shared<ompl::base::RealVectorStateSpace>(3);
 
-  // Bounds tuned for the office test environment.
+  // Bounds tuned for the office test environment: above the floor, below eye
+  // level (see kSearchLow / kSearchHigh).
   ompl::base::RealVectorBounds bounds(3);
-  bounds.setLow(0, -15.0);
-  bounds.setHigh(0, 15.0);
-  bounds.setLow(1, -15.0);
-  bounds.setHigh(1, 15.0);
-
-  // Keep the search above the floor and below eye level.
-  bounds.setLow(2, -1.5);
-  bounds.setHigh(2, 2.5);
+  for (int i = 0; i < 3; ++i) {
+    bounds.setLow(i, kSearchLow[i]);
+    bounds.setHigh(i, kSearchHigh[i]);
+  }
 
   space_->as<ompl::base::RealVectorStateSpace>()->setBounds(bounds);
 
@@ -442,6 +457,31 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
 
   for (int i = 0; i < 3; ++i) start->values[i] = start_vec[i];
 
+  // A start outside the box would be refused by OMPL ("invalid start state
+  // (invalid bounds)") and, since the vehicle cannot move without a plan, never
+  // recover. Grow the box just enough to hold it. The goal is not treated this
+  // way: a goal outside the box is clamped into it, not followed out.
+  {
+    auto* rv = space_->as<ompl::base::RealVectorStateSpace>();
+    ompl::base::RealVectorBounds b = rv->getBounds();
+    constexpr double kStartPad = 0.1;  // [m]
+    bool grown = false;
+    for (int i = 0; i < 3; ++i) {
+      if (start_vec[i] < b.low[i]) {
+        b.low[i] = start_vec[i] - kStartPad;
+        grown = true;
+      } else if (start_vec[i] > b.high[i]) {
+        b.high[i] = start_vec[i] + kStartPad;
+        grown = true;
+      }
+    }
+    if (grown) {
+      rv->setBounds(b);
+      DRONE_LOG_INFO("[plan] start (" << start_vec[0] << ", " << start_vec[1] << ", "
+                     << start_vec[2] << ") is outside the search box; grew it to hold the start");
+    }
+  }
+
   // Only the OMPL solve is bounded by planning_time_ — goal projection, the
   // debug tree capture and the post-processing shortcut are not, and the solve
   // itself only checks its termination condition between iterations. A search
@@ -493,6 +533,22 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
 
   for (int i = 0; i < 3; ++i) goal->values[i] = planning_goal[i];
 
+  // Start and (projected) goal coincide: the path is the point itself, and there
+  // is nothing to search. Not handed to OMPL, because a best cost of zero makes
+  // the informed set a single point that the direct sampler can never draw from,
+  // and RRT* then spins past its budget exactly like the rejection-sampling stall
+  // allocInformedStateSampler exists to prevent.
+  constexpr double kCoincident = 1e-3;  // [m]
+  if (std::sqrt(std::pow(planning_goal[0] - start_vec[0], 2) +
+                std::pow(planning_goal[1] - start_vec[1], 2) +
+                std::pow(planning_goal[2] - start_vec[2], 2)) < kCoincident) {
+    result_path.push_back({start_vec[0], start_vec[1], start_vec[2]});
+    result_path.push_back({planning_goal[0], planning_goal[1], planning_goal[2]});
+    last_goal_gap_ = last_goal_projection_;
+    if (record_tree_) last_tree_ = SearchTree{};
+    return true;
+  }
+
   auto pdef = std::make_shared<ompl::base::ProblemDefinition>(si_);
   pdef->setStartAndGoalStates(start, goal);
   pdef->setOptimizationObjective(makeObjective());
@@ -509,7 +565,22 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   // scope. Done regardless of success (the tree of a *failed* solve is just as
   // useful to look at) but only when recording is on, so a flight build never
   // pays for getPlannerData().
+  // Skipped when the search sampled too many states to copy quickly: getPlannerData
+  // runs without any time limit, and a short search (start near goal) now samples
+  // its small informed set densely enough that copying it took 40 s (bench
+  // 2026-09-29) with the solve itself on budget. Every sample is state-checked, so
+  // that counter is the size proxy; planners without it are always captured.
+  std::size_t sampled = 0;
   if (record_tree_) {
+    const auto props = planner->getPlannerProgressProperties();
+    const auto it = props.find("state collision checks INTEGER");
+    if (it != props.end()) sampled = static_cast<std::size_t>(std::stoull(it->second()));
+  }
+  if (record_tree_ && sampled > kMaxTreeCaptureStates) {
+    last_tree_ = SearchTree{};
+    DRONE_LOG_INFO("[plan] search tree not captured for viz: " << sampled
+                   << " states sampled (limit " << kMaxTreeCaptureStates << ")");
+  } else if (record_tree_) {
     last_tree_ = SearchTree{};
     ompl::base::PlannerData data(si_);
     planner->getPlannerData(data);

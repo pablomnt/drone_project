@@ -1178,6 +1178,50 @@ int main() {
     }
   }
 
+  // The box clips every region: with a floor at z = 0.9 a corridor through open
+  // space, however roomy, stays above it, and the box grows to hold a start that
+  // is already below it.
+  {
+    std::vector<Eigen::Vector3d> flat_obstacles;  // none: the window is otherwise unbounded
+    flat_obstacles.emplace_back(50.0, 50.0, 50.0);
+    const std::vector<Eigen::Vector3d> path = {{0, 0, 1.0}, {2, 0, 1.0}, {4, 0, 1.0}};
+    drone_core::planning::CorridorParams cp;
+    cp.max_segment_len = 2.0;
+    cp.margin = 0.3;
+    cp.local_bbox = Eigen::Vector3d(1.0, 2.0, 2.0);
+    cp.bounds_lo = Eigen::Vector3d(-10, -10, 0.9);
+    cp.bounds_hi = Eigen::Vector3d(10, 10, 2.5);
+    std::vector<Eigen::Vector3d> resampled;
+    std::vector<ConvexRegion> regs;
+    std::string why;
+    if (!drone_core::planning::buildCorridor(flat_obstacles, path, cp, resampled, regs, &why)) {
+      std::cerr << "FAIL: box-clipped corridor was not built (" << why << ")\n";
+      ++failures;
+    } else {
+      // The lowest z any region admits: maximise -z over the region by LP is
+      // overkill; probing the region's own sample points below the floor suffices.
+      bool leaks = false;
+      for (const auto& r : regs) {
+        if (r.contains(Eigen::Vector3d(2.0, 0.0, 0.85))) leaks = true;   // under the floor
+        if (r.contains(Eigen::Vector3d(2.0, 0.0, 2.6))) leaks = true;    // over the ceiling
+      }
+      if (leaks) {
+        std::cerr << "FAIL: a region admits points outside the box\n";
+        ++failures;
+      }
+    }
+    // A path that starts below the floor grows the box to include it: the start
+    // stays inside region 0.
+    const std::vector<Eigen::Vector3d> low = {{0, 0, 0.8}, {2, 0, 1.0}, {4, 0, 1.0}};
+    resampled.clear();
+    regs.clear();
+    if (!drone_core::planning::buildCorridor(flat_obstacles, low, cp, resampled, regs, &why) ||
+        !regs.front().contains(low.front())) {
+      std::cerr << "FAIL: a start below the box floor was excluded from region 0 (" << why << ")\n";
+      ++failures;
+    }
+  }
+
   // -------------------------------------------------- trajectory monitor -----
   // checkTrajectory holds a trajectory to the margins it was built with, less
   // the tolerance, and flags an emergency only for a close pass near the start

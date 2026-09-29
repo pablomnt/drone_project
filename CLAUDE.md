@@ -278,6 +278,29 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   (2026-09-29): first plan, improves scrapped as not better, obstacle dropped 2 s ahead → emergency
   stop → rest re-solve staged, stop point advanced → WAYPOINT solve staged. EVASION without an
   emergency not yet exercised.
+  **The search box also bounds the trajectory (2026-09-29).** The search plans inside
+  `GeometricPlanner::kSearchLow/High` (x, y ±15 m, z −1.5…2.5), and `buildCorridor` clips every region
+  (after the margin shrink, bridges included) to the same box via `CorridorParams::bounds_lo/hi`, grown
+  to hold every waypoint of the path it is given. Reason: a trajectory's corridor is not limited by the
+  search box, and the tester's drone ended at z = −1.62; a start outside the box is refused by OMPL
+  (`Skipping invalid start state (invalid bounds)`), so every later search failed and the vehicle
+  could never plan again. As a safety net `planPath` also grows the box to hold the start (goals are
+  clamped, not followed out) and logs `[plan] start ... is outside the search box`.
+  **Goal changes mid-flight (2026-09-29).** Three changes, driven by a goal behind the drone at cruise
+  that retried infeasible splices until the old trajectory ran out: (1) the search thread wakes at once
+  on a new goal or a divergence replan instead of waiting out `RRT_MONITOR_PERIOD`, and a search that
+  must produce a path now (new goal, blocked or missing path) uses `RRT_REPLAN_SOLVE_TIME` (0.3 s)
+  instead of `RRT_SOLVE_TIME`; (2) while a trajectory is flown the search starts from the point where
+  the new trajectory will be spliced on (the current trajectory at now + budget + half a monitor tick
+  + `kTrajgenLead`), not from the drone, so path and trajectory start together; (3) the solver roots
+  every path with `remainingCommittedSuffix` (it used to only overwrite the first waypoint, leaving a
+  path that doubled back), and when the splice velocity (> 0.1 m/s) is more than 60° off the new
+  path's first direction it inserts a **braking stub**: a straight lead-in along the velocity, 1.5x the
+  jerk-limited stopping distance, so the first corridor region holds the braking. Measured in
+  isolation: a pinned start velocity with the new path reversed is QP-infeasible at every time
+  allocation from 0.6 m/s (the first segment's control points are pushed out along it). The stub goes
+  through truncation like any path, so it cannot commit into an obstacle. Logged as `| braking stub X m`
+  on the `[trajgen] solve` line.
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
 Module roles:
@@ -995,7 +1018,7 @@ also straddling PX4's own 500 ms offboard-loss threshold. After the split, repla
   belongs in `cb_slow_`. If it then touches fast-group state, either guard that state or move the
   work — do not quietly promote `cross_mutex_` into a lock the control tick waits on.
 - **Known residual coupling:** the viz getters (`clearanceSamples()`, `geometricPath()`,
-  `searchTree()`, `corridorSnapshot()`) each take `traj_mutex_` to return a copy, and `stepControl`
+  `corridorSnapshot()`) each take `traj_mutex_` to return a copy, and `stepControl`
   takes the same mutex. So heavy viz converts a direct block into lock contention on the control
   tick — far smaller (a vector memcpy, not an octree rebuild), but non-zero. `DEBUG_PLANNER_VIZ`
   off makes it disappear entirely.
@@ -1112,10 +1135,8 @@ so the state it reads is always populated.
 
 **Debug-only planner visualisation** (gated by `DEBUG_PLANNER_VIZ`, default off — see below). These
 publish nothing and cost nothing when the flag is off:
-- `/planner/search_tree` (`visualization_msgs/MarkerArray`) — the search tree from the most recent
-  solve: faint grey `LINE_LIST` edges + orange `POINTS` nodes. Per-solve snapshot (persists between
-  searches). Lets you watch where the planner explored — A/B `PLANNER_TYPE` and tune `RRT_SOLVE_TIME`
-  (and per-planner knobs in `geometric_planner.hpp`) by eye.
+- `/planner/search_tree` was **removed 2026-09-29** (not wanted; copying the tree out of OMPL also
+  cost up to 40 s on dense near-goal searches). `GeometricPlanner::setRecordTree` remains for tests.
 - `/planner/clearance_field` (`sensor_msgs/PointCloud2`, `intensity` = clearance distance) — coarse
   (0.15 m) samples of the cached EDT, colour near→far. Shows exactly what the clearance cost "sees",
   for tuning `CLEARANCE_WEIGHT` / `CLEARANCE_THRESHOLD`. Sampled on the worker thread only when the
@@ -1479,8 +1500,19 @@ broadcasts `body→camera_link` (see *Frames & TF* above). Re-apply it if you re
    `planPath` when it overruns — **done**: a search taking more than 1.5x its budget now logs
    `[plan] search OVERRAN its N s budget: … (goal projection, setup, solve, tree capture, shortcut)`,
    so the next bench run says which part is slow. The **thread split is also done** (see *Two planner
-   threads*), so a stall no longer stops trajectories. Still open: the cause itself, and a hard
-   wall-clock deadline covering the whole search including the unbounded post-processing.
+   threads*), so a stall no longer stops trajectories. **Cause found and fixed 2026-09-29 (not yet
+   benched):** the overrun log showed the time was all inside OMPL's `solve()`. Our objective is a
+   state-cost integral, for which OMPL has no direct informed sampler, so it fell back to rejection
+   sampling the informed set from the whole 30 × 30 × 4 m space. When the best solution is short
+   (an improve search with the vehicle near the end of its path) that set is minute, nearly every
+   draw is rejected, and the loop never checks the stop condition. Reproduced offline: EIT* hangs
+   with start and goal 2 cm apart, ABIT* at 30 cm, both only once a clearance cost keeps the first
+   solution from being provably optimal. `ClearanceObjective::allocInformedStateSampler` now returns
+   OMPL's `PathLengthDirectInfSampler` (valid: the integrand is ≥ 1, so the length ellipsoid is a
+   superset of the informed set), and `planPath` returns start→goal directly when they coincide
+   (a zero-cost ellipsoid is a point the direct sampler cannot draw from, which hung RRT*). Pinned
+   by test 11 in `goal_projection`. Still open: a hard wall-clock deadline covering the whole search
+   including the unbounded post-processing, and a new goal waiting for any search in progress.
 
 ## Hardware / external process dependencies
 

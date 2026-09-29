@@ -77,6 +77,11 @@ public:
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
     double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
     double rrt_solve_time{3.0};       // planner optimisation budget per solve [s]
+    // Budget for a search that has to produce a path NOW — a new goal, or a
+    // committed path that is blocked or gone — rather than improve one [s]. The
+    // anytime planners have a first path well within this; the improve searches
+    // (rrt_solve_time) refine it later. Capped at rrt_solve_time.
+    double rrt_replan_solve_time{0.3};
     // Which OMPL planner the worker builds. Per-planner tunables (RRT* range/goal
     // bias, BIT*/AIT*/EIT* batch sizes, etc.) live in PlannerConfig in
     // geometric_planner.hpp, the single place to tune them.
@@ -343,10 +348,6 @@ public:
   // corridor snapshot below). Independent of trajectory generation, so it is populated even
   // when plan_trajectory is false.
   std::vector<std::vector<double>> geometricPath() const;
-
-  // Snapshot of the most recent RRT* search tree (nodes + edges), for debug
-  // visualisation. Empty unless cfg.debug_planner_viz is set. Thread-safe copy.
-  planning::GeometricPlanner::SearchTree searchTree() const;
 
   // Coarse samples of the cached clearance (EDT) field as {x, y, z, distance}
   // (distance clamped at clearance_threshold), for debug visualisation. Empty
@@ -647,7 +648,6 @@ private:
   double last_planned_at_{0.0};      // when it was staged, for the staleness check
   bool has_last_planned_{false};     // cleared on reset() — see spliceAnchor
   std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
-  planning::GeometricPlanner::SearchTree last_search_tree_;  // debug viz; empty unless enabled
   std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
   CorridorSnapshot last_corridor_;  // debug viz; empty unless corridor QP + viz on
 

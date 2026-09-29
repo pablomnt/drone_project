@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -508,6 +509,33 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
     }
     return true;
   };
+  // The box (p.bounds_*), grown to hold every waypoint, as six unit-normal
+  // faces appended to a region. Applied AFTER the margin shrink on purpose: the
+  // box is a limit on where the trajectory may be, not a hazard to keep a margin
+  // from. Axes with an infinite bound get no face.
+  Eigen::Vector3d box_lo = p.bounds_lo, box_hi = p.bounds_hi;
+  for (const auto& w : resampled_out) {
+    box_lo = box_lo.cwiseMin(w);
+    box_hi = box_hi.cwiseMax(w);
+  }
+  const auto clipToBox = [&box_lo, &box_hi](ConvexRegion r) {
+    std::vector<std::pair<Eigen::Vector3d, double>> faces;
+    for (int ax = 0; ax < 3; ++ax) {
+      Eigen::Vector3d n = Eigen::Vector3d::Zero();
+      n(ax) = 1.0;
+      if (std::isfinite(box_hi(ax))) faces.emplace_back(n, box_hi(ax));
+      if (std::isfinite(box_lo(ax))) faces.emplace_back(-n, -box_lo(ax));
+    }
+    if (faces.empty()) return r;
+    const int rows = static_cast<int>(r.A.rows());
+    r.A.conservativeResize(rows + static_cast<int>(faces.size()), 3);
+    r.b.conservativeResize(rows + static_cast<int>(faces.size()));
+    for (std::size_t i = 0; i < faces.size(); ++i) {
+      r.A.row(rows + static_cast<int>(i)) = faces[i].first.transpose();
+      r.b(rows + static_cast<int>(i)) = faces[i].second;
+    }
+    return r;
+  };
   // Pull every face in by `shrink`. With the full pull_in (margin + voxel half
   // diagonal): DecompUtil's faces touch the obstacle *points*, which are voxel
   // centres, so the extra pull-in makes the margin hold against the voxel's
@@ -599,7 +627,7 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
       }
       if (s == 0 && start_margin) *start_margin = shrink - p.voxel_half_diagonal;
 
-      ConvexRegion region = shrunkBy(raw, shrink);
+      ConvexRegion region = clipToBox(shrunkBy(raw, shrink));
       if (attempt) {
         attempt->raw.push_back(raw);
         attempt->shrunk.push_back(region);
@@ -731,7 +759,7 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
         const Eigen::Vector3d bb = c + h * dir;
         ConvexRegion braw;
         if (growRaw(ba, bb, braw)) {
-          ConvexRegion bridge = shrunkBy(braw, pull_in);
+          ConvexRegion bridge = clipToBox(shrunkBy(braw, pull_in));
           if (regionOverlapDepth(regions_out[s], bridge) >= kMinRegionOverlap &&
               regionOverlapDepth(bridge, regions_out[s + 1]) >= kMinRegionOverlap) {
             // Region s now ends at ba, the bridge spans ba..bb, and region s+1

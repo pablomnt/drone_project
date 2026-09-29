@@ -203,6 +203,9 @@ public:
   // short the returned path stops.
   void setBestEffort(bool on) { best_effort_ = on; }
 
+  // Optimisation budget for the next planPath [s] (the constructor sets the first).
+  void setPlanningTime(double seconds) { planning_time_ = seconds; }
+
   // Distance [m] over which the validity margin ramps from 0 at the start to
   // the full collision margin (see positionValid). The host passes the same
   // ESCAPE_RAMP_DIST truncatePath uses, so the search and truncation agree on
@@ -427,6 +430,12 @@ private:
   UnknownFn unknown_fn_;
   double unknown_weight_ = 0.0;
 
+  // Largest search (in sampled states) whose tree is copied out for the debug
+  // viz; see planPath. Measured 2026-09-29: normal searches sample 500-2000
+  // states and copy quickly; an EIT* search with start 2 cm from goal sampled
+  // ~9700 densely packed ones and the copy took 8.4 s (its edges, not its
+  // vertices, dominate).
+  static constexpr std::size_t kMaxTreeCaptureStates = 2500;
   // Validity margin [m]. A state is free when its clearance exceeds the margin:
   // kCollisionMargin in general, ramped down to 0 within escape_ramp_ of the
   // start so a parked/lifting drone can root the search (see positionValid).
@@ -469,6 +478,16 @@ private:
   // that to a quasi-random lattice would cost up to half a lattice spacing of
   // extra displacement on the most common geometry there is.
   static constexpr double kGoalProjectRadius = 2.0;
+public:
+  // The box the search is confined to, tuned for the office test environment:
+  // x and y +-15 m, z from -1.5 (above the floor) to 2.5 (below eye level). The
+  // trajectory stage clips its corridor to the same box (CorridorParams::bounds_*),
+  // so a trajectory cannot leave the space the search can plan in — a vehicle that
+  // did (bench 2026-09-29, z = -1.62) had a start outside the bounds, every search
+  // was refused, and it could never plan again.
+  static constexpr std::array<double, 3> kSearchLow{-15.0, -15.0, -1.5};
+  static constexpr std::array<double, 3> kSearchHigh{15.0, 15.0, 2.5};
+private:
   static constexpr double kGoalProjectStep = 0.05;
   static constexpr int kGoalProjectDirections = 128;
 

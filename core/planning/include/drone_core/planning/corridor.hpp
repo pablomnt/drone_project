@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,17 @@ struct CorridorParams {
   // Splitting a failing joint's segments in half is always allowed, since the
   // midpoints stay on the path.
   bool bridge_joints = true;
+
+  // Optional box every region is clipped to (world axes, after the margin
+  // shrink), so the trajectory cannot leave it: the search plans inside
+  // GeometricPlanner::kSearchLow/High, and a trajectory that left that space by
+  // the width of its corridor could strand the vehicle outside the box the
+  // search can start from. Unclipped by default (infinite). The box is grown to
+  // contain every waypoint of the path handed to buildCorridor — the start may
+  // sit slightly outside it (a splice point, or a vehicle already out), and a
+  // region that excluded it would make the start equality infeasible.
+  Eigen::Vector3d bounds_lo = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  Eigen::Vector3d bounds_hi = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
 };
 
 // What buildCorridor had to do to make consecutive regions overlap.

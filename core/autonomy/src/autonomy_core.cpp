@@ -91,6 +91,21 @@ double arcLengthAlong(const std::vector<std::vector<double>>& path, const Eigen:
   return best_arc;
 }
 
+// Distance [m] from `q` to the nearest point of a polyline.
+double distanceToPath(const std::vector<std::vector<double>>& path, const Eigen::Vector3d& q) {
+  double best = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    const Eigen::Vector3d a(path[i][0], path[i][1], path[i][2]);
+    const Eigen::Vector3d ab = Eigen::Vector3d(path[i + 1][0], path[i + 1][1], path[i + 1][2]) - a;
+    const double len2 = ab.squaredNorm();
+    const double u = len2 > 1e-12 ? std::clamp((q - a).dot(ab) / len2, 0.0, 1.0) : 0.0;
+    best = std::min(best, (a + u * ab - q).norm());
+  }
+  return path.size() == 1
+             ? (Eigen::Vector3d(path[0][0], path[0][1], path[0][2]) - q).norm()
+             : best;
+}
+
 planning::CorridorClearanceFn makeClearanceFn(std::shared_ptr<DynamicEDTOctomap> edt,
                                               double maxd) {
   return [edt = std::move(edt), maxd](double x, double y, double z) {
@@ -599,11 +614,6 @@ std::vector<std::vector<double>> AutonomyCore::geometricPath() const {
   return last_geometric_path_;
 }
 
-planning::GeometricPlanner::SearchTree AutonomyCore::searchTree() const {
-  std::lock_guard<std::mutex> lock(traj_mutex_);
-  return last_search_tree_;
-}
-
 std::vector<std::array<double, 4>> AutonomyCore::clearanceSamples() const {
   std::lock_guard<std::mutex> lock(traj_mutex_);
   return last_clearance_samples_;
@@ -697,6 +707,12 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     params.max_segment_len = cfg_.max_segment_len;
     params.margin = cfg_.corridor_margin;
     params.local_bbox = cfg_.corridor_bbox;
+    // The trajectory stays inside the box the search plans in (grown by
+    // buildCorridor to hold the path's own waypoints).
+    for (int i = 0; i < 3; ++i) {
+      params.bounds_lo(i) = planning::GeometricPlanner::kSearchLow[i];
+      params.bounds_hi(i) = planning::GeometricPlanner::kSearchHigh[i];
+    }
     // Same distance the truncation ramp uses, and for the same reason: it is
     // how far from the drone we accept reduced clearance in exchange for being
     // able to move at all. Sharing the parameter keeps the two stages from
@@ -1390,7 +1406,33 @@ void AutonomyCore::searchLoop() {
       std::vector<std::vector<double>> committed_path = committedPath();
       // The search, the committed-path cost from the drone and every other
       // planning quantity use the vehicle position in the map frame.
-      const Eigen::Vector3d pos_map = world_from_map.inverse() * state.pos;
+      // Where to plan FROM. Not the vehicle's position: while a trajectory is being
+      // flown, the trajectory built on this search will be spliced onto it at the
+      // point it reaches by the time that trajectory takes over — after this
+      // search, the monitor noticing the new plan, and the splice lead. Planned
+      // from the vehicle instead, the path started metres behind where the new
+      // trajectory had to start (bench 2026-09-29: splice point ~3 m off the new
+      // path on a goal change at cruise, corridors infeasible until the old
+      // trajectory ran out). Rest starts (none flown, hovering, bench flag) plan
+      // from the measured position, which is where they start.
+      Eigen::Vector3d pos_map = world_from_map.inverse() * state.pos;
+      bool predicted_start = false;
+      {
+        const double budget = std::min(search_cfg_.rrt_solve_time,
+                                       committed_path.empty() ? search_cfg_.rrt_replan_solve_time
+                                                              : search_cfg_.rrt_solve_time);
+        // The monitor ticks at traj_monitor_rate, so it notices the new plan on
+        // average half a period after the search ends.
+        const double engage =
+            now() + budget + 0.5 / std::max(search_cfg_.traj_monitor_rate, 0.5) + kTrajgenLead;
+        std::lock_guard<std::mutex> lock(traj_mutex_);
+        if (has_last_planned_ && !last_planned_.empty() && !tracker_holding_.load() &&
+            !search_cfg_.bench_replan_from_state) {
+          pos_map = world_from_map.inverse() * common::sampleMotion(last_planned_, engage).pos;
+          predicted_start = true;
+        }
+      }
+      (void)predicted_start;
       const std::vector<double> start = {pos_map.x(), pos_map.y(), pos_map.z()};
       const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
 
@@ -1425,7 +1467,6 @@ void AutonomyCore::searchLoop() {
       planner.setPlannerType(search_cfg_.planner_type);
       planner.setBestEffort(search_cfg_.best_effort_goal);
       planner.setEscapeRamp(search_cfg_.escape_ramp_dist);
-      planner.setRecordTree(search_cfg_.debug_planner_viz);
       applyClearanceObjective(planner, search_map, conservative);
 
       // Debug-only: re-sample the clearance field when the map changes (the EDT
@@ -1485,18 +1526,15 @@ void AutonomyCore::searchLoop() {
 
       if (path_invalid || improve_run) {
         std::vector<std::vector<double>> candidate;
+        // A path is needed now: a short budget. Improving one can take the full one.
+        planner.setPlanningTime(path_invalid ? std::min(search_cfg_.rrt_solve_time,
+                                                        search_cfg_.rrt_replan_solve_time)
+                                             : search_cfg_.rrt_solve_time);
         const double t_search = now();
         search_running_.store(true);
         const bool solved = planner.planPath(start, goal_vec, candidate);
         search_running_.store(false);
         last_search_time_.store(now() - t_search);
-
-        // Debug-only: capture the tree this solve built (even if it failed — that
-        // is exactly when seeing where it explored is most useful).
-        if (search_cfg_.debug_planner_viz) {
-          std::lock_guard<std::mutex> lock(traj_mutex_);
-          last_search_tree_ = planner.searchTree();
-        }
 
         // A goal the collision check rejects is planned to at the nearest valid
         // point instead (see GeometricPlanner::projectGoal), so the drone will
@@ -1607,10 +1645,19 @@ void AutonomyCore::searchLoop() {
       }
     }
 
-    // The loop ticks at the monitor cadence — every iteration is one monitor tick.
-    // Clamp to a small floor so a mis-set period cannot turn this into a busy loop.
-    std::this_thread::sleep_for(
-        std::chrono::duration<double>(std::max(search_cfg_.rrt_monitor_period, 0.01)));
+    // The loop ticks at the monitor cadence — every iteration is one monitor tick
+    // — but wakes at once for a new goal or a divergence replan, which used to
+    // wait up to a whole period for the next tick. Clamp to a small floor so a
+    // mis-set period cannot turn this into a busy loop.
+    const double wake = t + std::max(search_cfg_.rrt_monitor_period, 0.01);
+    while (running_.load() && now() < wake) {
+      {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        if (new_goal_) break;
+      }
+      if (search_replan_requested_.load()) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
   }
 }
 
@@ -1756,13 +1803,48 @@ void AutonomyCore::trajgenLoop() {
         if (has_last_planned_) min_t0 = last_planned_.t0 + kStageGap;
       }
       result.anchor = spliceAnchor(state, t_gen, world_from_map, min_t0);
-      std::vector<std::vector<double>> path = committed_path;
-      path.front() = {result.anchor.start.pos.x(), result.anchor.start.pos.y(),
-                      result.anchor.start.pos.z()};
-      const double root_shift = std::sqrt(
-          std::pow(path.front()[0] - committed_path.front()[0], 2) +
-          std::pow(path.front()[1] - committed_path.front()[1], 2) +
-          std::pow(path.front()[2] - committed_path.front()[2], 2));
+      // Root the path at the anchor AND drop the waypoints already behind it.
+      // Only overwriting the first waypoint (as this used to) leaves the path
+      // doubling back to waypoints the vehicle has passed once it is beyond the
+      // first one, so truncation and the corridor worked on a path that ran
+      // backwards before going on (bench 2026-09-29: "root 3.17 m from the search
+      // start", a 3.6 m path handed over as 5.8 m, corridors infeasible).
+      const std::vector<double> root = {result.anchor.start.pos.x(), result.anchor.start.pos.y(),
+                                        result.anchor.start.pos.z()};
+      std::vector<std::vector<double>> path = remainingCommittedSuffix(committed_path, root);
+      // Braking stub. A splice pins the start velocity; when the new path leaves
+      // at a sharp angle to it (a goal to the side or behind, at cruise), the
+      // corridor grown along the new path gives the vehicle ~1 m to brake in its
+      // old direction and the QP is infeasible at every time allocation (0.6 m/s
+      // reversal, measured). Lead the path in with a straight stub along the
+      // current velocity, as long as a jerk-limited stop from that speed, so the
+      // first corridor region holds the braking. Truncation checks the stub like
+      // the rest of the path, so it never commits into an obstacle; if there is
+      // no room to stop there, the solve fails as it did before.
+      std::ostringstream stub_note;
+      if (result.anchor.from_trajectory && path.size() >= 2) {
+        const Eigen::Vector3d v = result.anchor.start.vel;
+        const double speed = v.norm();
+        const Eigen::Vector3d first =
+            Eigen::Vector3d(path[1][0], path[1][1], path[1][2]) -
+            Eigen::Vector3d(path[0][0], path[0][1], path[0][2]);
+        constexpr double kStubMinSpeed = 0.1;     // [m/s]
+        constexpr double kStubCosAngle = 0.5;     // path leaving > 60 deg off the velocity
+        constexpr double kStubSafety = 1.5;       // x the ideal stopping distance
+        if (speed > kStubMinSpeed && first.norm() > 1e-6 &&
+            v.dot(first) / (speed * first.norm()) < kStubCosAngle) {
+          const double a = std::max(cfg_.amax, 1e-3), j = std::max(cfg_.jmax, 1e-3);
+          const double ramp = speed >= a * a / j ? speed / a + a / j : 2.0 * std::sqrt(speed / j);
+          const double stop = kStubSafety * 0.5 * speed * ramp;
+          const Eigen::Vector3d tip =
+              Eigen::Vector3d(path[0][0], path[0][1], path[0][2]) + (stop / speed) * v;
+          path.insert(path.begin() + 1, {tip.x(), tip.y(), tip.z()});
+          stub_note << " | braking stub " << stop << " m";
+        }
+      }
+      // How far the anchor is off the committed path, for the truncation log.
+      const double root_shift = distanceToPath(
+          committed_path, Eigen::Vector3d(root[0], root[1], root[2]));
       // Truncation stops at unobserved space only when the operator asked for
       // it — keyed off the flag, not off a conservative view existing (the host
       // builds that only once a frontier cloud has arrived). The predicate reads
@@ -1784,8 +1866,8 @@ void AutonomyCore::trajgenLoop() {
                      << (result.anchor.from_trajectory ? "splice" : "rest") << ", starts "
                      << result.anchor.t0 - t_gen << " s after the solve began | search last "
                      << last_search_time_.load() << " s"
-                     << (search_running_.load() ? ", one running now" : "") << " | "
-                     << (result.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED"));
+                     << (search_running_.load() ? ", one running now" : "") << stub_note.str()
+                     << " | " << (result.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED"));
     }
     std::lock_guard<std::mutex> lock(job_mutex_);
     result_ = std::move(result);
@@ -1966,9 +2048,13 @@ void AutonomyCore::monitorLoop() {
       if (field && recs.back().corridor && !needs.new_plan && path.size() >= 2) {
         const TrajRecord& active =
             (recs.size() > 1 && t < recs.back().traj.t0) ? recs.front() : recs.back();
+        // Rooted where the reference is now, with the waypoints behind it dropped
+        // (see the solver).
+        const Eigen::Vector3d ref = map_from_world * common::sampleMotion(active.traj, t).pos;
         std::vector<Eigen::Vector3d> epath;
-        for (const auto& w : path) epath.emplace_back(w[0], w[1], w[2]);
-        epath.front() = map_from_world * common::sampleMotion(active.traj, t).pos;
+        for (const auto& w : remainingCommittedSuffix(path, {ref.x(), ref.y(), ref.z()})) {
+          epath.emplace_back(w[0], w[1], w[2]);
+        }
         const auto committed = planning::truncatePath(
             clearance, epath, c.frontier_margin * (1.0 - kTruncationTolerance), c.escape_ramp_dist,
             0.05, unknown, nullptr, cons->getResolution(), kTruncationTolerance);
@@ -2197,7 +2283,10 @@ void AutonomyCore::monitorLoop() {
         postJob(needs, version);
         DRONE_LOG_INFO("[trajmon] solve started for " << needsName(needs)
                        << (needs.evasion ? " (" + evasion_note + ")" : std::string()));
-      } else if (!recs.empty() && t - last_completed >= c.traj_improve_period) {
+      } else if (!recs.empty() && t - last_completed >= c.traj_improve_period &&
+                 t < recs.back().traj.t0 + recs.back().traj.total_duration) {
+        // An improve is judged on reaching the current stop point sooner, which a
+        // trajectory that has already arrived cannot be beaten on.
         postJob(needs, version);
       }
     }

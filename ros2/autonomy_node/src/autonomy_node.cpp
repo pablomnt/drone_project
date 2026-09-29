@@ -221,7 +221,6 @@ public:
     pub_path_ = create_publisher<nav_msgs::msg::Path>("/smooth_trajectory", 10);
     pub_geom_path_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/geometric_path", 10);
     pub_goal_marker_ = create_publisher<visualization_msgs::msg::Marker>("/planner/goal_marker", 10);
-    pub_search_tree_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/search_tree", 10);
     pub_clearance_field_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/clearance_field", 10);
     pub_occupancy_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/occupancy_map", 10);
     pub_corridor_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/corridor", 10);
@@ -282,11 +281,24 @@ private:
     // replan shrinks it; this stops that. Never fly with it on: every replan
     // would restart from zero velocity (warned while flying).
     declare_parameter("BENCH_TEST_REPLAN_DISABLER", false);
+    // BENCH ONLY, battery off. Simulates a vehicle that has taken off to POS_SP
+    // and then follows the tracker's reference perfectly: the core (planner and
+    // tracker) is fed that vehicle instead of the real one on the desk, so the
+    // hand-over from POS_SP to a trajectory and from one trajectory to the next
+    // can be watched on the /control/pos_ff marker. Bypasses the sensor warmup,
+    // the armed/offboard gate and the in-flight watchdog, and overrides
+    // BENCH_TEST_REPLAN_DISABLER (replans splice onto the reference, as in
+    // flight). Sends PX4 NO attitude or thrust commands. Refused while armed.
+    declare_parameter("BENCH_TEST_TRANSFER_TESTER", false);
     declare_parameter("SENSOR_TIMEOUT", 0.5);
     declare_parameter("SENSOR_WARMUP", 5.0);
     declare_parameter("RRT_MONITOR_PERIOD", 1.0);
     declare_parameter("RRT_IMPROVE_PERIOD", 10.0);
     declare_parameter("RRT_SOLVE_TIME", 1.0);
+    // Budget for a search that must produce a path now (a new goal, or the
+    // committed path blocked or gone) rather than improve one. The first path is
+    // found well within it; the improve searches (RRT_SOLVE_TIME) refine it.
+    declare_parameter("RRT_REPLAN_SOLVE_TIME", 0.3);
     // Which OMPL planner to run: RRTstar | BITstar | ABITstar | AITstar | EITstar.
     // Live-reconfigurable so you can A/B them on the bench. Per-planner internal
     // tunables live in geometric_planner.hpp (PlannerConfig).
@@ -350,9 +362,9 @@ private:
     // waypoint (set on fire, before the shape flies) so the hand-back is
     // continuous. See onParameterChange and firePresetSquare.
     declare_parameter("PRESET_WAYPOINTS", false);
-    // Single switch for the planner debug visualisation: publishes the RRT*
-    // search tree (/planner/search_tree), the EDT clearance field
-    // (/planner/clearance_field) and the corridor stages (/planner/corridor).
+    // Single switch for the planner debug visualisation: publishes the EDT
+    // clearance field (/planner/clearance_field) and the corridor stages
+    // (/planner/corridor).
     // Normally off so regular flights pay nothing (live-reconfigurable).
     //
     // Held TRUE for the PRESET_WAYPOINTS bring-up: /planner/corridor is what
@@ -501,9 +513,18 @@ private:
     cfg.health_timeout = param("HEALTH_TIMEOUT").as_double();
     cfg.max_tracking_error = param("MAX_TRACKING_ERROR").as_double();
     cfg.bench_replan_from_state = param("BENCH_TEST_REPLAN_DISABLER").as_bool();
+    if (param("BENCH_TEST_TRANSFER_TESTER").as_bool()) {
+      // Replans must splice onto the reference: that is the transfer under test.
+      // (The simulated vehicle tracks perfectly, so the tracking-error check has
+      // nothing to catch; it is off so a bug in the simulation shows as a jump,
+      // not as an abandoned trajectory.)
+      cfg.max_tracking_error = 0.0;
+      cfg.bench_replan_from_state = false;
+    }
     cfg.rrt_monitor_period = param("RRT_MONITOR_PERIOD").as_double();
     cfg.rrt_improve_period = param("RRT_IMPROVE_PERIOD").as_double();
     cfg.rrt_solve_time = param("RRT_SOLVE_TIME").as_double();
+    cfg.rrt_replan_solve_time = param("RRT_REPLAN_SOLVE_TIME").as_double();
     const std::string planner = param("PLANNER_TYPE").as_string();
     if (!drone_core::planning::fromString(planner, cfg.planner_type)) {
       RCLCPP_WARN(get_logger(), "Unknown PLANNER_TYPE '%s', using RRTstar.", planner.c_str());
@@ -971,6 +992,14 @@ private:
     const bool position_fresh = use_sim_mode_
         ? streamHealthy(t_px4_odom_, now_s, sensor_timeout)
         : streamHealthy(t_vio_odom_, now_s, sensor_timeout);
+    // BENCH_TEST_TRANSFER_TESTER (see the parameter): refused while armed, so it can
+    // never bypass the flight gates on a vehicle that could actually fly. While it
+    // runs, the core sees ONLY the simulated vehicle (benchTransferTick), never the
+    // real one sitting on the desk.
+    const bool armed_now =
+        vehicle_status_.arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED;
+    const bool bench_transfer_requested = get_parameter("BENCH_TEST_TRANSFER_TESTER").as_bool();
+    const bool bench_transfer = bench_transfer_requested && !armed_now;
     // Mean of every accelerometer sample since the last tick (see onSensorCombined).
     // Folded every tick, not only when position is fresh, so the window never
     // spans more than one tick. No new sample: hold the previous mean.
@@ -1002,7 +1031,7 @@ private:
       // own header stamp, so they stay in one clock domain across sim and flight.
       state.stamp = use_sim_mode_ ? t_px4_odom_ : t_vio_odom_;
       yaw_used = state.yaw;
-      core_->setVehicleState(state);
+      if (!bench_transfer) core_->setVehicleState(state);
     }
 
     // RTAB-Map's map->world correction, for the planner. Pushed every tick because it
@@ -1028,7 +1057,28 @@ private:
     // trajectory is harmless — stepControl only runs armed+offboard, and reset() on
     // the real engage clears it.
     if (position_fresh && preset_fire_requested_.exchange(false)) {
-      firePresetSquare(state);
+      // Under the transfer tester the preset is built around the simulated vehicle.
+      firePresetSquare(bench_transfer && bench_transfer_active_ ? bench_state_ : state);
+    }
+
+    // BENCH_TEST_TRANSFER_TESTER: run the tracker on a simulated vehicle, without
+    // the flight gates below and without commanding PX4 (see the parameter).
+    if (bench_transfer_requested && armed_now) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                            "BENCH_TEST_TRANSFER_TESTER refused: the vehicle is ARMED. It is "
+                            "for the battery-off bench only. Set it false.");
+    }
+    if (bench_transfer) {
+      benchTransferTick();
+      return;
+    }
+    if (bench_transfer_active_) {
+      bench_transfer_active_ = false;
+      core_->reset();
+      if (position_fresh) core_->setVehicleState(state);
+      reissueGoal();  // its path was planned from the simulated vehicle
+      RCLCPP_INFO(get_logger(), "BENCH_TEST_TRANSFER_TESTER off: tracker reset, back on the real "
+                                "vehicle state.");
     }
 
     // Announce the warmup completing, exactly once per streak (rising edge of
@@ -1155,6 +1205,61 @@ private:
     publishDebug(state);
   }
 
+  // One control tick of the transfer tester. It simulates a vehicle that has
+  // taken off to POS_SP and from then on follows the tracker's reference
+  // perfectly: the core is fed that vehicle's state (and never the real one on
+  // the desk), the tracker runs on POS_SP and the planner's trajectories exactly
+  // as when engaged, and the resulting command is thrown away. The search, the
+  // splices, truncation and the trajectory monitor then all see one consistent
+  // vehicle, which is what makes the hand-overs meaningful to watch: on
+  // /control/pos_ff (and pos_sp in /control/debug), from POS_SP onto a trajectory
+  // and from each trajectory onto the next.
+  void benchTransferTick() {
+    const auto pos_sp = get_parameter("POS_SP").as_double_array();
+    const Eigen::Vector3d sp = pos_sp.size() == 3
+                                   ? Eigen::Vector3d(pos_sp[0], pos_sp[1], pos_sp[2])
+                                   : Eigen::Vector3d::Zero();
+    if (!bench_transfer_active_) {
+      bench_transfer_active_ = true;
+      core_->reset();
+      bench_state_ = drone_core::common::State{};
+      bench_state_.pos = sp;  // it has just taken off to POS_SP and hovers there
+      bench_state_.yaw = kDefaultYaw;
+      bench_state_.stamp = get_clock()->now().seconds();
+      core_->setVehicleState(bench_state_);
+      reissueGoal();  // an active goal's path was planned from the real vehicle
+      RCLCPP_WARN(get_logger(),
+                  "BENCH_TEST_TRANSFER_TESTER ON: simulated vehicle hovering at POS_SP and "
+                  "following the reference perfectly; sensor warmup, arm/offboard gate and "
+                  "watchdog bypassed. NO commands are sent to PX4. Watch /control/pos_ff.");
+    }
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                         "BENCH_TEST_TRANSFER_TESTER is ON (bench only, no commands sent to PX4).");
+    const double now_s = get_clock()->now().seconds();
+    bench_state_.stamp = now_s;
+    core_->setVehicleState(bench_state_);
+    core_->setSetpoint(sp, kDefaultYaw);
+    core_->stepControl(kControlDt);  // the command is deliberately discarded
+    // Perfect tracking: next tick the vehicle is wherever the reference is now.
+    const auto& c = core_->controller();
+    bench_state_.pos = c.getPositionFeedforward();
+    bench_state_.vel = c.getVelocityFeedforward();
+    publishDebug(bench_state_);
+  }
+
+  // Hand the core the current goal again, so it drops the committed path and
+  // re-plans from the vehicle state it has now. Used when the transfer tester
+  // swaps the real vehicle for the simulated one and back. No-op without a goal.
+  void reissueGoal() {
+    drone_core::common::Goal goal;
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      if (!has_goal_) return;
+      goal.pos = goal_pos_;
+    }
+    core_->setGoal(goal);
+  }
+
   void publishDebug(const drone_core::common::State& state) {
     const auto& c = core_->controller();
     drone_interfaces::msg::ControllerDebug d;
@@ -1210,7 +1315,6 @@ private:
     publishGoalMarker();
     publishGeometricPath();
     publishPlannedPath();
-    publishSearchTree();
     publishClearanceField();
     publishCorridor();
   }
@@ -1447,63 +1551,6 @@ private:
     pub_corridor_->publish(arr);
   }
 
-  // Debug-only (gated by DEBUG_PLANNER_VIZ): the search tree from the most recent
-  // solve as a MarkerArray — a faint LINE_LIST of edges plus small POINTS for the
-  // nodes. Lets you watch where the planner explored and A/B PLANNER_TYPE /
-  // RRT_SOLVE_TIME by eye. When off this returns before building anything.
-  void publishSearchTree() {
-    if (!get_parameter("DEBUG_PLANNER_VIZ").as_bool()) return;
-    const auto tree = core_->searchTree();
-
-    visualization_msgs::msg::MarkerArray arr;
-    visualization_msgs::msg::Marker clear;
-    clear.header.frame_id = kMapFrame;
-    clear.header.stamp = now();
-    clear.action = visualization_msgs::msg::Marker::DELETEALL;
-    arr.markers.push_back(clear);
-
-    if (!tree.nodes.empty()) {
-      visualization_msgs::msg::Marker edges;
-      edges.header.frame_id = kMapFrame;
-      edges.header.stamp = now();
-      edges.ns = "search_tree";
-      edges.id = 0;
-      edges.type = visualization_msgs::msg::Marker::LINE_LIST;
-      edges.action = visualization_msgs::msg::Marker::ADD;
-      edges.pose.orientation.w = 1.0;
-      edges.scale.x = 0.01;  // line width [m]
-      edges.color.r = 0.6f; edges.color.g = 0.6f; edges.color.b = 0.6f; edges.color.a = 0.5f;
-      for (const auto& e : tree.edges) {
-        if (e.first < 0 || e.second < 0) continue;
-        const auto& a = tree.nodes[static_cast<std::size_t>(e.first)];
-        const auto& b = tree.nodes[static_cast<std::size_t>(e.second)];
-        geometry_msgs::msg::Point pa, pb;
-        pa.x = a[0]; pa.y = a[1]; pa.z = a[2];
-        pb.x = b[0]; pb.y = b[1]; pb.z = b[2];
-        edges.points.push_back(pa);
-        edges.points.push_back(pb);
-      }
-
-      visualization_msgs::msg::Marker nodes;
-      nodes.header = edges.header;
-      nodes.ns = "search_tree";
-      nodes.id = 1;
-      nodes.type = visualization_msgs::msg::Marker::POINTS;
-      nodes.action = visualization_msgs::msg::Marker::ADD;
-      nodes.pose.orientation.w = 1.0;
-      nodes.scale.x = nodes.scale.y = 0.04;  // point size [m]
-      nodes.color.r = 1.0f; nodes.color.g = 0.7f; nodes.color.b = 0.1f; nodes.color.a = 0.9f;
-      for (const auto& n : tree.nodes) {
-        geometry_msgs::msg::Point p;
-        p.x = n[0]; p.y = n[1]; p.z = n[2];
-        nodes.points.push_back(p);
-      }
-      arr.markers.push_back(edges);
-      arr.markers.push_back(nodes);
-    }
-    pub_search_tree_->publish(arr);
-  }
-
   // Debug-only (gated by DEBUG_PLANNER_VIZ): the EDT clearance field as a
   // PointCloud2 with an `intensity` = distance-to-nearest-obstacle field, so
   // RViz/Foxglove colour it near->far. Shows exactly what the clearance cost
@@ -1640,7 +1687,6 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_geom_path_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_goal_marker_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_search_tree_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_clearance_field_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_occupancy_map_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_corridor_;
@@ -1672,6 +1718,8 @@ private:
   bool was_armed_{false};
   bool was_offboard_{false};
   bool controller_running_{false};
+  bool bench_transfer_active_{false};  // BENCH_TEST_TRANSFER_TESTER is running the tracker
+  drone_core::common::State bench_state_;  // the simulated vehicle it runs on
 
   // Last-receive wall-clock times [s] per estimator stream, for the in-flight
   // sensor-liveness watchdog (see controlLoop). Negative == never received.
