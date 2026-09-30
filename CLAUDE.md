@@ -111,7 +111,8 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
   `rigid_transform` (the `map`↔`world` trajectory/state conversion, instant), `goal_projection` (invalid-goal → nearest-valid-state projection; analytic clearance fields and
   0.5 s solve budgets, ~3 s total, so it also runs on every planning edit),
   `unknown_cost` (unknown-space surcharge + truncation's hard stop; analytic predicates, ~0.5 s,
-  also on every planning edit), `autonomy_core` (plan→track→watchdog).
+  also on every planning edit), `distance_field` (the distance field against brute force and
+  DynamicEDT3D), `autonomy_core` (plan→track→watchdog).
 - ROS packages use `ament_lint_auto` / `ament_lint_common` via `colcon test`; the python packages
   (`pc_publisher` C++ aside, `system_monitor_pkg`) carry the standard flake8/pep257/copyright triplet.
 
@@ -214,7 +215,7 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   are thus rooted at the drone, so a candidate can't win merely because the drone has advanced toward
   the goal (which would shrink a drone-rooted candidate while the full committed cost still billed the
   already-traversed prefix). One search ⇒ one
-  EDT use per tick. Validity and cost use **separate cached `DynamicEDTOctomap`s** when a distinct
+  EDT use per tick. Validity and cost use **separate cached `planning::DistanceField`s** when a distinct
   conservative view exists: validity reads the search map's field, the cost reads the conservative
   one (see *Two fields, two questions* below). Both are rebuilt only when their map object changes
   (`clearanceField` / `conservativeField`), not per tick, and the conservative field is the same one
@@ -332,7 +333,7 @@ Module roles:
   informed sampling "will have little to no effect" and RRT*'s ellipse / the BIT* goal heuristic stay
   blind.
   **Collision check is EDT-based**: a state is free when its clearance (3D Euclidean distance to the
-  nearest obstacle, via a `DynamicEDTOctomap` passed as the clearance fn) exceeds `kCollisionMargin`
+  nearest obstacle, via a `planning::DistanceField` passed as the clearance fn) exceeds `kCollisionMargin`
   (0.5 m) — one O(1) lookup, and because the distance is 3D it enforces **vertical** clearance too
   (the old horizontal-only box is now only a fallback in `isStateValid` for standalone/test use with
   no field set). **Start-state escape sphere**: within `kStartEscapeRadius` (0.5 m) of the start the
@@ -408,13 +409,12 @@ Module roles:
     treat_unknown_as_hazard` and driving truncation's stop as well, so the flag is a genuine master
     switch: with it off, nothing anywhere in the pipeline distinguishes unknown from free.
     **Gated on the flag itself, NOT on a conservative map view existing** — that was a real bug
-    worth not repeating. The node only builds the conservative view once a frontier cloud has
-    arrived (`TREAT_FRONTIER_AS_OBSTACLE && frontier_cloud_`), so keying off it meant a late or
+    worth not repeating. The node used to build the conservative view only once RTAB-Map's frontier
+    cloud had arrived (it now builds its own shell every map), so keying off it meant a late or
     missing `/octomap_frontier` silently switched off both guards with the flag still on — visible
-    only as `unk_cost` quietly vanishing from the `[plan]` line. Neither guard needs the frontier
-    cloud: both read the raw octree, where a cell with no node has never been observed. The node now
-    warns (throttled, naming the resolved topic and its publisher count) when the flag is on but no
-    cloud has arrived, since that state is otherwise invisible.
+    only as `unk_cost` quietly vanishing from the `[plan]` line. The surcharge reads the raw octree,
+    where a cell with no node has never been observed; truncation's stop now reads the stamped copy
+    (see `TREAT_FRONTIER_AS_OBSTACLE`).
 
   Admissibility is preserved (the term is ≥ 0, so the integrand stays ≥ 1 and both heuristics remain
   lower bounds). **Accuracy caveat:** OMPL integrates the objective trapezoidally over states
@@ -440,7 +440,7 @@ Module roles:
   voxels. The ramp exemption is the point: the ramp trades margin for the ability to move at all,
   which is defensible against a hazard whose distance we can measure, and unobserved space is not
   that. **This makes free cells load-bearing.** RTAB-Map's `Grid/RayTracing true` carves free space
-  along each ray, `toOcTree` copies free leaves with their log-odds, and free nodes survive the
+  along each ray, and free nodes survive the
   binary octomap round-trip — so the flight volume has nodes and truncation commits normally. But a
   map carrying *only* obstacles now reads as "nothing here has ever been observed" and commits
   nothing; the `autonomy_core` test had to start writing free space for this reason. The empty-
@@ -969,8 +969,9 @@ is explicitly assigned to one of two **mutually exclusive** groups:
 
 - **`cb_fast_`** — the 20 ms control timer and every estimator stream feeding it: `onPx4Odom`,
   `onVioOdom`, `onSensorCombined`, `onStatus`, `onJoy`, `onGoal`.
-- **`cb_slow_`** — everything that can block for longer than a tick: `onOctomap`, `onFrontier`, and
-  the 500 ms viz timer.
+- **`cb_slow_`** — everything that can block for longer than a tick: `onOctomap` (decode, unknown
+  shell, both distance fields — timed by `LOG_MAP_TIMING`) and the 500 ms viz timer. (`onFrontier`
+  is commented out along with the RTAB-Map frontier subscription.)
 - The node's **default group** is left holding only the parameter services, which is the third thread.
 
 This exists because of a real mid-flight auto-land on 2026-07-31. On the previous single-threaded
@@ -1264,24 +1265,29 @@ publish nothing and cost nothing when the flag is off:
   bench validation** — turn it off for a real flight so the NUC pays nothing for it.
 - `TREAT_FRONTIER_AS_OBSTACLE` (bool, **currently defaulted `false`** for corridor bench tests, so
   the decomposition is exercised against real obstacles alone; `true` is the intended flight
-  setting) — stamp RTAB-Map's frontier cloud
-  (`/rtabmap/octomap_global_frontier_space`, remapped in the launch) as occupied voxels into a deep
-  **copy** of each incoming octomap, fed to the core as the **conservative** map view (the raw map
-  stays the optimistic search view — dual-map; a small keep-out ball around the drone stays
-  unstamped so it can root the search). With `USE_CORRIDOR_QP` off the search itself runs on the
-  conservative view (legacy behavior); with it on, the conservative view drives truncation, corridor
-  growth **and the search's cost objective** — but never its collision check, which stays optimistic
-  (see *Two fields, two questions*). NOTE: on a fresh map almost everything is frontier — the drone
-  is boxed in until it has scanned its surroundings.
-  **This is the master switch for "is unmapped space a hazard".** It gates three things: the stamped
-  shell, `UNKNOWN_WEIGHT`'s cost surcharge, and `truncatePath`'s stop at never-observed cells. Turn
-  it off and the pipeline is the legacy one in this respect — unknown reads as ordinary free space
-  everywhere. The last two are gated via `Config::treat_unknown_as_hazard`, set straight from this
-  parameter, **not** via whether a conservative map view exists: that view needs a frontier cloud,
-  and those two guards do not (they read the raw octree), so tying them to it made a missing
-  `/octomap_frontier` disable them silently. The shell genuinely does need the cloud, so with the
-  flag on but no cloud the node warns and you run without the shell's gradient but with both octree
-  guards intact.
+  setting) — build a deep **copy** of each incoming octomap with `planning::stampUnknownShell`
+  (`core/planning/src/unknown_shell.cpp`): never-observed voxels within 0.5 m of the drone
+  (`kFrontierKeepOutRadius`) are marked **free**, then every never-observed voxel touching a free one
+  (26-neighbourhood) is stamped **occupied**. The result is a closed shell around explored space,
+  wrapped around the ball too, so it answers every distance/corridor question exactly as if the
+  whole unobserved volume were an obstacle. Computed from the octomap itself, in the map callback:
+  RTAB-Map's frontier cloud (`/octomap_frontier`, now commented out) arrived as a separate message
+  one map update late and had holes. The sweep uses a dense byte grid of the tree's bounding box
+  rather than 26 tree searches per free voxel (905 ms -> 55 ms on a synthetic 6x6x2.5 m room at 5 cm).
+  The copy is fed to the core as the **conservative** view (the raw map stays the optimistic search
+  view — dual-map). With `USE_CORRIDOR_QP` off the search itself runs on the conservative view
+  (legacy behavior); with it on, the conservative view drives truncation, corridor growth, the
+  trajectory monitor **and the search's cost objective** — but never its collision check, which
+  stays optimistic (see *Two fields, two questions*). NOTE: on a fresh map almost everything is
+  unobserved — the drone is boxed in until it has scanned its surroundings.
+  **This is the master switch for "is unmapped space a hazard".** It gates the shell,
+  `UNKNOWN_WEIGHT`'s cost surcharge (reads the RAW octree), and the "never observed" stop in
+  truncation, the monitor and the adoption check (read the STAMPED copy, so the ball is free there
+  and all three agree with the corridor). Turn it off and unknown reads as ordinary free space
+  everywhere.
+- `LOG_MAP_TIMING` (bool, default `true`) — one `[map]` line per octomap: time since the previous
+  one (and Hz), decode, shell (voxels stamped / freed / free leaves swept), distance fields, viz
+  publish, total.
 - `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
   short of the goal (the reachable point closest to it) instead of reporting "no path"; the worker
   keeps advancing the endpoint as the map grows.
@@ -1415,9 +1421,20 @@ unchecked polynomial is only reachable via the legacy `USE_CORRIDOR_QP=false` ro
 > publishing — so it never taxes a real flight on the NUC, and never touches the flight-critical
 > control path. `DEBUG_PLANNER_VIZ` is the reference example.
 
-**Additional dependency**: `libdynamicedt3d-dev` (apt, version-matched to octomap 1.9.7). Used in
-`autonomy_core.cpp` only; linked into `drone_core_autonomy`. Headers at
-`<dynamicEDT3D/dynamicEDTOctomap.h>`. Re-install if rebuilding on a fresh machine.
+**Distance fields**: `planning::DistanceField` (`core/planning/src/distance_field.cpp`), an exact
+Euclidean distance transform rebuilt from scratch for every map with the separable
+Felzenszwalb–Huttenlocher decomposition: three passes, one per axis, rows spread over threads (the
+core uses 4). Up to a saturation of 128 cells the y/z passes check every offset within the cap
+directly (16-bit SIMD) instead of building the lower envelope, ~3-5x faster at our 20 cells; above it
+they use the exact integer envelope. Stored as uint16 squared cell distances with a float lookup
+table (2 B/cell). It replaced DynamicEDT3D, which is built for incremental repair (priority queue,
+~25 B/cell) that a per-map rebuild never uses: two DynamicEDT3D fields took 2.7 s on the bench map;
+on a synthetic 10M-cell room DynamicEDT3D took 4.6 s per field and this ~15 ms at 4 threads.
+Differences from DynamicEDT3D: the box is exactly the tree's voxels (DynamicEDT3D had one extra
+layer on the max faces), far cells read exactly maxdist (DynamicEDT3D read maxdist + one voxel), and
+it is exact where DynamicEDT3D's brushfire occasionally overestimates by a few mm.
+`libdynamicedt3d-dev` (apt, version-matched to octomap 1.9.7) is still needed, only as the reference
+the `distance_field` test compares against.
 
 **DecompUtil (safe-flight-corridor decomposition)**: system CMake install at `/usr/local` from
 https://github.com/sikang/DecompUtil — **header-only**, so `find_package(decomp_util)` supplies only
@@ -1473,10 +1490,15 @@ latches and the subscriber retains the last map (below).
 
 **Two non-obvious gotchas the switch exposed (both fixed in `autonomy_node.cpp`):**
 1. **`ColorOcTree`, not `OcTree`.** RTAB-Map publishes a `ColorOcTree` (it stores voxel colour);
-   `octomap_server` published a plain `OcTree`. The core/`DynamicEDTOctomap` needs an `OcTree`, so a
+   `octomap_server` published a plain `OcTree`. The core needs an `OcTree`, so a
    naive `dynamic_cast<OcTree*>` silently dropped *every* map and the planner sat idle ("New goal"
-   then nothing). `onOctomap` now converts via the `toOcTree()` helper (copies occupancy, drops
-   colour, **expands coarse/pruned leaves** to resolution voxels so walls don't get holes).
+   then nothing). **Since 2026-09-30 `onOctomap` reads the binary message straight into an `OcTree`**
+   (`octomap_msgs::readTree`, then `prune()`): the binary format holds only the tree shape and a
+   free/occupied bit per leaf, identical whichever tree type wrote it (checked: a `ColorOcTree`'s
+   binary data read into an `OcTree` matches it at every voxel). It replaced a `toOcTree()` copy that
+   broke every merged block into 5 cm voxels (~300 ms of a 700k-node map). Merged blocks now stay
+   merged; every consumer handles them (distance field, shell, "never seen" search, the corridor's
+   obstacle points, which expand them itself, and the occupancy viz cloud, likewise).
 2. **QoS durability.** RTAB-Map's octomap publisher is `RELIABLE` + `TRANSIENT_LOCAL` (latched) and
    publishes sparsely (only on motion-gated updates). A `VOLATILE` subscriber never receives the
    retained sample, so on a static scene `map_` stayed null. The octomap subscription is now
@@ -1550,7 +1572,7 @@ suggesting higher resolution/rate/quality:
 - Camera capped at 640×480@15fps (depth/infra/RGB) in `autonomy_vision_launch.py`.
 - `okvis2/config/realsense_D435i.yaml`: `use_cnn: false` (no GPU), ≤400 keypoints, `octaves: 0`,
   2 optimization threads, 40 ms realtime budget.
-- RTAB-Map tuned light (`rtabmap_viz:=false`, `--Vis/MinInliers 12`, `--Rtabmap/DetectionRate 1`);
+- RTAB-Map tuned light (`rtabmap_viz:=false`, `--Vis/MinInliers 12`, `--Rtabmap/DetectionRate 2.5` — raised from 1 on 2026-09-30 once the map callback dropped; at 0 (no limit) it reached ~3 Hz, 2.5 leaves OKVIS some idle CPU);
   OctoMap at 0.05 m. Min-snap trajgen is ms-cheap; RRT* runs on its own thread (≤3 s) so it never
   stalls the 50 Hz control loop.
 - `system_monitor_pkg/cpu_monitor.py` publishes `/telemetry/cpu_usage_total` and

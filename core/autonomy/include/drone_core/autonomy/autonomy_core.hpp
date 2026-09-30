@@ -15,12 +15,9 @@
 #include "drone_core/control/trajectory_tracker.hpp"
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/min_snap_trajectory.hpp"
+#include "drone_core/planning/distance_field.hpp"
 #include "drone_core/planning/geometric_planner.hpp"
 
-// Forward declaration (from dynamicEDT3D) so the cached distance field can be a
-// member without pulling that header into this ROS-free public interface.
-template <class TREE>
-class DynamicEDTOctomapBase;
 
 namespace drone_core::autonomy {
 
@@ -259,8 +256,9 @@ public:
   // geometric search can chase a goal beyond the mapped frontier (informed
   // planners refuse an unreachable goal outright). `conservative` is the
   // frontier-stamped copy — unknown space reads as occupied — used for
-  // truncation, corridor growth and trajectory safety; pass nullptr when no
-  // frontier information is available (the raw map then serves both roles and
+  // truncation, corridor growth and trajectory safety — the host's copy of the
+  // raw map with every never-observed voxel bordering free space stamped
+  // occupied (planning::stampUnknownShell); pass nullptr when it has none (the raw map then serves both roles and
   // nothing guards against unknown space, matching the pre-frontier behavior).
   // With use_corridor_qp off and a conservative map present, the search runs on
   // the conservative view instead — the legacy single-map behavior of
@@ -398,8 +396,8 @@ private:
   // off) trajgen is plain min-snap over the waypoints.
   //
   // is_unknown, when non-empty, makes truncation stop at the first point in
-  // never-observed space — a check the distance field cannot make, because the
-  // stamped shell it measures against has gaps. The CALLER decides whether to
+  // never-observed space, read from the stamped view (the ball around the drone
+  // free, the unknown shell occupied). The CALLER decides whether to
   // supply it, and supplies it only when a conservative map view exists (i.e.
   // TREAT_FRONTIER_AS_OBSTACLE is on). Passed as the predicate rather than as a
   // map handle so that decision is visible at the call site next to the
@@ -421,7 +419,7 @@ private:
   };
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const common::MotionState& start,
-                  const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
+                  const std::shared_ptr<const planning::DistanceField>& cons_edt,
                   const planning::MapHandle& cons_map,
                   const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj,
@@ -569,7 +567,7 @@ private:
   // this and each owns its own Config copy. The cache is guarded by edt_mutex_,
   // which is held only for the rebuild and the pointer hand-back — never across
   // a solve.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> clearanceField(
+  std::shared_ptr<const planning::DistanceField> clearanceField(
       const planning::MapHandle& map, double maxdist);
 
   // Cached distance field over the conservative map view, for truncation and
@@ -577,7 +575,7 @@ private:
   // when the conservative and search maps are the same object (no frontier
   // information), the search field is reused instead of building a second EDT.
   // Same edt_mutex_ and same reason for the explicit maxdist as clearanceField.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> conservativeField(
+  std::shared_ptr<const planning::DistanceField> conservativeField(
       const planning::MapHandle& map, double maxdist);
 
   // Sample the cached EDT on a coarse grid over the map's bounding box. Samples
@@ -738,12 +736,12 @@ private:
 
   // Cached distance field and the map it was built from — the single obstacle
   // model for both collision validity and the clearance cost. See clearanceField.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> edt_;
+  std::shared_ptr<const planning::DistanceField> edt_;
   planning::MapHandle edt_source_map_;
   double edt_maxdist_{0.0};  // clearance_threshold the field was built with
   // Second cached field over the conservative map view (truncation + corridor).
   // See conservativeField.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> cons_edt_;
+  std::shared_ptr<const planning::DistanceField> cons_edt_;
   planning::MapHandle cons_edt_source_map_;
   double cons_edt_maxdist_{0.0};
   planning::MapHandle viz_sampled_map_;  // map the debug clearance samples were taken from

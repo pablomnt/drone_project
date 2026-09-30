@@ -124,7 +124,8 @@ def generate_launch_description():
                 'visual_odometry:=false '
                 'rtabmap_viz:=false '
                 # Quiet rtabmap's per-update INFO stats so the terminal can focus on
-                # planning logs; warnings/errors still print.
+                # planning logs; warnings/errors still print. Set to info to see its
+                # per-frame timing (Rate, RTAB-Map, Maps update, pub).
                 'log_level:=warn '
                 'rgb_topic:=/camera/camera/color/image_raw '
                 'depth_topic:=/camera/camera/aligned_depth_to_color/image_raw '
@@ -157,7 +158,7 @@ def generate_launch_description():
                 # RangeMax trades look-ahead vs. far D435i depth noise (8 m is well into
                 #   the noisy range; lower it toward ~3 m for less speckle at the source).
                 #   CellSize matches the old 0.05 m octomap_server resolution.
-                'args:=" -d --Vis/MinInliers 12 --Rtabmap/DetectionRate 1 --Rtabmap/ImagesBufferSize 10 --Rtabmap/TimeThr 0 --Rtabmap/MemoryThr 0 --RGBD/OptimizeMaxError 5.0 '
+                'args:=" -d --Vis/MinInliers 12 --Rtabmap/DetectionRate 2.5 --Rtabmap/ImagesBufferSize 10 --Rtabmap/TimeThr 0 --Rtabmap/MemoryThr 0 --RGBD/OptimizeMaxError 5.0 '
                 '--Grid/3D true --Grid/RayTracing true --Grid/CellSize 0.05 --Grid/RangeMax 8.0 '
                 '--Grid/DepthDecimation 1 --Grid/NormalsSegmentation false '
                 '--Grid/NoiseFilteringRadius 0.1 --Grid/NoiseFilteringMinNeighbors 5"'

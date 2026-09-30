@@ -6,7 +6,9 @@ add_library(drone_core_planning
   src/geometric_planner.cpp
   src/min_snap_trajectory.cpp
   src/corridor.cpp
-  src/corridor_trajectory.cpp)
+  src/corridor_trajectory.cpp
+  src/unknown_shell.cpp
+  src/distance_field.cpp)
 add_library(drone_core::planning ALIAS drone_core_planning)
 
 target_include_directories(drone_core_planning PUBLIC
@@ -16,8 +18,11 @@ target_include_directories(drone_core_planning PUBLIC
   ${OCTOMAP_INCLUDE_DIRS}
   ${NLOPT_INCLUDE_DIRS})
 
+find_package(Threads REQUIRED)   # DistanceField builds its passes on std::thread
+
 target_link_libraries(drone_core_planning PUBLIC
   drone_core_common
+  Threads::Threads
   Eigen3::Eigen
   ${OMPL_LIBRARIES}
   ${OCTOMAP_LIBRARIES}
@@ -61,4 +66,11 @@ if(DRONE_CORE_BUILD_TESTS)
   add_executable(test_unknown_cost test/test_unknown_cost.cpp)
   target_link_libraries(test_unknown_cost PRIVATE drone_core_planning)
   add_test(NAME unknown_cost COMMAND test_unknown_cost)
+
+  # DistanceField (exact EDT) against brute force on small maps and against
+  # DynamicEDT3D, the field it replaced, on a medium one; thread-count and
+  # concurrent-query determinism. A few seconds in Release.
+  add_executable(test_distance_field test/test_distance_field.cpp)
+  target_link_libraries(test_distance_field PRIVATE drone_core_planning ${DYNAMICEDT3D_LIBRARY})
+  add_test(NAME distance_field COMMAND test_distance_field)
 endif()

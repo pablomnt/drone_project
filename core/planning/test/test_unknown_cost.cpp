@@ -17,6 +17,7 @@
 
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/geometric_planner.hpp"
+#include "drone_core/planning/unknown_shell.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -188,6 +189,55 @@ int main() {
                                   /*escape_ramp=*/1.0, /*sample_step=*/0.05, nearUnknown);
     expect(cut.back().x() <= 0.25,
            "the escape ramp let truncation commit into unknown space near the drone");
+  }
+
+  // 8. The unknown shell. A known-free 1 m cube with one occupied voxel on its
+  //    floor, the drone at one corner: the shell closes the cube on every side
+  //    with no hole, the ball around the drone is freed and wrapped, and nothing
+  //    known is changed.
+  {
+    const double res = 0.1;
+    octomap::OcTree tree(res);
+    for (double x = 0.05; x < 1.0; x += res)
+      for (double y = 0.05; y < 1.0; y += res)
+        for (double z = 0.05; z < 1.0; z += res)
+          tree.updateNode(octomap::point3d(x, y, z), false);
+    tree.updateNode(octomap::point3d(0.55, 0.55, 0.05), true);
+    tree.updateNode(octomap::point3d(0.55, 0.55, 0.05), true);
+    const octomap::point3d drone(0.05, 0.05, 0.55);
+    const auto stats = stampUnknownShell(tree, drone, 0.32);
+    const auto occupied = [&](double x, double y, double z) {
+      const auto* n = tree.search(octomap::point3d(x, y, z));
+      return n && tree.isNodeOccupied(n);
+    };
+    const auto freeKnown = [&](double x, double y, double z) {
+      const auto* n = tree.search(octomap::point3d(x, y, z));
+      return n && !tree.isNodeOccupied(n);
+    };
+    expect(stats.ball_freed > 0, "the ball freed nothing beside the drone");
+    expect(occupied(1.05, 0.55, 0.55), "shell missing on the +x face");
+    expect(occupied(0.55, 1.05, 0.55), "shell missing on the +y face");
+    expect(occupied(0.55, 0.55, 1.05), "shell missing on the top face");
+    expect(occupied(0.55, 0.55, -0.05), "shell missing on the bottom face");
+    expect(occupied(1.05, 1.05, 1.05), "shell missing on a corner (26-neighbourhood)");
+    expect(freeKnown(-0.15, 0.05, 0.55), "the ball did not free unknown space behind the drone");
+    expect(occupied(-0.35, 0.05, 0.55), "the shell does not wrap around the ball");
+    expect(tree.search(octomap::point3d(-0.55, 0.05, 0.55)) == nullptr,
+           "space beyond the shell was touched");
+    expect(occupied(0.55, 0.55, 0.05), "a known obstacle was changed");
+    expect(freeKnown(0.55, 0.55, 0.55), "known free space was changed");
+    // A closed shell: every voxel just outside the cube is either the ball
+    // (free) or stamped.
+    int holes = 0;
+    for (double a = -0.05; a < 1.1; a += res)
+      for (double b = -0.05; b < 1.1; b += res) {
+        for (const auto& p : {octomap::point3d(-0.05, a, b), octomap::point3d(1.05, a, b),
+                              octomap::point3d(a, -0.05, b), octomap::point3d(a, 1.05, b),
+                              octomap::point3d(a, b, -0.05), octomap::point3d(a, b, 1.05)}) {
+          if (!tree.search(p)) ++holes;
+        }
+      }
+    expect(holes == 0, "the shell has " + std::to_string(holes) + " holes");
   }
 
   if (failures == 0) {

@@ -9,7 +9,6 @@
 #include <sstream>
 #include <string>
 
-#include <dynamicEDT3D/dynamicEDTOctomap.h>
 #include <ompl/util/Console.h>
 
 #include "drone_core/common/logging.hpp"
@@ -39,25 +38,14 @@ double steadyNowSeconds() {
   return std::chrono::duration<double>(t).count();
 }
 
-// Build a Euclidean distance transform over the occupancy octree, capped at
-// maxdist (metres) so its cost is bounded by the obstacle envelope rather than
-// the whole volume. getDistance() then gives O(1) clearance lookups. Points
-// outside the map's bounding box read as "no obstacle within maxdist", matching
-// the planner's treat-unknown-as-free policy.
-std::shared_ptr<DynamicEDTOctomap> buildEdt(const std::shared_ptr<octomap::OcTree>& tree,
-                                            double maxdist) {
-  double xmin, ymin, zmin, xmax, ymax, zmax;
-  tree->getMetricMin(xmin, ymin, zmin);
-  tree->getMetricMax(xmax, ymax, zmax);
-  const octomap::point3d bbx_min(static_cast<float>(xmin), static_cast<float>(ymin),
-                                 static_cast<float>(zmin));
-  const octomap::point3d bbx_max(static_cast<float>(xmax), static_cast<float>(ymax),
-                                 static_cast<float>(zmax));
-  auto edt = std::make_shared<DynamicEDTOctomap>(static_cast<float>(maxdist), tree.get(),
-                                                 bbx_min, bbx_max,
-                                                 /*treatUnknownAsOccupied=*/false);
-  edt->update();
-  return edt;
+// Build the Euclidean distance field over the occupancy octree's bounding box,
+// capped at maxdist (metres). getDistance() then gives O(1) clearance lookups.
+// Points outside the box read negative, which makeClearanceFn turns into "no
+// obstacle within maxdist", matching the planner's treat-unknown-as-free policy.
+std::shared_ptr<const planning::DistanceField> buildEdt(
+    const std::shared_ptr<octomap::OcTree>& tree, double maxdist) {
+  // 4 threads: nearly as fast as all 8 on the NUC, leaving room for VIO and SLAM.
+  return std::make_shared<const planning::DistanceField>(*tree, maxdist, /*threads=*/4);
 }
 
 // Wrap a distance field as a clearance oracle. The planner's objective, the
@@ -106,7 +94,7 @@ double distanceToPath(const std::vector<std::vector<double>>& path, const Eigen:
              : best;
 }
 
-planning::CorridorClearanceFn makeClearanceFn(std::shared_ptr<DynamicEDTOctomap> edt,
+planning::CorridorClearanceFn makeClearanceFn(std::shared_ptr<const planning::DistanceField> edt,
                                               double maxd) {
   return [edt = std::move(edt), maxd](double x, double y, double z) {
     const double d = edt->getDistance(octomap::point3d(
@@ -571,14 +559,13 @@ bool AutonomyCore::planOnce() {
 
   common::Trajectory traj;
   const planning::MapHandle cons = conservative ? conservative : map;
-  // Truncation stops at unobserved space only when the operator asked for it —
-  // see the worker's copy of this for why it keys off the flag and not off
-  // whether a conservative view exists. The predicate reads the RAW map.
+  // Truncation stops at unobserved space only when the operator asked for it.
+  // The predicate reads the stamped view — see the worker's copy of this.
   TrajgenInfo info;
   if (!runTrajgen(path, anchor.t0, anchor.start,
                   conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin)),
                   cons,
-                  cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+                  cfg_.treat_unknown_as_hazard ? makeUnknownFn(cons)
                                                : planning::CorridorUnknownFn{},
                   traj, /*pin_waypoints=*/false, /*root_shift=*/-1.0, &info))
     return false;
@@ -638,7 +625,7 @@ std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField(double max
   // shows what the objective sees. That is the conservative field whenever one
   // exists as a distinct view, and the search field otherwise. Both are current
   // for this tick: applyClearanceObjective runs before this and populates them.
-  std::shared_ptr<DynamicEDTOctomap> field;
+  std::shared_ptr<const planning::DistanceField> field;
   planning::MapHandle source;
   {
     // Pick the field up under the lock, then sample outside it: the walk is slow
@@ -685,7 +672,7 @@ bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal&
 
 bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                               const common::MotionState& start,
-                              const std::shared_ptr<DynamicEDTOctomap>& cons_edt,
+                              const std::shared_ptr<const planning::DistanceField>& cons_edt,
                               const planning::MapHandle& cons_map,
                               const planning::CorridorUnknownFn& unknown_fn,
                               common::Trajectory& traj, bool pin_waypoints,
@@ -867,9 +854,9 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     // is 1e5-1e6 voxels and DecompUtil scans the list per segment, which would
     // never fit the 1 Hz trajgen budget. The window is the prefix's AABB grown
     // by the region-growth extent plus the margin, so nothing that could bound
-    // a region is missed. Coarse (unpruned) leaves are expanded to resolution
-    // voxels, mirroring toOcTree() in the ROS node, so a single big leaf does
-    // not under-represent a solid block as one point.
+    // a region is missed. Coarse (merged) leaves are expanded to resolution
+    // voxels, so a single big leaf does not under-represent a solid block as
+    // one point.
     const auto obstacles = [&]() {
       Eigen::Vector3d lo = committed.front(), hi = committed.front();
       for (const auto& w : committed) {
@@ -1112,7 +1099,7 @@ void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d
                              conservativeField(cons, std::max(cfg_.clearance_threshold,
                                                               cfg_.frontier_margin)),
                              cons,
-                             cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+                             cfg_.treat_unknown_as_hazard ? makeUnknownFn(cons)
                                                           : planning::CorridorUnknownFn{},
                              traj, /*pin_waypoints=*/true);
   if (!ok) {
@@ -1203,7 +1190,7 @@ common::Trajectory AutonomyCore::stagePlanned(const SpliceAnchor& anchor,
   return traj;
 }
 
-std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
+std::shared_ptr<const planning::DistanceField> AutonomyCore::clearanceField(
     const planning::MapHandle& map, double maxdist) {
   std::lock_guard<std::mutex> lock(edt_mutex_);
   // No obstacles => clearance is uniform => no field needed (validity treats
@@ -1242,7 +1229,7 @@ std::shared_ptr<DynamicEDTOctomap> AutonomyCore::clearanceField(
   return edt_;
 }
 
-std::shared_ptr<DynamicEDTOctomap> AutonomyCore::conservativeField(
+std::shared_ptr<const planning::DistanceField> AutonomyCore::conservativeField(
     const planning::MapHandle& map, double maxdist) {
   std::lock_guard<std::mutex> lock(edt_mutex_);
   if (!map || map->size() == 0) {
@@ -1870,15 +1857,16 @@ void AutonomyCore::trajgenLoop() {
           distanceToPath(committed_path, Eigen::Vector3d(root[0], root[1], root[2]));
       std::ostringstream stub_note;
       // Truncation stops at unobserved space only when the operator asked for
-      // it — keyed off the flag, not off a conservative view existing (the host
-      // builds that only once a frontier cloud has arrived). The predicate reads
-      // the RAW map: stamping writes voxels into the conservative copy.
+      // it. The predicate reads the STAMPED view: there the ball around the drone
+      // has been marked free and the shell occupied, so "never observed" means
+      // the same thing to truncation, the monitor and the corridor (whose
+      // obstacles come from the same view).
       const planning::MapHandle cons = conservative ? conservative : map;
       const double t_field = now();
       const auto cons_field =
           conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
       const double field_time = now() - t_field;
-      const auto unknown_fn = cfg_.treat_unknown_as_hazard ? makeUnknownFn(map)
+      const auto unknown_fn = cfg_.treat_unknown_as_hazard ? makeUnknownFn(cons)
                                                            : planning::CorridorUnknownFn{};
       const double factors_with_stub[] = {1.5, 2.25, 3.4};
       const int tries = stub_ideal > 0.0 ? 3 : 1;
@@ -2047,8 +2035,9 @@ void AutonomyCore::monitorLoop() {
     const auto field = corridor ? conservativeField(cons, maxd) : nullptr;
     const planning::CorridorClearanceFn clearance =
         field ? makeClearanceFn(field, maxd) : planning::CorridorClearanceFn{};
+    // Read from the stamped view, like truncation's (see the solver).
     const planning::CorridorUnknownFn unknown =
-        c.treat_unknown_as_hazard ? makeUnknownFn(map) : planning::CorridorUnknownFn{};
+        c.treat_unknown_as_hazard ? makeUnknownFn(cons) : planning::CorridorUnknownFn{};
 
     Needs needs;
     bool emergency = false;

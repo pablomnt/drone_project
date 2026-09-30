@@ -22,7 +22,6 @@
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 #include <octomap/octomap.h>
-#include <octomap/ColorOcTree.h>
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
 
@@ -48,6 +47,7 @@
 #include "drone_interfaces/msg/controller_debug.hpp"
 
 #include "drone_core/autonomy/autonomy_core.hpp"
+#include "drone_core/planning/unknown_shell.hpp"
 #include "drone_core/common/frames.hpp"
 #include "drone_core/common/logging.hpp"
 
@@ -72,35 +72,11 @@ constexpr const char* kWorldFrame = "world";
 // POS_SP once the preset completes.
 constexpr double kPresetMinAirborneZ = 0.8;   // reject a preset fired below this [m]
 
-// RTAB-Map publishes its octomap as a ColorOcTree (it stores voxel colour for
-// visualisation), but the core's map model — and DynamicEDTOctomap — needs a
-// plain octomap::OcTree. Copy occupancy across, dropping colour. Coarse (pruned)
-// leaves are expanded to resolution-sized voxels so an occupied region stays
-// solid instead of collapsing to a single centre voxel (which would punch holes
-// in walls for the planner). Works for any OccupancyOcTreeBase node type.
-template <typename TreeT>
-std::shared_ptr<octomap::OcTree> toOcTree(const TreeT& in) {
-  const double res = in.getResolution();
-  auto out = std::make_shared<octomap::OcTree>(res);
-  for (auto it = in.begin_leafs(), end = in.end_leafs(); it != end; ++it) {
-    const float log_odds = it->getLogOdds();
-    const double size = it.getSize();
-    if (size <= res * 1.5) {
-      out->setNodeValue(it.getCoordinate(), log_odds, /*lazy_eval=*/true);
-    } else {
-      const double half = (size - res) / 2.0;
-      const octomap::point3d c = it.getCoordinate();
-      for (double dx = -half; dx <= half + 1e-6; dx += res)
-        for (double dy = -half; dy <= half + 1e-6; dy += res)
-          for (double dz = -half; dz <= half + 1e-6; dz += res)
-            out->setNodeValue(octomap::point3d(c.x() + dx, c.y() + dy, c.z() + dz),
-                              log_odds, /*lazy_eval=*/true);
-    }
-  }
-  out->updateInnerOccupancy();
-  return out;
-}
 
+// RTAB-Map's frontier cloud is no longer used: the shell is computed from the
+// octomap itself (planning::stampUnknownShell, see onOctomap). Kept for
+// reference.
+#if 0
 // Burn a frontier point cloud into an OcTree as *occupied* voxels. The frontier
 // (RTAB-Map's octomap_global_frontier_space) is the shell of known-free voxels
 // that border unmapped space; stamping it occupied makes the planner's EDT treat
@@ -128,6 +104,7 @@ void stampFrontierOccupied(octomap::OcTree& tree, const sensor_msgs::msg::PointC
   }
   tree.updateInnerOccupancy();
 }
+#endif
 }  // namespace
 
 class AutonomyNode : public rclcpp::Node {
@@ -203,13 +180,12 @@ public:
     sub_map_ = create_subscription<octomap_msgs::msg::Octomap>(
         "/octomap_binary", map_qos, std::bind(&AutonomyNode::onOctomap, this, std::placeholders::_1),
         slow_opts);
-    // Frontier (known-free/unknown boundary) as a PointCloud2, latched like the
-    // octomap and published on the same motion-gated map updates. Cached and
-    // burned into each incoming octomap as occupied voxels (see onOctomap) when
-    // TREAT_FRONTIER_AS_OBSTACLE is on, so the planner won't route into unknown space.
-    sub_frontier_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        "/octomap_frontier", map_qos, std::bind(&AutonomyNode::onFrontier, this, std::placeholders::_1),
-        slow_opts);
+    // RTAB-Map's frontier cloud is no longer used: it arrived as a separate
+    // message, one map update late, and had holes. The shell is now computed
+    // from each octomap itself (see onOctomap).
+    // sub_frontier_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+    //     "/octomap_frontier", map_qos, std::bind(&AutonomyNode::onFrontier, this, std::placeholders::_1),
+    //     slow_opts);
     sub_goal_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         "/planner/goal", 10, std::bind(&AutonomyNode::onGoal, this, std::placeholders::_1), fast_opts);
 
@@ -381,13 +357,19 @@ private:
     // work. Held TRUE for the current trajectory-following bench tuning; turn
     // it off for a real flight.
     declare_parameter("DEBUG_CONTROL_VIZ", true);
-    // Treat frontier voxels (the known-free/unknown boundary from RTAB-Map's
-    // octomap_global_frontier_space) as obstacles, so the planner refuses to
-    // route through unmapped space and only flies through explored-free space.
-    // Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
+    // Treat never-observed space as an obstacle, so the planner refuses to route
+    // through unmapped space and only flies through explored-free space. Each
+    // octomap gets a copy with every never-observed voxel that touches free
+    // space stamped occupied (a closed shell), and the never-observed voxels
+    // within 0.5 m of the drone marked free so it is not boxed in by what it
+    // cannot see beside it. Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
     // so with this on the drone is boxed in until it has mapped its surroundings
     // (e.g. an initial 360deg scan) — flip it off for open-loop bench tests.
     declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", false);
+    // One [map] line per octomap: time since the previous one, and how long
+    // decoding, the unknown shell, the two distance fields, the occupancy-map
+    // publish and the whole callback took.
+    declare_parameter("LOG_MAP_TIMING", true);
     // Best-effort goal seeking. When true (default), a goal in unreachable or
     // still-unmapped space no longer produces "no path": the planner routes to the
     // reachable point closest to the goal (the frontier edge) and the worker keeps
@@ -446,9 +428,8 @@ private:
     // trajectory toward the planned waypoints without tightening the corridor.
     declare_parameter("TRAJ_PATH_WEIGHT", 0.5);
     // Log one line per corridor QP solve breaking down its time: seed growth,
-    // BOBYQA's initial probe, the rest of the search, the final solve. On for
-    // now while the time search is being tuned.
-    declare_parameter("DEBUG_TRAJGEN", true);
+    // the bisection, the group cuts, the final solve.
+    declare_parameter("DEBUG_TRAJGEN", false);
     // Corridor resample cap: one free box is grown per path piece of at most
     // this length [m].
     declare_parameter("MAX_SEGMENT_LEN", 2.0);
@@ -700,89 +681,111 @@ private:
     t_sensor_ = get_clock()->now().seconds();
   }
 
-  void onFrontier(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    // Just cache the latest frontier cloud; it is applied when the next octomap
-    // arrives (onOctomap). Both callbacks are in the slow group, which is mutually
-    // exclusive, so they never run concurrently and no lock is needed.
-    frontier_cloud_ = msg;
-  }
+  // void onFrontier(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+  //   // Just cache the latest frontier cloud; it is applied when the next octomap
+  //   // arrives (onOctomap). Both callbacks are in the slow group, which is mutually
+  //   // exclusive, so they never run concurrently and no lock is needed.
+  //   frontier_cloud_ = msg;
+  // }
 
   void onOctomap(const octomap_msgs::msg::Octomap::SharedPtr msg) {
-    octomap::AbstractOcTree* tree = octomap_msgs::binaryMsgToMap(*msg);
-    if (!tree) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "octomap failed to deserialize (binaryMsgToMap returned null)");
-      return;
-    }
+    using Clock = std::chrono::steady_clock;
+    const auto t_arrival = Clock::now();
+    const double since_last =
+        last_map_arrival_ == Clock::time_point{}
+            ? -1.0
+            : std::chrono::duration<double>(t_arrival - last_map_arrival_).count();
+    last_map_arrival_ = t_arrival;
 
-    std::shared_ptr<octomap::OcTree> map;
-    if (auto* octree = dynamic_cast<octomap::OcTree*>(tree)) {
-      // Already the type the core wants (e.g. octomap_server) — take ownership.
-      map = std::shared_ptr<octomap::OcTree>(octree);
-    } else if (auto* color = dynamic_cast<octomap::ColorOcTree*>(tree)) {
-      // RTAB-Map's case: convert colour tree to a plain OcTree, then free the original.
-      map = toOcTree(*color);
-      delete tree;
-    } else {
+    // The binary format carries only the tree's shape and a free/occupied bit per
+    // leaf (no colour, no probabilities), whichever tree type wrote it, so it is
+    // read straight into the plain OcTree the core uses. RTAB-Map sends a
+    // ColorOcTree; this used to be read into one and then copied voxel by voxel
+    // into an OcTree with every merged block broken up (~300 ms on a 700k-node
+    // map). Merged blocks now stay merged — everything downstream handles them.
+    if (!msg->binary || msg->data.empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "octomap is an unsupported tree type (id='%s'), ignoring",
-                           msg->id.c_str());
-      delete tree;
+                           "octomap ignored: %s (id='%s')",
+                           msg->binary ? "empty" : "not a binary octomap", msg->id.c_str());
       return;
     }
+    auto map = std::make_shared<octomap::OcTree>(msg->resolution);
+    octomap_msgs::readTree(map.get(), *msg);
+    map->prune();  // the binary values are two-level, so far more blocks merge
+
+    const auto t_decoded = Clock::now();
 
     // Dual-map feed. The raw map is the core's OPTIMISTIC view (unknown reads
     // as free — what the corridor pipeline's geometric search runs on so goals
-    // beyond the frontier are accepted). When frontier treatment is on, a
-    // stamped deep copy becomes the CONSERVATIVE view (frontier voxels read as
-    // occupied) used for truncation, corridor growth — and, with the corridor
-    // QP off, as the legacy single search map. Read live (map rate is sparse),
-    // matching the loop's live-parameter pattern; before the first frontier
-    // cloud arrives only the raw map is fed.
+    // beyond the frontier are accepted). When frontier treatment is on, a deep
+    // copy with every never-observed voxel bordering free space stamped occupied
+    // becomes the CONSERVATIVE view, used for truncation, corridor growth,
+    // trajectory safety — and, with the corridor QP off, as the legacy single
+    // search map. Read live (map rate is sparse), matching the loop's
+    // live-parameter pattern.
     std::shared_ptr<octomap::OcTree> conservative;
+    drone_core::planning::UnknownShellStats shell;
+    auto t_copied = t_decoded;
     const bool want_frontier = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
-    if (want_frontier && frontier_cloud_) {
+    if (want_frontier) {
       // Snapshot the drone position under the lock rather than referencing it: this
       // is the slow group reading a member the fast group's odometry callbacks
-      // write, and the copy below takes long enough that a reference could be
+      // write, and the sweep below takes long enough that a reference could be
       // rewritten underneath us mid-use.
       Eigen::Vector3d p;
       {
         std::lock_guard<std::mutex> lock(cross_mutex_);
         p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
       }
-      // The octree and the frontier cloud are map-frame, and the drone position is
-      // world-frame, so the keep-out ball has to be centred on the drone expressed in
-      // map. Without a transform it stays unconverted, but planning is paused then
-      // anyway (the core requires one).
+      // The octree is map-frame and the drone position world-frame, so the ball
+      // has to be centred on the drone expressed in map. Without a transform it
+      // stays unconverted, but planning is paused then anyway (the core requires one).
       Eigen::Isometry3d world_from_map;
       if (lookupWorldFromMap(world_from_map)) p = world_from_map.inverse() * p;
       conservative = std::make_shared<octomap::OcTree>(*map);
-      stampFrontierOccupied(*conservative, *frontier_cloud_,
-                            octomap::point3d(p.x(), p.y(), p.z()),
-                            drone_core::planning::GeometricPlanner::frontierKeepOutRadius());
-    } else if (want_frontier) {
-      // Asked for but not available: no shell is stamped, so the search gets no
-      // gradient steering it away from the frontier and the corridor's regions
-      // are bounded only by real obstacles. The octree-based guards (the cost
-      // surcharge and truncation's unobserved-space stop) still hold, so this is
-      // a degradation rather than a hole — but it is invisible from the plan
-      // log, which is why it is said out loud. Names the resolved topic and its
-      // publisher count so "wrong remap" and "RTAB-Map is not publishing it" are
-      // distinguishable.
-      RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 10000,
-          "TREAT_FRONTIER_AS_OBSTACLE is on but no frontier cloud has arrived on '%s' "
-          "(%zu publishers) - no frontier shell is being stamped",
-          sub_frontier_->get_topic_name(),
-          count_publishers(sub_frontier_->get_topic_name()));
+      t_copied = Clock::now();
+      shell = drone_core::planning::stampUnknownShell(
+          *conservative, octomap::point3d(p.x(), p.y(), p.z()),
+          drone_core::planning::GeometricPlanner::frontierKeepOutRadius());
     }
+    const auto t_shell = Clock::now();
 
     // One-time confirmation the core is actually being fed a map (and how dense).
     RCLCPP_INFO_ONCE(get_logger(), "First octomap received: %zu nodes", map->size());
     got_octomap_ = true;
-    core_->setMap(map, conservative);
+    core_->setMap(map, conservative);  // builds both distance fields
+    const auto t_fields = Clock::now();
     publishOccupancyMap(conservative ? *conservative : *map);
+    const auto t_done = Clock::now();
+
+    if (get_parameter("LOG_MAP_TIMING").as_bool()) {
+      const auto ms = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+      };
+      char arrival[64];
+      if (since_last > 0.0) {
+        std::snprintf(arrival, sizeof(arrival), "%.2f s after the last (%.2f Hz)", since_last,
+                      1.0 / since_last);
+      } else {
+        std::snprintf(arrival, sizeof(arrival), "first map");
+      }
+      char shell_note[256];
+      if (want_frontier) {
+        std::snprintf(shell_note, sizeof(shell_note),
+                      "%.0f ms (copy %.0f, ball %.0f, grid %.0f, sweep %.0f, stamp %.0f ms; "
+                      "%zu stamped, %zu freed around the drone, %zu free leaves)",
+                      ms(t_decoded, t_shell), ms(t_decoded, t_copied), shell.ball_ms,
+                      shell.grid_ms, shell.sweep_ms, shell.stamp_ms, shell.stamped,
+                      shell.ball_freed, shell.free_leaves);
+      } else {
+        std::snprintf(shell_note, sizeof(shell_note), "off");
+      }
+      RCLCPP_INFO(get_logger(),
+                  "[map] %s | decode %.0f ms | shell %s | fields %.0f ms | viz %.0f ms | "
+                  "total %.0f ms | %zu nodes",
+                  arrival, ms(t_arrival, t_decoded), shell_note, ms(t_shell, t_fields),
+                  ms(t_fields, t_done), ms(t_arrival, t_done), map->size());
+    }
   }
 
   void onGoal(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
@@ -1605,23 +1608,37 @@ private:
     cloud.is_dense = true;
     cloud.is_bigendian = false;
 
+    // Merged (pruned) occupied blocks are broken up into resolution voxels, so a
+    // wall drawn as Boxes stays solid instead of showing one point per block.
+    std::vector<octomap::point3d> pts;
+    const double res = map.getResolution();
+    for (auto it = map.begin_leafs(), end = map.end_leafs(); it != end; ++it) {
+      if (!map.isNodeOccupied(*it)) continue;
+      const double size = it.getSize();
+      const octomap::point3d c = it.getCoordinate();
+      if (size <= res * 1.5) {
+        pts.push_back(c);
+        continue;
+      }
+      const double half = (size - res) / 2.0;
+      for (double dx = -half; dx <= half + 1e-6; dx += res)
+        for (double dy = -half; dy <= half + 1e-6; dy += res)
+          for (double dz = -half; dz <= half + 1e-6; dz += res)
+            pts.emplace_back(c.x() + dx, c.y() + dy, c.z() + dz);
+    }
+
     sensor_msgs::PointCloud2Modifier mod(cloud);
     mod.setPointCloud2FieldsByString(1, "xyz");
-    mod.resize(map.size());
-
+    mod.resize(pts.size());
     sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x");
     sensor_msgs::PointCloud2Iterator<float> iy(cloud, "y");
     sensor_msgs::PointCloud2Iterator<float> iz(cloud, "z");
-    std::size_t n = 0;
-    for (auto it = map.begin_leafs(), end = map.end_leafs(); it != end; ++it) {
-      if (!map.isNodeOccupied(*it)) continue;
-      *ix = static_cast<float>(it.getX());
-      *iy = static_cast<float>(it.getY());
-      *iz = static_cast<float>(it.getZ());
+    for (const auto& p : pts) {
+      *ix = p.x();
+      *iy = p.y();
+      *iz = p.z();
       ++ix; ++iy; ++iz;
-      ++n;
     }
-    mod.resize(n);
     pub_occupancy_map_->publish(cloud);
   }
 
@@ -1670,15 +1687,16 @@ private:
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr sub_status_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_vio_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr sub_map_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_frontier_;
+  // rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_frontier_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_goal_;
 
-  // Latest frontier cloud (octomap_global_frontier_space), applied to each
-  // incoming octomap in onOctomap. Null until the first frontier arrives.
-  sensor_msgs::msg::PointCloud2::SharedPtr frontier_cloud_;
+  // Latest frontier cloud (octomap_global_frontier_space), no longer used.
+  // sensor_msgs::msg::PointCloud2::SharedPtr frontier_cloud_;
   // Written by onOctomap, read by warnIfNoMap on the viz timer — both slow group,
-  // so unguarded like frontier_cloud_ above.
+  // so unguarded.
   bool got_octomap_{false};  // has onOctomap ever fired? (see warnIfNoMap)
+  // Arrival time of the previous octomap, for LOG_MAP_TIMING. Slow group only.
+  std::chrono::steady_clock::time_point last_map_arrival_{};
 
   rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
   rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr pub_offboard_;

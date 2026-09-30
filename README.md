@@ -79,7 +79,7 @@ passed in by mistake. If you need a genuine measured acceleration, do not use th
   the Euclidean distance, admissible since the integrand is ≥1; without the cost-to-go one OMPL warns
   informed sampling has "little to no effect". Collision checking is **EDT-based**: a state is free
   when its clearance (3D Euclidean distance to
-  the nearest obstacle, from a `DynamicEDTOctomap` passed in as the clearance function) exceeds
+  the nearest obstacle, from a `planning::DistanceField` passed in as the clearance function) exceeds
   `kCollisionMargin` (0.5 m) — one O(1) lookup that also enforces *vertical* clearance. (A
   horizontal-only octree box scan remains as a fallback for standalone use when no field is set.)
   Inside a sphere around the start (`kStartEscapeRadius`, 0.5 m) the required clearance drops to
@@ -341,7 +341,7 @@ TF, because it collided with the launch's static publisher and randomly corrupte
 
 ```
 RealSense → OKVIS2 (VIO: /okvis/okvis_odometry) → RTAB-Map (ray-traced 3D occupancy
-         octomap: /rtabmap/octomap_binary, + /rtabmap/octomap_global_frontier_space)
+         octomap: /rtabmap/octomap_binary; the unknown shell is computed in the node)
                                    │
                       ┌────────────┴──────────── autonomy_node (thin ROS wrapper) ──────────────┐
                       │  subscribes: octomap, okvis odom, px4 odom, sensor_combined,             │
@@ -613,7 +613,8 @@ only a build-time one via `CMAKE_PREFIX_PATH`. `-DUSE_NN=OFF` is required (okvis
 which needs LibTorch); `-DCMAKE_BUILD_TYPE=Release` is strongly wanted (VIO+SLAM are too slow on the
 NUC un-optimized).
 
-Besides the usual apt packages the core needs `libdynamicedt3d-dev` (version-matched to octomap),
+Besides the usual apt packages the core needs `libdynamicedt3d-dev` (version-matched to octomap;
+only the distance-field test uses it now, as a reference),
 **OSQP** (a system CMake install providing `libosqpstatic.a`, double precision) and **DecompUtil**
 (header-only, from https://github.com/sikang/DecompUtil; configure it with
 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` on CMake >= 4, and keep its source outside `src/` since it ships
