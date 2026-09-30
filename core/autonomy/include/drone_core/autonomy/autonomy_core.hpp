@@ -731,6 +731,9 @@ private:
   // (worker thread only). Corridor covers truncation, obstacle gathering and the
   // decomposition; QP is the trajectory solve. Zero for a stage not reached.
   double trajgen_corridor_time_{0.0};
+  // Length of the braking stub leading the path of the solve in progress [m], 0
+  // for none; its segments get a doubled seed time (trajgen thread only).
+  double trajgen_stub_len_{0.0};
   double trajgen_qp_time_{0.0};
 
   // Cached distance field and the map it was built from — the single obstacle

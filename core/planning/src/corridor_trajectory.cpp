@@ -614,6 +614,13 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
   // first ~0.3 m, where the vehicle is slowest, so it goes wholly to the end
   // segment however short that is. The last segment always ends at rest; the
   // first only starts there when the start is (near) stationary.
+  if (start_boost_len_ > 0.0) {
+    double arc = 0.0;
+    for (int s = 0; s < S; ++s) {
+      if (arc < start_boost_len_ - 1e-9) times[s] *= start_boost_factor_;
+      arc += (waypoints[s + 1] - waypoints[s]).norm();
+    }
+  }
   const double rest_allowance = restAllowance(limits_);
   times.back() += rest_allowance;
   if (start.vel.norm() < kRestSpeed) {

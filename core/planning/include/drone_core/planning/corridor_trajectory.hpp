@@ -181,6 +181,16 @@ public:
   // Soft by construction: it changes the objective only, never the constraints,
   // so it can never make a feasible corridor infeasible the way pinning can.
   void setPathWeight(double weight) { path_weight_ = weight; }
+
+  // Seed the segments that start within `length` metres of the path's start
+  // with `factor` times their normal time. Used for a braking stub (see the
+  // autonomy solver): the vehicle has to shed its speed along it, which the
+  // len/vmax seed knows nothing about, and uniform growth keeps whatever ratio
+  // the seed set between segments. <= 0 length: off (the default).
+  void setStartSeedBoost(double length, double factor) {
+    start_boost_len_ = length;
+    start_boost_factor_ = factor;
+  }
   double pathWeight() const { return path_weight_; }
 
   // Stage 3 of the time search. Segments are grouped by how the path turns:
@@ -201,6 +211,8 @@ private:
   double time_budget_ = 0.0;
   const std::atomic<bool>* abort_flag_ = nullptr;
   double path_weight_ = 0.0;
+  double start_boost_len_ = 0.0;
+  double start_boost_factor_ = 1.0;
   double group_cut_ = 0.25;
   double group_edge_factor_ = 0.6;
   bool debug_ = false;

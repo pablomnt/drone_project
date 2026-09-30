@@ -957,6 +957,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       optimizer.setPathWeight(cfg_.traj_path_weight);
       optimizer.setDebug(cfg_.debug_trajgen);
       optimizer.setAbortFlag(&solve_abort_);
+      if (trajgen_stub_len_ > 0.0) optimizer.setStartSeedBoost(trajgen_stub_len_, 2.0);
       snapshotRegions(attempt, /*accepted=*/true);
       if (solve_cancel_.load()) return false;  // cancellation checkpoint
       // `start` carries the splice state. Its position is path.front() by
@@ -1883,6 +1884,7 @@ void AutonomyCore::trajgenLoop() {
       const int tries = stub_ideal > 0.0 ? 3 : 1;
       for (int k = 0; k < tries; ++k) {
         const double factor = stub_ideal > 0.0 ? factors_with_stub[k] : 0.0;
+        trajgen_stub_len_ = factor * stub_ideal;
         result.ok = runTrajgen(pathWithStub(factor), result.anchor.t0, result.anchor.start,
                                cons_field, cons, unknown_fn, result.traj,
                                /*pin_waypoints=*/false, root_shift, &result.info);
@@ -1895,6 +1897,7 @@ void AutonomyCore::trajgenLoop() {
         // try must finish leaving the hand-over margin before it.
         if (result.ok || solve_cancel_.load() || result.anchor.t0 - now() < 0.5) break;
       }
+      trajgen_stub_len_ = 0.0;
       result.cancelled = solve_cancel_.load();
       // A failure with the anchor far off the path means the path is stale (it was
       // planned from a predicted start the trajectory has since left): drop it so
