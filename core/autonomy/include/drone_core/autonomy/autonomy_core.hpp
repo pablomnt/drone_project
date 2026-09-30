@@ -96,6 +96,13 @@ public:
     // insists on (near-)exact arrival and holds if the goal is unreachable.
     bool best_effort_goal{true};
     double clearance_weight{4.0};     // obstacle-proximity penalty weight
+    // Weight on the frontier's proximity penalty: what running near the edge of
+    // explored space costs beyond what the nearest mapped obstacle already
+    // charges (see GeometricPlanner::setCostClearance). Only used when the cost
+    // is scored on the conservative field (treat_unknown_as_hazard +
+    // use_corridor_qp); with it equal to clearance_weight the cost is the old
+    // single penalty on that field.
+    double frontier_weight{4.0};
     double clearance_threshold{1.0};  // clearance saturation distance / EDT maxdist [m]
     // Flat extra cost charged per metre of path routed through space that has
     // never been observed. This is NOT expressible as a clearance weight: the
@@ -196,9 +203,11 @@ public:
     // narrowing the corridor, so tight scenery keeps its options.
     // See CorridorTrajectoryOptimizer::setPathWeight.
     double traj_path_weight{0.0};
-    // Log where each corridor QP solve spends its time (seed growth, BOBYQA
-    // probe and search, final solve). See CorridorTrajectoryOptimizer::setDebug.
-    bool debug_trajgen{true};
+    // Trajgen detail logs: where each corridor QP solve spends its time (see
+    // CorridorTrajectoryOptimizer::setDebug) and the lines of a corridor that
+    // worked (truncation cut, start margin relaxed, end pulled back, thin joints
+    // repaired, OK). Failures and the one-line solve summary always log.
+    bool debug_trajgen{false};
     // Minimum half-extents of the region-growth window in the SEGMENT-ALIGNED
     // frame (x along the segment, y/z lateral) — not world axes. A floor, not a
     // cap: buildCorridor raises it to scale with the longest segment. Pinning

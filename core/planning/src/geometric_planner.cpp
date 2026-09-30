@@ -35,11 +35,19 @@ namespace {
 // each has.
 class ClearanceObjective : public ompl::base::StateCostIntegralObjective {
 public:
+  // `clearance` is the obstacle field, weighted by `weight`. `frontier`, when
+  // set, is a field that also counts the frontier (never farther from a hazard
+  // than `clearance`); the extra penalty it gives over `clearance` is weighted
+  // by `frontier_weight`. With the two weights equal that is exactly the single
+  // penalty on `frontier`. Either may be null.
   ClearanceObjective(const ompl::base::SpaceInformationPtr& si,
-                     GeometricPlanner::ClearanceFn clearance, double weight, double threshold,
-                     GeometricPlanner::UnknownFn is_unknown, double unknown_weight)
+                     GeometricPlanner::ClearanceFn clearance, double weight,
+                     GeometricPlanner::ClearanceFn frontier, double frontier_weight,
+                     double threshold, GeometricPlanner::UnknownFn is_unknown,
+                     double unknown_weight)
       : ompl::base::StateCostIntegralObjective(si, /*enableMotionCostInterpolation=*/true),
-        clearance_(std::move(clearance)), weight_(weight), threshold_(threshold),
+        clearance_(std::move(clearance)), weight_(weight), frontier_(std::move(frontier)),
+        frontier_weight_(frontier_weight), threshold_(threshold),
         unknown_(std::move(is_unknown)), unknown_weight_(unknown_weight) {
     // Register a state->goal cost-to-go heuristic (distance to the goal region).
     // This is what RRT*'s informed sampler and the BIT*-lineage goal heuristic
@@ -51,13 +59,18 @@ public:
   }
 
   ompl::base::Cost stateCost(const ompl::base::State* state) const override {
-    if (!clearance_ && !unknown_) return ompl::base::Cost(1.0);
+    if (!clearance_ && !frontier_ && !unknown_) return ompl::base::Cost(1.0);
     const auto* pos = state->as<ompl::base::RealVectorStateSpace::StateType>();
     const double x = pos->values[0], y = pos->values[1], z = pos->values[2];
 
     double penalty = 0.0;
-    if (clearance_) {
-      penalty += weight_ * std::max(0.0, threshold_ - clearance_(x, y, z));
+    const double obst = clearance_ ? std::max(0.0, threshold_ - clearance_(x, y, z)) : 0.0;
+    penalty += weight_ * obst;
+    if (frontier_) {
+      // Only what the frontier adds over the obstacles: zero wherever a mapped
+      // obstacle is at least as close as the frontier.
+      const double both = std::max(0.0, threshold_ - frontier_(x, y, z));
+      penalty += frontier_weight_ * std::max(0.0, both - obst);
     }
     // Flat, not proportional to anything: the point is that every metre spent in
     // unobserved space costs the same, so a route diving deep into it keeps
@@ -98,6 +111,8 @@ public:
 private:
   GeometricPlanner::ClearanceFn clearance_;
   double weight_;
+  GeometricPlanner::ClearanceFn frontier_;
+  double frontier_weight_;
   double threshold_;
   GeometricPlanner::UnknownFn unknown_;
   double unknown_weight_;
@@ -363,10 +378,11 @@ void GeometricPlanner::setUnknownPenalty(UnknownFn is_unknown, double weight) {
   unknown_weight_ = weight;
 }
 
-void GeometricPlanner::setCostClearance(ClearanceFn clearance) {
+void GeometricPlanner::setCostClearance(ClearanceFn clearance, double frontier_weight) {
   // Deliberately does not touch clearance_fn_, so a host may call the two
   // setters in either order (see the header note on order-independence).
   cost_clearance_fn_ = std::move(clearance);
+  frontier_weight_ = frontier_weight;
 }
 
 ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
@@ -436,15 +452,20 @@ ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
 }
 
 ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective(
-    bool include_unknown) const {
+    bool include_unknown, bool include_obstacles, bool include_frontier) const {
   // With no clearance function the per-state cost is a constant 1, so this is
   // exactly a path-length objective; with one it adds the proximity penalty.
-  // The field sampled here is the cost field, which is the validity field
-  // unless the host set a separate one (see setCostClearance). Everything that
-  // scores a path — pathCost, costBreakdown, the shortcut pass — therefore
-  // agrees with what the search minimised.
+  // With a separate cost field (see setCostClearance) the obstacle penalty is
+  // scored on the validity field and the frontier's extra on the cost field,
+  // each with its own weight; with only one field, that field at
+  // clearance_weight_. Everything that scores a path — pathCost, costBreakdown,
+  // the shortcut pass — therefore agrees with what the search minimised.
+  // The include_* switches drop a term's weight to 0 (costBreakdown only).
+  const bool split = static_cast<bool>(clearance_fn_) && static_cast<bool>(cost_clearance_fn_);
   return std::make_shared<ClearanceObjective>(
-      si_, costClearanceFn(), clearance_weight_, clearance_threshold_,
+      si_, split ? clearance_fn_ : costClearanceFn(), include_obstacles ? clearance_weight_ : 0.0,
+      split ? cost_clearance_fn_ : ClearanceFn{}, include_frontier ? frontier_weight_ : 0.0,
+      clearance_threshold_,
       (include_unknown && unknownPenaltyActive()) ? unknown_fn_ : UnknownFn{},
       unknown_weight_);
 }
@@ -714,7 +735,7 @@ double GeometricPlanner::pathCost(const std::vector<std::vector<double>>& path) 
 GeometricPlanner::CostBreakdown
 GeometricPlanner::costBreakdown(const std::vector<std::vector<double>>& path) const {
   constexpr double inf = std::numeric_limits<double>::infinity();
-  if (path.size() < 2) return {inf, inf, inf};
+  if (path.size() < 2) return {inf, inf, inf, inf};
 
   ompl::geometric::PathGeometric geo(si_);
   for (const auto& p : path) {
@@ -736,7 +757,17 @@ GeometricPlanner::costBreakdown(const std::vector<std::vector<double>>& path) co
   if (unknownPenaltyActive()) {
     unknown = total - geo.cost(makeObjective(/*include_unknown=*/false)).value();
   }
-  return {length, total - length - unknown, unknown, total};
+  CostBreakdown cb{length, total - length - unknown, unknown, total};
+  // The frontier's share, with the obstacle weight switched off. The integral
+  // is linear in the per-state terms, so the obstacle share is the rest.
+  if (cost_clearance_fn_ && clearance_fn_) {
+    const double frontier =
+        geo.cost(makeObjective(/*include_unknown=*/false, /*include_obstacles=*/false)).value() -
+        length;
+    cb.frontier = std::clamp(frontier, 0.0, std::max(cb.clearance, 0.0));
+    cb.split = true;
+  }
+  return cb;
 }
 
 }  // namespace drone_core::planning

@@ -543,6 +543,46 @@ void checkConservativeGrid() {
         kNoCropHi, true, 2);
     expect(nan_centre.empty(), "empty tree with a NaN centre: non-empty grid");
   }
+
+  // --- the keep-out shape: a ball behind the heading, a cylinder of the same
+  //     radius ahead of it, wrapped in shell; a zero heading is the plain ball.
+  {
+    OcTree empty(0.1);
+    const octomap::point3d c(0.05f, 0.05f, 0.05f);  // a cell centre
+    for (const Eigen::Vector3d& fwd : {Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(0, 1, 0)}) {
+      ConservativeGrid::KeepOut ko;
+      ko.center = c;
+      ko.radius = 0.6;
+      ko.forward = fwd;
+      ko.forward_len = 0.6;
+      const ConservativeGrid g(empty, ko, kNoCropLo, kNoCropHi, true, 2);
+      // Offsets along the heading (a) and across it (b), level.
+      const Eigen::Vector3d side(-fwd.y(), fwd.x(), 0.0);
+      const auto at = [&](double a, double b) {
+        const Eigen::Vector3d p = Eigen::Vector3d(c.x(), c.y(), c.z()) + a * fwd + b * side;
+        return g.at(p.x(), p.y(), p.z());
+      };
+      const std::string name = "keep-out along (" + std::to_string(fwd.x()) + ", " +
+                               std::to_string(fwd.y()) + ")";
+      expect(at(0.5, 0.0) == ConservativeGrid::kFree, name + ": ahead on the axis not free");
+      expect(at(0.5, 0.5) == ConservativeGrid::kFree,
+             name + ": the cylinder's corner (outside the ball) not free");
+      expect(at(-0.5, 0.0) == ConservativeGrid::kFree, name + ": behind on the axis not free");
+      expect(at(-0.5, 0.5) == ConservativeGrid::kShell,
+             name + ": behind, outside the ball, not shell");
+      // (Not asserted as shell: their free neighbours sit exactly on the edge.)
+      expect(at(0.7, 0.0) != ConservativeGrid::kFree, name + ": past the cylinder's end is free");
+      expect(at(0.3, 0.7) != ConservativeGrid::kFree, name + ": beside the cylinder is free");
+    }
+    ConservativeGrid::KeepOut ball;
+    ball.center = c;
+    ball.radius = 0.6;
+    ball.forward_len = 0.6;  // no heading: ignored
+    const ConservativeGrid gb(empty, ball, kNoCropLo, kNoCropHi, true, 2);
+    const ConservativeGrid gr(empty, c, 0.6, kNoCropLo, kNoCropHi, true, 2);
+    expect(gb.stats().ball_freed == gr.stats().ball_freed && gb.stats().shell == gr.stats().shell,
+           "keep-out without a heading differs from the plain ball");
+  }
 }
 
 }  // namespace
@@ -579,6 +619,39 @@ int main() {
     expectNear(cb.unknown, 120.0, kIntegrationSlack, "breakdown unknown term wrong");
     expectNear(cb.total, cb.length + cb.clearance + cb.unknown, 1e-9,
                "breakdown terms do not sum to the total");
+  }
+
+  // 1b. The frontier's share of the proximity term: with a separate cost field,
+  //     the penalty that field adds over the validity field. Validity 0.8 m
+  //     from something along the whole path, the cost field 0.3 m: at weight
+  //     2 / threshold 1 the proximity term is 2 * 0.7 * 10 = 14 in all, of which
+  //     2 * 0.2 * 10 = 4 is mapped obstacles and 10 the frontier.
+  {
+    const std::vector<std::vector<double>> path = {{0, 0, 1}, {10, 0, 1}};
+    GeometricPlanner p(empty, /*planning_time=*/0.1);
+    p.setClearance([](double, double, double) { return 0.8; }, /*weight=*/2.0,
+                   /*threshold=*/1.0);
+    const auto one = p.costBreakdown(path);
+    expect(!one.split && one.frontier == 0.0, "a single field reported a frontier share");
+    p.setCostClearance([](double, double, double) { return 0.3; }, /*frontier_weight=*/2.0);
+    const auto cb = p.costBreakdown(path);
+    expect(cb.split, "a separate cost field was not split");
+    expectNear(cb.clearance, 14.0, 1e-6, "split: proximity term wrong");
+    expectNear(cb.frontier, 10.0, 1e-6, "split: frontier share wrong");
+    expectNear(cb.total, cb.length + cb.clearance + cb.unknown, 1e-9,
+               "split: terms do not sum to the total");
+    // Its own weight: at 5 the frontier's extra 0.5 costs 5 * 0.5 * 10 = 25,
+    // the obstacle share stays 4, and the total follows.
+    p.setCostClearance([](double, double, double) { return 0.3; }, /*frontier_weight=*/5.0);
+    const auto w5 = p.costBreakdown(path);
+    expectNear(w5.frontier, 25.0, 1e-6, "frontier weight: frontier share wrong");
+    expectNear(w5.clearance - w5.frontier, 4.0, 1e-6, "frontier weight changed the obstacle share");
+    expectNear(p.pathCost(path), 10.0 + 29.0, 1e-6, "frontier weight not in the path cost");
+    // A mapped obstacle nearer than the frontier: the frontier adds nothing.
+    p.setClearance([](double, double, double) { return 0.3; }, /*weight=*/2.0, /*threshold=*/1.0);
+    p.setCostClearance([](double, double, double) { return 0.3; }, /*frontier_weight=*/5.0);
+    expectNear(p.costBreakdown(path).frontier, 0.0, 1e-9,
+               "frontier charged where a mapped obstacle is the nearest hazard");
   }
 
   // 2. Flat, not a ramp: cost must keep accruing the further in you go. Twice

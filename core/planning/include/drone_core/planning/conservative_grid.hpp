@@ -18,9 +18,9 @@ namespace drone_core::planning {
 // Built in three steps:
 //   1. fill the grid from the raw tree's leaves (merged blocks cover every cell
 //      they span): free, occupied, or never observed where the tree has no node;
-//   2. mark never-observed cells within `keep_out_radius` of `center` (the
-//      drone) as free, so the drone is never boxed in by what it cannot see
-//      beside it and the shell wraps around that ball;
+//   2. mark never-observed cells inside the keep-out shape around the drone
+//      (see KeepOut) as free, so the drone is never boxed in by what it cannot
+//      see beside it and the shell wraps around that shape;
 //   3. mark every never-observed cell touching a free one (26-neighbourhood) as
 //      shell.
 // Obstacles for the distance field and the corridor are occupied + shell cells,
@@ -40,12 +40,27 @@ class ConservativeGrid {
 public:
   enum Cell : std::uint8_t { kUnknown = 0, kOccupied = 1, kFree = 2, kShell = 3 };
 
+  // The volume around the drone whose never-observed cells are marked free:
+  // a ball of `radius` behind `center` (the half-space opposite `forward`),
+  // and a cylinder of that radius reaching `forward_len` ahead along
+  // `forward`, so there is more room where the camera looks. A zero `forward`
+  // (or `forward_len` 0) gives a plain ball. Cells are in when their centre is.
+  struct KeepOut {
+    octomap::point3d center;
+    double radius = 0.0;
+    Eigen::Vector3d forward = Eigen::Vector3d::Zero();  // unit, or zero for a ball
+    double forward_len = 0.0;
+    bool contains(const octomap::point3d& p) const;
+    // Farthest any point of the shape lies from `center` [m].
+    double extent() const;
+  };
+
   struct Stats {
     std::size_t free_cells = 0;  // free cells swept (ball included)
-    std::size_t ball_freed = 0;  // never-observed cells inside the ball, marked free
+    std::size_t ball_freed = 0;  // never-observed cells inside the keep-out, marked free
     std::size_t shell = 0;       // cells marked shell
     // Wall time of each step [ms]: filling the grid (allocation included),
-    // freeing the ball, the neighbour sweep.
+    // freeing the keep-out, the neighbour sweep.
     double fill_ms = 0.0;
     double ball_ms = 0.0;
     double sweep_ms = 0.0;
@@ -54,9 +69,15 @@ public:
   // `shell` false skips steps 2 and 3: a plain mirror of `raw` (used by tests
   // that hand-build a conservative tree). `threads` = 0 uses the hardware
   // concurrency.
+  ConservativeGrid(const octomap::OcTree& raw, const KeepOut& keep_out,
+                   const Eigen::Vector3d& crop_lo, const Eigen::Vector3d& crop_hi,
+                   bool shell = true, unsigned threads = 0);
+  // The same with a plain ball of `keep_out_radius` around `center`.
   ConservativeGrid(const octomap::OcTree& raw, const octomap::point3d& center,
                    double keep_out_radius, const Eigen::Vector3d& crop_lo,
-                   const Eigen::Vector3d& crop_hi, bool shell = true, unsigned threads = 0);
+                   const Eigen::Vector3d& crop_hi, bool shell = true, unsigned threads = 0)
+      : ConservativeGrid(raw, KeepOut{center, keep_out_radius}, crop_lo, crop_hi, shell,
+                         threads) {}
 
   // The cell containing `p` (same key arithmetic as octomap); kUnknown outside
   // the grid, for NaN, or for coordinates beyond octomap's key range.

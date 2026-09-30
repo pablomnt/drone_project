@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -878,9 +879,10 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     };
 
     // Truncation shortening the path is the pipeline refusing to commit toward
-    // unknown space — worth a line, since the endpoint it picked is where the
-    // drone will actually fly this cycle. Silent when the whole path survives.
-    if ((committed.back() - epath.back()).norm() > 1e-6) {
+    // unknown space; the endpoint it picked is where the drone will actually fly
+    // this cycle. Silent when the whole path survives. Detail, like the other
+    // successful-corridor lines below: DEBUG_TRAJGEN only.
+    if (cfg_.debug_trajgen && (committed.back() - epath.back()).norm() > 1e-6) {
       DRONE_LOG_INFO("[trajgen] corridor: truncated to " << committed.size() << " wp / "
                      << polylineLength(committed) << " m of " << polylineLength(epath)
                      << " m — " << describeCut());
@@ -953,19 +955,17 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                      << " obstacle pts -> no new trajectory");
       return false;
     } else {
-      // A corridor bought with reduced clearance around the vehicle is not the
-      // same event as one that cleared the full margin, so it never passes
-      // silently — this is the one number that says how much protection the
-      // first stretch of the flown trajectory actually has. Logged
-      // unconditionally (not behind debug_planner_viz, unlike the OK line): it
-      // is a safety fact, not a debugging aid.
-      if (start_margin < params.margin - 1e-6) {
+      // The details of a corridor that worked: how much clearance the first
+      // stretch actually has, how far the end was pulled back, whether thin
+      // joints were repaired. DEBUG_TRAJGEN only (the start relaxation used to
+      // be unconditional; turned off with the rest on request, 2026-09-30).
+      if (cfg_.debug_trajgen && start_margin < params.margin - 1e-6) {
         DRONE_LOG_INFO("[trajgen] corridor: start margin relaxed to " << start_margin
                        << " m (of " << params.margin << " m) over the first "
                        << params.start_relax_dist
                        << " m — the drone is hemmed in; full margin applies beyond that");
       }
-      if (end_pullback > 1e-6) {
+      if (cfg_.debug_trajgen && end_pullback > 1e-6) {
         DRONE_LOG_INFO("[trajgen] corridor: end pulled back " << end_pullback
                        << " m along the path to fit inside the shrunk corridor (CORRIDOR_MARGIN "
                        << params.margin << " m)");
@@ -973,7 +973,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       // A squeeze on the path: consecutive regions only overlapped once repaired.
       // Safe (every joint still passed the overlap test), but it explains an
       // unusually large region count and a slower solve.
-      if (repairs.bridges > 0 || repairs.split_rounds > 0) {
+      if (cfg_.debug_trajgen && (repairs.bridges > 0 || repairs.split_rounds > 0)) {
         DRONE_LOG_INFO("[trajgen] corridor: repaired thin joints with " << repairs.bridges
                        << " bridge region(s) and " << repairs.split_rounds
                        << " split round(s) -> " << regions.size() << " regions");
@@ -1002,7 +1002,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
           info->start_margin = start_margin;
           info->trunc_end = committed.back();
         }
-        if (cfg_.debug_planner_viz) {
+        if (cfg_.debug_trajgen) {
           DRONE_LOG_INFO("[trajgen] corridor: OK " << regions.size() << " regions / "
                          << polylineLength(committed) << " m / " << traj.total_duration << " s");
         }
@@ -1340,8 +1340,8 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   // has to be this view and not the conservative one, because the conservative
   // view stamps the frontier as occupied and a validity check against that
   // would wall the search inside the mapped region entirely.
-  planner.setClearance(makeClearanceFn(edt, cfg_.clearance_threshold),
-                       cfg_.clearance_weight, cfg_.clearance_threshold);
+  planner.setClearance(makeClearanceFn(edt, search_cfg_.clearance_threshold),
+                       search_cfg_.clearance_weight, search_cfg_.clearance_threshold);
 
   // The cost, however, is scored against the conservative field whenever one
   // exists as a distinct map. The reason is that the search and the downstream
@@ -1364,7 +1364,8 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   // field above.
   if (cons && search_cfg_.use_corridor_qp) {
     if (auto cons_edt = conservativeField(map, cons, cons_md)) {
-      planner.setCostClearance(makeClearanceFn(cons_edt, search_cfg_.clearance_threshold));
+      planner.setCostClearance(makeClearanceFn(cons_edt, search_cfg_.clearance_threshold),
+                               search_cfg_.frontier_weight);
     }
   }
 
@@ -1566,14 +1567,26 @@ void AutonomyCore::searchLoop() {
       const auto committed = planner.costBreakdown(committed_path);
       const double committed_clr = planner.minClearance(committed_path);
 
-      // Stream a cost as "total (len=L + clr_cost=C + unk_cost=U)". The unknown
-      // term is shown only when it is being charged, so the common line stays
-      // as it was — but when a route does leave mapped space, the number that
-      // explains the score is right there rather than hidden inside clr_cost.
-      auto fmtCost = [](const planning::GeometricPlanner::CostBreakdown& cb) {
+      // Stream a cost as "T (len L N% + obst O N% + frontier F N% + unknown U
+      // N%)": the path's length, the proximity penalty near mapped obstacles,
+      // the same near the frontier (only when the cost is scored on the
+      // frontier-stamped field), and the unknown-space surcharge (only when it
+      // is configured), each with its share of the total, so a high score reads
+      // as long, wall-hugging, frontier-hugging or routed through unmapped
+      // space, which want different knobs (length: none; obst/frontier:
+      // CLEARANCE_WEIGHT / CLEARANCE_THRESHOLD; unknown: UNKNOWN_WEIGHT).
+      const bool show_unknown = search_cfg_.treat_unknown_as_hazard && search_cfg_.unknown_weight > 0.0;
+      auto fmtCost = [show_unknown](const planning::GeometricPlanner::CostBreakdown& cb) {
         std::ostringstream os;
-        os << cb.total << " (len=" << cb.length << " + clr_cost=" << cb.clearance;
-        if (cb.unknown > 0.0) os << " + unk_cost=" << cb.unknown;
+        os << std::fixed << std::setprecision(2) << cb.total;
+        if (!std::isfinite(cb.total) || cb.total <= 0.0) return os.str();
+        const auto term = [&](const char* name, double v) {
+          os << name << v << " " << std::lround(100.0 * v / cb.total) << "%";
+        };
+        term(" (len ", cb.length);
+        term(cb.split ? " + obst " : " + clr ", cb.clearance - cb.frontier);
+        if (cb.split) term(" + frontier ", cb.frontier);
+        if (show_unknown || cb.unknown > 0.0) term(" + unknown ", cb.unknown);
         os << ")";
         return os.str();
       };
@@ -1663,7 +1676,8 @@ void AutonomyCore::searchLoop() {
           const double cand_gap =
               solved ? planner.lastGoalGap() : std::numeric_limits<double>::infinity();
           const auto remaining = remainingCommittedSuffix(committed_path, start);
-          const double remaining_cost = planner.pathCost(remaining);
+          const auto remaining_cb = planner.costBreakdown(remaining);
+          const double remaining_cost = remaining_cb.total;
           const double threshold = search_cfg_.replan_improve_ratio * remaining_cost;
           const auto cand = planner.costBreakdown(candidate);
           if (solved && cand_gap < committed_gap - kGoalProgress) {
@@ -1673,11 +1687,11 @@ void AutonomyCore::searchLoop() {
                            << planner.minClearance(candidate) << "m" << goal_note);
           } else if (solved && cand_gap <= committed_gap + kGoalProgress && cand.total <= threshold) {
             adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << fmtCost(remaining_cb)
                            << " (committed=" << fmtCost(committed) << ") -> ADOPT cost=" << fmtCost(cand) << " clr="
                            << planner.minClearance(candidate) << "m" << goal_note);
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << remaining_cost
+            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << fmtCost(remaining_cb)
                            << " clr=" << committed_clr << "m gap=" << committed_gap << "m candidate cost="
                            << (solved ? fmtCost(cand) : std::string("inf")) << " gap="
                            << (solved ? std::to_string(cand_gap) : std::string("inf"))

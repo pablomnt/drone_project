@@ -282,6 +282,13 @@ private:
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
     declare_parameter("CLEARANCE_WEIGHT", 1.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
+    // Weight on running near the frontier (the edge of explored space), separate
+    // from CLEARANCE_WEIGHT, which now weighs mapped obstacles only. Same
+    // penalty shape and threshold; it charges what the frontier adds beyond the
+    // nearest mapped obstacle. Used only with TREAT_FRONTIER_AS_OBSTACLE and
+    // USE_CORRIDOR_QP on. The [plan] line's cost splits into `obst` and
+    // `frontier` to show which is costing what.
+    declare_parameter("FRONTIER_WEIGHT", 1.0);
     // Flat extra cost per metre of path routed through never-observed space.
     // CLEARANCE_WEIGHT cannot do this job: the distance field saturates at
     // CLEARANCE_THRESHOLD, so anything further than that from a mapped obstacle
@@ -361,8 +368,9 @@ private:
     // through unmapped space and only flies through explored-free space. Each
     // octomap gets a copy with every never-observed voxel that touches free
     // space stamped occupied (a closed shell), and the never-observed voxels
-    // within 0.5 m of the drone marked free so it is not boxed in by what it
-    // cannot see beside it. Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
+    // within a keep-out around the drone (a 0.6 m ball behind the camera, a
+    // 0.6 m-radius cylinder 1.2 m ahead of it) marked free so it is not boxed in
+    // by what it cannot see beside it. Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
     // so with this on the drone is boxed in until it has mapped its surroundings
     // (e.g. an initial 360deg scan) — flip it off for open-loop bench tests.
     declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", false);
@@ -427,8 +435,11 @@ private:
     // so wide turns wherever the regions are roomy). Raise to pull the
     // trajectory toward the planned waypoints without tightening the corridor.
     declare_parameter("TRAJ_PATH_WEIGHT", 0.5);
-    // Log one line per corridor QP solve breaking down its time: seed growth,
-    // the bisection, the group cuts, the final solve.
+    // Trajgen detail logs: one line per corridor QP solve breaking down its time
+    // (seed growth, the bisection, the group cuts, the final solve), and the
+    // corridor lines of a solve that worked (truncated to, start margin relaxed,
+    // end pulled back, repaired thin joints, corridor OK). Failures and the
+    // `[trajgen] solve for` summary always log.
     declare_parameter("DEBUG_TRAJGEN", false);
     // Corridor resample cap: one free box is grown per path piece of at most
     // this length [m].
@@ -514,6 +525,7 @@ private:
     cfg.replan_improve_ratio = param("REPLAN_IMPROVE_RATIO").as_double();
     cfg.clearance_weight = param("CLEARANCE_WEIGHT").as_double();
     cfg.clearance_threshold = param("CLEARANCE_THRESHOLD").as_double();
+    cfg.frontier_weight = param("FRONTIER_WEIGHT").as_double();
     cfg.unknown_weight = param("UNKNOWN_WEIGHT").as_double();
     // Whether unmapped space is a hazard at all — drives the cost surcharge and
     // truncation's refusal to commit into unobserved cells. Passed as its own
@@ -643,7 +655,11 @@ private:
       px4_pos_enu_ = drone_core::frames::pxNedToEnu(pos_ned);
     }
     px4_vel_enu_ = drone_core::frames::pxNedToEnu(vel_ned);
-    yaw_px4_enu_ = drone_core::frames::pxAttitudeToEnuYaw(q);
+    {
+      // Read by onOctomap for the keep-out's heading.
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      yaw_px4_enu_ = drone_core::frames::pxAttitudeToEnuYaw(q);
+    }
     t_px4_odom_ = get_clock()->now().seconds();
   }
 
@@ -658,7 +674,10 @@ private:
                                msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
     const Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
     vio_vel_enu_ = drone_core::frames::bodyVelToWorld(q, vel_body);
-    yaw_vio_enu_ = drone_core::frames::okvisAttitudeToEnuYaw(q);
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      yaw_vio_enu_ = drone_core::frames::okvisAttitudeToEnuYaw(q);
+    }
     t_vio_odom_ = get_clock()->now().seconds();
   }
 
@@ -733,21 +752,33 @@ private:
       // write, and the sweep below takes long enough that a reference could be
       // rewritten underneath us mid-use.
       Eigen::Vector3d p;
+      double yaw;
       {
         std::lock_guard<std::mutex> lock(cross_mutex_);
         p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
+        yaw = use_sim_mode_ ? yaw_px4_enu_ : yaw_vio_enu_;
       }
+      // The camera looks along the body heading; the keep-out's cylinder
+      // points that way (level, whatever the tilt).
+      Eigen::Vector3d fwd(std::cos(yaw), std::sin(yaw), 0.0);
       // The octree is map-frame and the drone position world-frame, so the ball
       // has to be centred on the drone expressed in map. Without a transform it
       // stays unconverted, but planning is paused then anyway (the core requires one).
       Eigen::Isometry3d world_from_map;
-      if (lookupWorldFromMap(world_from_map)) p = world_from_map.inverse() * p;
+      if (lookupWorldFromMap(world_from_map)) {
+        p = world_from_map.inverse() * p;
+        fwd = world_from_map.linear().transpose() * fwd;
+      }
+      using drone_core::planning::GeometricPlanner;
+      drone_core::planning::ConservativeGrid::KeepOut keep_out;
+      keep_out.center = octomap::point3d(p.x(), p.y(), p.z());
+      keep_out.radius = GeometricPlanner::frontierKeepOutRadius();
+      keep_out.forward = fwd.normalized();
+      keep_out.forward_len = GeometricPlanner::frontierKeepOutForward();
       Eigen::Vector3d crop_lo, crop_hi;
       core_->mapCrop(crop_lo, crop_hi);
       conservative = std::make_shared<const drone_core::planning::ConservativeGrid>(
-          *map, octomap::point3d(p.x(), p.y(), p.z()),
-          drone_core::planning::GeometricPlanner::frontierKeepOutRadius(), crop_lo, crop_hi,
-          /*shell=*/true, /*threads=*/4);
+          *map, keep_out, crop_lo, crop_hi, /*shell=*/true, /*threads=*/4);
     }
     const auto t_shell = Clock::now();
 
@@ -1705,8 +1736,8 @@ private:
   rclcpp::CallbackGroup::SharedPtr cb_slow_;
 
   // Guards ONLY the members read across the two callback groups: px4_pos_enu_ /
-  // vio_pos_enu_ (fast writes, onOctomap reads) and goal_pos_ / has_goal_ (fast
-  // writes, publishGoalMarker reads). Deliberately not a general node lock —
+  // vio_pos_enu_ and yaw_px4_enu_ / yaw_vio_enu_ (fast writes, onOctomap reads)
+  // and goal_pos_ / has_goal_ (fast writes, publishGoalMarker reads). Deliberately not a general node lock —
   // everything else stays inside one group and needs no synchronisation. Never
   // held across anything slow, so it cannot delay the control tick.
   std::mutex cross_mutex_;

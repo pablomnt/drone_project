@@ -15,12 +15,12 @@
 // Build outline:
 //   1. The box of all leaves, by six branch-and-bound descents (one per face)
 //      rather than a walk of the whole tree, each stopping once it passes the
-//      crop; plus the ball's cells.
+//      crop; plus the keep-out's cells.
 //   2. Allocate the grid (kUnknown everywhere) and walk only the subtrees that
 //      reach into it (parallel over subtrees), stamping each leaf straight in.
 //      Leaves are disjoint, so every byte has at most one writer. With 1 and 2
 //      together, map outside the crop costs next to nothing.
-//   3. The ball (serial, a few thousand cells).
+//   3. The keep-out (serial, a few thousand cells).
 //   4. The sweep, as a dilation of the free set by the 3x3x3 cube on bitsets
 //      (64 cells per word): pack the free cells of every row whose 26
 //      neighbours are all in the grid into bits and dilate them along x, then OR
@@ -296,9 +296,22 @@ inline bool isUnknownCell(std::uint8_t c) { return c == ConservativeGrid::kUnkno
 
 }  // namespace
 
-ConservativeGrid::ConservativeGrid(const octomap::OcTree& raw, const octomap::point3d& center,
-                                   double keep_out_radius, const Eigen::Vector3d& crop_lo,
-                                   const Eigen::Vector3d& crop_hi, bool shell, unsigned threads)
+bool ConservativeGrid::KeepOut::contains(const octomap::point3d& p) const {
+  const Eigen::Vector3d d(p.x() - center.x(), p.y() - center.y(), p.z() - center.z());
+  const double s = forward_len > 0.0 ? d.dot(forward) : 0.0;
+  if (s <= 0.0) return d.squaredNorm() <= radius * radius;  // the ball behind
+  // The cylinder ahead: within forward_len along the axis, within radius of it.
+  return s <= forward_len && (d - s * forward).squaredNorm() <= radius * radius;
+}
+
+double ConservativeGrid::KeepOut::extent() const {
+  const bool cyl = forward_len > 0.0 && forward.squaredNorm() > 0.0;
+  return cyl ? std::hypot(radius, forward_len) : radius;
+}
+
+ConservativeGrid::ConservativeGrid(const octomap::OcTree& raw, const KeepOut& keep_out,
+                                   const Eigen::Vector3d& crop_lo, const Eigen::Vector3d& crop_hi,
+                                   bool shell, unsigned threads)
     : res_(raw.getResolution()),
       inv_res_(1.0 / raw.getResolution()),  // octomap's resolution_factor, bit for bit
       key_offset_(1 << (raw.getTreeDepth() - 1)) {
@@ -330,14 +343,15 @@ ConservativeGrid::ConservativeGrid(const octomap::OcTree& raw, const octomap::po
     leafBox(raw, stop_lo, stop_hi, lo, hi);
   }
 
-  // The ball's cells (the same test as stampUnknownShell), which the box must
-  // hold whether or not they fall in the crop.
+  // The keep-out's cells (for a ball, the same test as stampUnknownShell),
+  // which the box must hold whether or not they fall in the crop.
   std::vector<std::array<int, 3>> ball;
   octomap::OcTreeKey ck;
-  if (shell && keep_out_radius > 0.0 && std::isfinite(center.x()) && std::isfinite(center.y()) &&
-      std::isfinite(center.z()) && raw.coordToKeyChecked(center, ck)) {
-    const int n = static_cast<int>(std::ceil(keep_out_radius / res_));
-    const double r2 = keep_out_radius * keep_out_radius;
+  const octomap::point3d& center = keep_out.center;
+  if (shell && keep_out.radius > 0.0 && std::isfinite(center.x()) && std::isfinite(center.y()) &&
+      std::isfinite(center.z()) && keep_out.forward.allFinite() &&
+      raw.coordToKeyChecked(center, ck)) {
+    const int n = static_cast<int>(std::ceil(keep_out.extent() / res_));
     for (int dz = -n; dz <= n; ++dz)
       for (int dy = -n; dy <= n; ++dy)
         for (int dx = -n; dx <= n; ++dx) {
@@ -347,7 +361,7 @@ ConservativeGrid::ConservativeGrid(const octomap::OcTree& raw, const octomap::po
           const octomap::OcTreeKey key(static_cast<octomap::key_type>(k[0]),
                                        static_cast<octomap::key_type>(k[1]),
                                        static_cast<octomap::key_type>(k[2]));
-          if ((raw.keyToCoord(key) - center).norm_sq() > r2) continue;
+          if (!keep_out.contains(raw.keyToCoord(key))) continue;
           ball.push_back({k[0], k[1], k[2]});
           for (int a = 0; a < 3; ++a) {
             lo[a] = std::min(lo[a], k[a]);
@@ -386,7 +400,7 @@ ConservativeGrid::ConservativeGrid(const octomap::OcTree& raw, const octomap::po
   if (!shell) return;
   t = Clock::now();
 
-  // 3. The ball: never-observed cells around the drone become free.
+  // 3. The keep-out: never-observed cells around the drone become free.
   for (const auto& k : ball) {
     const int x = k[0] - kx0_, y = k[1] - ky0_, z = k[2] - kz0_;
     if (x < 0 || y < 0 || z < 0 || x >= nx_ || y >= ny_ || z >= nz_) continue;

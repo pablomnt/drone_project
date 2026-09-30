@@ -140,9 +140,17 @@ public:
   //
   // Order-independent with setClearance: whichever is called last, the cost
   // uses this field when one is set and falls back to the validity field when
-  // it is not. Pass an empty function to clear it. weight and threshold stay
-  // where setClearance put them; this changes only which field is sampled.
-  void setCostClearance(ClearanceFn clearance);
+  // it is not. Pass an empty function to clear it. threshold stays where
+  // setClearance put it.
+  //
+  // With both fields set the proximity term is split in two, each with its own
+  // weight (c_v = validity field, c_c = this one, never farther than c_v):
+  //   clearance_weight * max(0, threshold - c_v)
+  //   + frontier_weight * ( max(0, threshold - c_c) - max(0, threshold - c_v) )
+  // i.e. mapped obstacles at clearance_weight and whatever extra the frontier
+  // adds at frontier_weight. Equal weights give exactly the single penalty on
+  // c_c.
+  void setCostClearance(ClearanceFn clearance, double frontier_weight);
 
   // Charge a FLAT extra cost per metre flown through space that has never been
   // observed. The path cost becomes
@@ -284,12 +292,18 @@ public:
   // replan log show whether a path scores high because it is long, because it
   // hugs obstacles, or because it routes through unmapped space — three problems
   // with three different fixes. `unknown` is 0 when no surcharge is configured.
+  // When the cost is scored on a separate field (setCostClearance, the
+  // frontier-stamped view), `frontier` is the frontier weight's term of
+  // `clearance` — the price of running near the frontier rather than near a
+  // mapped obstacle — and `split` is true; otherwise it is 0.
   // Same +infinity convention as pathCost for <2-point paths.
   struct CostBreakdown {
     double length;     // arc-length term [m] (== pathCost with no penalties)
-    double clearance;  // obstacle-proximity penalty term
+    double clearance;  // proximity penalty term, obstacles and frontier together
     double unknown;    // unknown-space surcharge term (see setUnknownPenalty)
     double total;      // length + clearance + unknown (== pathCost(path))
+    double frontier = 0.0;  // the frontier's share of `clearance` (see above)
+    bool split = false;     // `frontier` was computed (two distinct fields)
   };
   CostBreakdown costBreakdown(const std::vector<std::vector<double>>& path) const;
 
@@ -306,10 +320,11 @@ public:
   // The hard clearance the validity check enforces away from the start [m].
   double collisionMargin() const { return kCollisionMargin; }
 
-  // Radius [m] the host should leave frontier-free around the drone when stamping
-  // frontier as occupied (see kFrontierKeepOutRadius). Static so the ROS wrapper
-  // can read it without a planner instance.
+  // The keep-out the host marks free around the drone before building the
+  // unknown shell (see kFrontierKeepOutRadius). Static so the ROS wrapper can
+  // read them without a planner instance.
   static constexpr double frontierKeepOutRadius() { return kFrontierKeepOutRadius; }
+  static constexpr double frontierKeepOutForward() { return kFrontierKeepOutForward; }
 
   // Snapshot of the search tree from the most recent planPath, for debug
   // visualisation. `nodes` are the tree vertices in world XYZ; `edges` index
@@ -353,10 +368,12 @@ private:
   // side of a thin wall. Anchor start_pos_ before calling (planPath does).
   bool projectGoal(const std::vector<double>& goal, std::array<double, 3>& out) const;
 
-  // Build the optimisation objective. include_unknown=false omits the
-  // unknown-space surcharge, which costBreakdown uses to separate that term
-  // from the obstacle-proximity one.
-  ompl::base::OptimizationObjectivePtr makeObjective(bool include_unknown = true) const;
+  // Build the optimisation objective. The include_* switches drop the
+  // unknown-space surcharge, the obstacle penalty or the frontier penalty;
+  // costBreakdown uses them to separate the terms.
+  ompl::base::OptimizationObjectivePtr makeObjective(bool include_unknown = true,
+                                                     bool include_obstacles = true,
+                                                     bool include_frontier = true) const;
 
   // Construct and configure the OMPL planner selected by planner_type_, applying
   // the matching PlannerConfig sub-struct. Called once per planPath.
@@ -423,6 +440,7 @@ private:
   // the cost samples clearance_fn_, which is the single-field behaviour.
   ClearanceFn cost_clearance_fn_;
   double clearance_weight_ = 1.0;       // obstacle-proximity penalty weight
+  double frontier_weight_ = 1.0;        // frontier-proximity weight (setCostClearance)
   double clearance_threshold_ = 1.0;    // clearance saturation distance [m]
 
   // Flat per-metre surcharge for unobserved space (see setUnknownPenalty).
@@ -445,14 +463,18 @@ private:
   static constexpr double kValidityCheckStep = 0.05;
   double escape_ramp_ = 1.0;  // [m], see setEscapeRamp
 
-  // Radius [m] around the drone the host leaves frontier-free when burning
-  // frontier into the occupancy map (consumed by the ROS wrapper's frontier
-  // stamping, not the planner itself). Kept here beside the escape ramp since
-  // it serves the same "let a drone boxed in by unknown space still root the
-  // search" purpose. Must stay well below kCollisionMargin so
-  // the surrounding frontier's margin reseals the gap — otherwise the planner
-  // could route out through the hole into (free-reading) unknown space.
-  static constexpr double kFrontierKeepOutRadius = 0.5;
+  // The volume around the drone whose never-observed voxels the host marks free
+  // before building the unknown shell (consumed by the ROS wrapper's
+  // ConservativeGrid, not the planner itself): a ball of kFrontierKeepOutRadius
+  // behind the camera and a cylinder of that radius reaching
+  // kFrontierKeepOutForward ahead along its heading, so there is more room
+  // where it looks. The shell wraps around it, so the planner cannot route out
+  // through it into unknown space. It must be well above the clearance margins
+  // (FRONTIER_MARGIN 0.5 m, CORRIDOR_MARGIN 0.4 m) to give the drone any room
+  // to move: a 0.5 m ball left only its centre keeping the margins and cut
+  // every plan to ~0.2 m. The price is treating that much unseen space as empty.
+  static constexpr double kFrontierKeepOutRadius = 0.6;
+  static constexpr double kFrontierKeepOutForward = 1.2;
 
   // Largest straight bypass [m] the clearance-aware shortcut will create. Caps
   // how much waypoint density it removes so the downstream min-snap optimiser

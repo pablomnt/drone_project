@@ -421,10 +421,14 @@ Module roles:
   interpolated at the state-validity resolution (~0.5 m for this state space), so a step-function
   surcharge is smeared across the straddling segment and the total lands within about
   `step × weight` of exact. Fine for steering the search; **not** a safety mechanism — a sliver of
-  unobserved space thinner than the step can be missed entirely. `CostBreakdown` gained an
-  `unknown` field so the `[plan]` line reports `len=… + clr_cost=… + unk_cost=…` (the last shown
-  only when charged), because "long", "hugs a wall" and "routes through unmapped space" need
-  different fixes. Covered by `ctest -R unknown_cost` (~0.5 s).
+  unobserved space thinner than the step can be missed entirely. `CostBreakdown` splits the cost
+  so every cost on the `[plan]` line (committed, remaining, candidate) reads
+  `T (len L N% + obst O N% + frontier F N% + unknown U N%)`: length, proximity to mapped obstacles,
+  proximity to the frontier (the cost field's penalty over the validity field's; shown only when the
+  cost is scored on the conservative field, else the one proximity term reads `clr`), and the
+  surcharge (shown whenever it is configured), each with its share — because "long", "hugs a wall",
+  "hugs the frontier" and "routes through unmapped space" need different fixes. Covered by
+  `ctest -R unknown_cost` (~2-3 s).
 
   **Truncation stops at unobserved space (when `TREAT_FRONTIER_AS_OBSTACLE` is on).** The same
   predicate is a hard stop in `truncatePath`, checked *before* the clearance test and **exempt from
@@ -576,7 +580,9 @@ Module roles:
   8.0 with the drone 1 mm inside region 0 turned a solving corridor into a failing one, with every
   inradius above 0.87 m and every joint overlap above 0.7 m — a soft cost cannot change the feasible
   set, so that can only have been convergence. These are distinct faults needing opposite fixes, hence distinct messages. A
-  successful corridor logs one line only when `DEBUG_PLANNER_VIZ` is on.
+  successful corridor's lines (`truncated to`, `start margin relaxed`, `end pulled back`, `repaired
+  thin joints`, `OK`) log only with `DEBUG_TRAJGEN` on (2026-09-30); failures and the `[trajgen]
+  solve for` summary always log.
 
   **The start relaxation — why the first region is special.** `truncatePath` ramps its requirement to
   *zero* at the drone (`ESCAPE_RAMP_DIST`) so a vehicle in a tight pocket can root a path at all. A
@@ -598,8 +604,9 @@ Module roles:
   The floor is `voxel_half_diagonal`, and that is geometry rather than taste: below it the region
   would contain points inside an occupied voxel's actual volume, not merely close to it. A drone
   that close fails the corridor outright with its own message. `runTrajgen` logs `start margin
-  relaxed to X m` **unconditionally** (not behind `DEBUG_PLANNER_VIZ`) whenever it bites — it is the
-  number that says how much protection the first stretch of the flown trajectory actually has.
+  relaxed to X m` whenever it bites, with `DEBUG_TRAJGEN` on (it was unconditional until 2026-09-30)
+  — it is the number that says how much protection the first stretch of the flown trajectory
+  actually has.
 - **`control`** — see the flight-critical note below.
 
 ### control (`core/control/`) — flight-critical, be careful
@@ -1225,11 +1232,18 @@ publish nothing and cost nothing when the flag is off:
 - `REPLAN_IMPROVE_RATIO` (double, default `0.85`) — adopt candidate iff cost ≤ ratio × committed.
 - `CLEARANCE_WEIGHT` (double, default `1.0`) — obstacle-proximity penalty weight. Lowered from 4.0
   during bench work; raising it pushes the search off the walls, which is one way to buy the corridor
-  stage the room it needs to grow regions. Since the cost is scored against the **conservative**
-  field (see *Two fields, two questions*), this now also sets how hard the search is pushed off the
-  *frontier*, and is therefore the main lever on how much of the path survives truncation — at the
-  cost of longer detours, and of a goal at the frontier being approached more reluctantly.
+  stage the room it needs to grow regions. Mapped obstacles only since 2026-09-30: how hard the search
+  is pushed off the *frontier* is `FRONTIER_WEIGHT` (below), the main lever on how much of the path
+  survives truncation — at the cost of longer detours, and of a goal at the frontier being
+  approached more reluctantly.
 - `CLEARANCE_THRESHOLD` (double, default `1.0` m) — clearance saturation / EDT maxdist.
+- `FRONTIER_WEIGHT` (double, default `1.0`, 2026-09-30) — weight on running near the frontier,
+  separate from `CLEARANCE_WEIGHT`, which since then weighs mapped obstacles only. With `c_v` the
+  optimistic (validity) field and `c_c` the conservative one, the proximity term is
+  `CLEARANCE_WEIGHT·max(0, T − c_v) + FRONTIER_WEIGHT·(max(0, T − c_c) − max(0, T − c_v))`: equal
+  weights give the old single penalty on `c_c`. Only when the cost is scored on the conservative
+  field (`TREAT_FRONTIER_AS_OBSTACLE` + `USE_CORRIDOR_QP`); the `[plan]` cost's `obst` / `frontier`
+  terms are these two.
 - `UNKNOWN_WEIGHT` (double, default `10.0`) — flat extra cost charged per metre of path routed
   through never-observed space (see *The unknown-space surcharge*). Read it as "how many metres of
   detour through mapped space is one metre through unmapped space worth". **`CLEARANCE_WEIGHT`
@@ -1268,8 +1282,12 @@ publish nothing and cost nothing when the flag is off:
   setting) — build a `planning::ConservativeGrid` (`core/planning/src/conservative_grid.cpp`) from each
   incoming octomap: one byte per voxel (free / occupied / shell / never observed) over the map's box,
   cropped to the search box grown by the fields' saturation distance (`AutonomyCore::mapCrop`).
-  Never-observed voxels within 0.5 m of the drone (`kFrontierKeepOutRadius`) are marked **free**,
-  then every never-observed voxel touching a free one (26-neighbourhood) is marked **shell**. Occupied
+  Never-observed voxels inside a keep-out around the drone are marked **free** — a 0.6 m ball behind
+  the camera and a 0.6 m-radius cylinder reaching 1.2 m ahead along the heading (level), so there
+  is more room where it looks (`kFrontierKeepOutRadius` / `kFrontierKeepOutForward`,
+  `ConservativeGrid::KeepOut`; a plain 0.5 m ball left only its centre keeping the 0.4-0.5 m
+  margins, so every plan was cut to ~0.2 m) — then every never-observed voxel touching a free one
+  (26-neighbourhood) is marked **shell**. Occupied
   + shell cells are the conservative obstacles, a closed shell around explored space wrapped around
   the ball too, so it answers every distance/corridor question exactly as if the whole unobserved
   volume were an obstacle. Computed from the octomap itself, in the map callback: RTAB-Map's frontier

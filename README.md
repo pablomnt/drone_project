@@ -509,7 +509,8 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 
 | Parameter | Type / default | What it does |
 |---|---|---|
-| `CLEARANCE_WEIGHT` | double, `1.0` | Weight on the obstacle-proximity penalty. Raising it pushes the search off walls — and, when frontier stamping is on, off the frontier too, which is the main lever on how much of a path survives truncation. Costs longer detours. |
+| `CLEARANCE_WEIGHT` | double, `1.0` | Weight on the obstacle-proximity penalty. Raising it pushes the search off mapped walls. Costs longer detours. |
+| `FRONTIER_WEIGHT` | double, `1.0` | Weight on the frontier-proximity penalty: what running near the edge of explored space costs beyond what the nearest mapped obstacle already charges (same shape and `CLEARANCE_THRESHOLD`). The main lever on how much of a path survives truncation. Used only with `TREAT_FRONTIER_AS_OBSTACLE` and `USE_CORRIDOR_QP`. |
 | `CLEARANCE_THRESHOLD` | double, `1.0` m | Distance at which the proximity penalty saturates; also the EDT's `maxdist`. |
 | `UNKNOWN_WEIGHT` | double, `0.5` | Flat extra cost per metre routed through never-observed space. Read as "how many metres of detour through mapped space is one metre through unmapped space worth". **Keep it low** — it defocuses the informed planners badly, because their sampling ellipse is built from straight-line estimates that cannot see this term. Ignored entirely when `TREAT_FRONTIER_AS_OBSTACLE` is false. |
 
