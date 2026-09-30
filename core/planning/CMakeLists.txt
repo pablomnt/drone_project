@@ -8,7 +8,8 @@ add_library(drone_core_planning
   src/corridor.cpp
   src/corridor_trajectory.cpp
   src/unknown_shell.cpp
-  src/distance_field.cpp)
+  src/distance_field.cpp
+  src/conservative_grid.cpp)
 add_library(drone_core::planning ALIAS drone_core_planning)
 
 target_include_directories(drone_core_planning PUBLIC

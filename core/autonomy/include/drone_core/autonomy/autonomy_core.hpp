@@ -15,11 +15,15 @@
 #include "drone_core/control/trajectory_tracker.hpp"
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/min_snap_trajectory.hpp"
+#include "drone_core/planning/conservative_grid.hpp"
 #include "drone_core/planning/distance_field.hpp"
 #include "drone_core/planning/geometric_planner.hpp"
 
 
 namespace drone_core::autonomy {
+
+// The conservative map view (see setMap): a dense grid, not an octree.
+using ConsGridHandle = std::shared_ptr<const planning::ConservativeGrid>;
 
 // Frames. Two frames meet in here and must not be mixed. Planning — the goal, the
 // geometric search, truncation, the corridor and the trajectory solve — works in
@@ -255,14 +259,14 @@ public:
   // `map` is the raw (optimistic) map: unknown space reads as free, so the
   // geometric search can chase a goal beyond the mapped frontier (informed
   // planners refuse an unreachable goal outright). `conservative` is the
-  // frontier-stamped copy — unknown space reads as occupied — used for
-  // truncation, corridor growth and trajectory safety — the host's copy of the
-  // raw map with every never-observed voxel bordering free space stamped
-  // occupied (planning::stampUnknownShell); pass nullptr when it has none (the raw map then serves both roles and
-  // nothing guards against unknown space, matching the pre-frontier behavior).
-  // With use_corridor_qp off and a conservative map present, the search runs on
-  // the conservative view instead — the legacy single-map behavior of
-  // TREAT_FRONTIER_AS_OBSTACLE.
+  // conservative view — a planning::ConservativeGrid over the raw map, cropped to
+  // mapCrop(), with the ball around the drone freed and every never-observed
+  // voxel bordering free space marked shell — used for truncation, corridor
+  // growth and trajectory safety; pass nullptr when there is none (the raw map
+  // then serves both roles and nothing guards against unknown space, matching
+  // the pre-frontier behavior). With use_corridor_qp off and a conservative view
+  // present, the search's collision check reads the conservative field instead —
+  // the legacy single-map behavior of TREAT_FRONTIER_AS_OBSTACLE.
   //
   // BLOCKS for as long as it takes to build the new map's distance fields
   // (over a second on a room-sized map), on the CALLER's thread, before the map
@@ -274,8 +278,12 @@ public:
   // group, which exists for exactly this kind of blocking work. Meanwhile the
   // planners keep running on the previous map and its fields; they switch to the
   // new pair together, so a tick never mixes a new map with an old field.
-  void setMap(const planning::MapHandle& map,
-              const planning::MapHandle& conservative = nullptr);
+  void setMap(const planning::MapHandle& map, const ConsGridHandle& conservative = nullptr);
+  // The box [m, MAP frame] the host should crop the conservative grid to: the
+  // search box grown by the conservative field's saturation distance plus a
+  // voxel, so obstacles just outside the box still count. The raw field is
+  // cropped the same way internally.
+  void mapCrop(Eigen::Vector3d& lo, Eigen::Vector3d& hi) const;
   // MAP frame.
   void setGoal(const common::Goal& goal);
 
@@ -389,11 +397,11 @@ private:
                      const planning::MapHandle& map,
                      std::vector<std::vector<double>>& path);
   // Trajectory generation for the committed path. cons_edt is the distance
-  // field of the conservative map view and cons_map the octree it was built
-  // from (nullptr when unavailable): with use_corridor_qp set the field drives
-  // truncation and the octree supplies the windowed obstacle points the
-  // polyhedral corridor decomposition consumes; without them (or with the flag
-  // off) trajgen is plain min-snap over the waypoints.
+  // field of the conservative view, and the obstacle points the polyhedral
+  // corridor decomposition consumes come from `cons_grid` (occupied + shell
+  // cells), or from the raw `map`'s occupied voxels when there is no grid: with
+  // use_corridor_qp set the field drives truncation and the points the corridor;
+  // without them (or with the flag off) trajgen is plain min-snap.
   //
   // is_unknown, when non-empty, makes truncation stop at the first point in
   // never-observed space, read from the stamped view (the ball around the drone
@@ -420,7 +428,7 @@ private:
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const common::MotionState& start,
                   const std::shared_ptr<const planning::DistanceField>& cons_edt,
-                  const planning::MapHandle& cons_map,
+                  const planning::MapHandle& map, const ConsGridHandle& cons_grid,
                   const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj,
                   bool pin_waypoints = false,
@@ -434,7 +442,7 @@ private:
   // Worker thread only.
   void runPreset(const common::State& state, const Eigen::Isometry3d& world_from_map,
                  const planning::MapHandle& map,
-                 const planning::MapHandle& conservative,
+                 const ConsGridHandle& conservative,
                  const std::vector<Eigen::Vector3d>& waypoints);
   // The two planner threads. They are deliberately separate: a geometric search
   // can take tens of seconds (EIT* overrunning its budget has been measured at
@@ -556,7 +564,7 @@ private:
   // no obstacles (clearance is then uniform and the EDT meaningless).
   bool applyClearanceObjective(planning::GeometricPlanner& planner,
                                const planning::MapHandle& map,
-                               const planning::MapHandle& cons);
+                               const ConsGridHandle& cons);
 
   // Return the cached Euclidean distance field for `map`, rebuilding it only when
   // the map has actually changed (octomap hands us a fresh tree per message). A
@@ -570,13 +578,13 @@ private:
   std::shared_ptr<const planning::DistanceField> clearanceField(
       const planning::MapHandle& map, double maxdist);
 
-  // Cached distance field over the conservative map view, for truncation and
-  // corridor growth. Mirrors clearanceField's rebuild-on-map-change caching;
-  // when the conservative and search maps are the same object (no frontier
-  // information), the search field is reused instead of building a second EDT.
-  // Same edt_mutex_ and same reason for the explicit maxdist as clearanceField.
+  // Cached distance field over the conservative view, for truncation and
+  // corridor growth. Mirrors clearanceField's rebuild-on-map-change caching,
+  // keyed on the grid; with no grid (no frontier information) the search field
+  // over `map` is reused instead of building a second one. Same edt_mutex_ and
+  // same reason for the explicit maxdist as clearanceField.
   std::shared_ptr<const planning::DistanceField> conservativeField(
-      const planning::MapHandle& map, double maxdist);
+      const planning::MapHandle& map, const ConsGridHandle& grid, double maxdist);
 
   // Sample the cached EDT on a coarse grid over the map's bounding box. Samples
   // whichever field the cost objective is scored against — the conservative one
@@ -606,7 +614,7 @@ private:
   Eigen::Isometry3d world_from_map_{Eigen::Isometry3d::Identity()};
   bool has_map_to_world_{false};          // set by the first setMapToWorld
   planning::MapHandle map_;               // optimistic view (unknown = free)
-  planning::MapHandle conservative_map_;  // frontier-stamped view; may be null
+  ConsGridHandle conservative_map_;       // conservative view (shell grid); may be null
   common::Goal goal_;
   bool has_goal_{false};
   bool new_goal_{false};  // raised by setGoal, consumed by the worker to force a replan
@@ -742,7 +750,8 @@ private:
   // Second cached field over the conservative map view (truncation + corridor).
   // See conservativeField.
   std::shared_ptr<const planning::DistanceField> cons_edt_;
-  planning::MapHandle cons_edt_source_map_;
+  ConsGridHandle cons_edt_source_grid_;     // the grid it was built from, or
+  planning::MapHandle cons_edt_source_map_;  // the raw map, when built without one
   double cons_edt_maxdist_{0.0};
   planning::MapHandle viz_sampled_map_;  // map the debug clearance samples were taken from
 
@@ -756,10 +765,11 @@ private:
   // so a freed map's address being reused by a new one can never match.
   std::vector<std::weak_ptr<octomap::OcTree>> edt_superseded_;
   std::vector<std::weak_ptr<octomap::OcTree>> cons_edt_superseded_;
+  std::vector<std::weak_ptr<const planning::ConservativeGrid>> cons_grid_superseded_;
   static constexpr std::size_t kSupersededHistory = 8;
 
   // Build the fields a new map will need, OFF the planner threads (see setMap).
-  void prebuildFields(const planning::MapHandle& map, const planning::MapHandle& conservative);
+  void prebuildFields(const planning::MapHandle& map, const ConsGridHandle& conservative);
 };
 
 }  // namespace drone_core::autonomy

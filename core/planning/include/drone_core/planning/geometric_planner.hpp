@@ -479,14 +479,16 @@ private:
   // extra displacement on the most common geometry there is.
   static constexpr double kGoalProjectRadius = 2.0;
 public:
-  // The box the search is confined to, tuned for the office test environment:
-  // x and y +-15 m, z from -1.5 (above the floor) to 2.5 (below eye level). The
+  // The box the search is confined to: x and y +-30 m, z from -1.5 (above the
+  // floor of the office test environment) to 5 m (raised from +-15 / 2.5 on
+  // 2026-09-30). The distance fields and the conservative grid are cropped to
+  // it (grown by their saturation distance), so map beyond it costs nothing. The
   // trajectory stage clips its corridor to the same box (CorridorParams::bounds_*),
   // so a trajectory cannot leave the space the search can plan in — a vehicle that
   // did (bench 2026-09-29, z = -1.62) had a start outside the bounds, every search
   // was refused, and it could never plan again.
-  static constexpr std::array<double, 3> kSearchLow{-15.0, -15.0, -1.5};
-  static constexpr std::array<double, 3> kSearchHigh{15.0, 15.0, 2.5};
+  static constexpr std::array<double, 3> kSearchLow{-30.0, -30.0, -1.5};
+  static constexpr std::array<double, 3> kSearchHigh{30.0, 30.0, 5.0};
 private:
   static constexpr double kGoalProjectStep = 0.05;
   static constexpr int kGoalProjectDirections = 128;

@@ -17,9 +17,10 @@
 
 // Build outline (all phases parallel over independent work items):
 //   1. Walk the octree once: bounding box of all leaves (== getMetricMin/Max in
-//      keys) and the list of occupied leaves.
-//   2. Stamp the occupied leaves into a bitset (one bit per cell, rows padded to
-//      64-bit words): ~1 MB for 10M cells, so the stamping stays in cache and the
+//      keys), cut to the crop if there is one, and the list of occupied leaves.
+//      (From a ConservativeGrid: no walk, the box is the grid's.)
+//   2. Stamp the occupied leaves (or the grid's occupied and shell cells) into
+//      a bitset (one bit per cell, rows padded to 64-bit words): ~1 MB for 10M cells, so the stamping stays in cache and the
 //      big grid is first touched by the x pass instead of by a separate init.
 //   3. x pass: per row, squared distance to the nearest occupied bit.
 //   4. y and z passes: per column, out[i] = min_j in[j] + (i - j)^2 (the
@@ -123,8 +124,21 @@ void visitLeaf(const octomap::OcTree& tree, const octomap::OcTreeNode* node, uns
     out.occ.push_back({{k[0], k[1], k[2]}, static_cast<std::uint16_t>(level)});
 }
 
+// Only subtrees reaching into [clip_lo, clip_hi] (keys, inclusive) are walked;
+// the full key range walks everything.
+struct Clip {
+  int lo[3], hi[3];
+  bool misses(unsigned level, const std::uint16_t k[3]) const {
+    const int span = 1 << level;
+    for (int a = 0; a < 3; ++a)
+      if (k[a] + span - 1 < lo[a] || k[a] > hi[a]) return true;
+    return false;
+  }
+};
+
 void walk(const octomap::OcTree& tree, const octomap::OcTreeNode* node, unsigned level,
-          const std::uint16_t k[3], WalkResult& out) {
+          const std::uint16_t k[3], const Clip& clip, WalkResult& out) {
+  if (clip.misses(level, k)) return;
   bool inner = false;
   if (level > 0) {
     const std::uint16_t half = static_cast<std::uint16_t>(1u << (level - 1));
@@ -134,7 +148,7 @@ void walk(const octomap::OcTree& tree, const octomap::OcTreeNode* node, unsigned
       const std::uint16_t ck[3] = {static_cast<std::uint16_t>(k[0] + ((i & 1) ? half : 0)),
                                    static_cast<std::uint16_t>(k[1] + ((i & 2) ? half : 0)),
                                    static_cast<std::uint16_t>(k[2] + ((i & 4) ? half : 0))};
-      walk(tree, tree.getNodeChild(node, i), level - 1, ck, out);
+      walk(tree, tree.getNodeChild(node, i), level - 1, ck, clip, out);
     }
   }
   if (!inner) visitLeaf(tree, node, level, k, out);
@@ -142,7 +156,7 @@ void walk(const octomap::OcTree& tree, const octomap::OcTreeNode* node, unsigned
 
 // Splits the top of the tree into enough independent subtrees for `threads`
 // workers and walks them in parallel. Returns one result per worker.
-std::vector<WalkResult> walkTree(const octomap::OcTree& tree, unsigned threads) {
+std::vector<WalkResult> walkTree(const octomap::OcTree& tree, unsigned threads, const Clip& clip) {
   std::vector<WalkResult> results(std::max(1u, threads));
   const octomap::OcTreeNode* root = tree.getRoot();
   if (root == nullptr) return results;
@@ -153,6 +167,7 @@ std::vector<WalkResult> walkTree(const octomap::OcTree& tree, unsigned threads) 
     std::vector<Frontier> next;
     next.reserve(frontier.size() * 8);
     for (const Frontier& f : frontier) {
+      if (clip.misses(f.level, f.k)) continue;
       bool inner = false;
       if (f.level > 0) {
         const std::uint16_t half = static_cast<std::uint16_t>(1u << (f.level - 1));
@@ -170,10 +185,46 @@ std::vector<WalkResult> walkTree(const octomap::OcTree& tree, unsigned threads) 
     frontier.swap(next);
   }
   parallelFor(frontier.size(), threads, [&](std::size_t i, unsigned w) {
-    walk(tree, frontier[i].node, frontier[i].level, frontier[i].k, results[w]);
+    walk(tree, frontier[i].node, frontier[i].level, frontier[i].k, clip, results[w]);
   });
   return results;
 }
+
+// The extent of the leaves along one axis, by branch and bound: the lowest
+// leaf key (`upper` false) or the highest (`upper` true), visiting the nearer
+// half of each node's children first and skipping any subtree that cannot beat
+// the best so far (every octomap node has a leaf below it, so a node whose
+// near half has a child never needs its far half). Stops once the answer
+// reaches `enough`, where the crop clamps it anyway. (A copy of
+// ConservativeGrid's.)
+struct Extent {
+  const octomap::OcTree& tree;
+  int axis;
+  bool upper;
+  int enough;
+  int best;
+
+  void search(const octomap::OcTreeNode* node, unsigned level, const std::uint16_t k[3]) {
+    const int lo = k[axis], hi = k[axis] + (1 << level) - 1;
+    if (upper ? hi <= best : lo >= best) return;
+    if (level == 0 || !tree.nodeHasChildren(node)) {
+      best = upper ? hi : lo;
+      return;
+    }
+    const std::uint16_t half = static_cast<std::uint16_t>(1u << (level - 1));
+    for (unsigned pass = 0; pass < 2; ++pass) {
+      const unsigned side = upper ? 1 - pass : pass;  // near half first
+      for (unsigned i = 0; i < 8; ++i) {
+        if (((i >> axis) & 1u) != side || !tree.nodeChildExists(node, i)) continue;
+        const std::uint16_t ck[3] = {static_cast<std::uint16_t>(k[0] + ((i & 1) ? half : 0)),
+                                     static_cast<std::uint16_t>(k[1] + ((i & 2) ? half : 0)),
+                                     static_cast<std::uint16_t>(k[2] + ((i & 4) ? half : 0))};
+        search(tree.getNodeChild(node, i), level - 1, ck);
+        if (upper ? best >= enough : best <= enough) return;
+      }
+    }
+  }
+};
 
 // ------------------------------------------------------------------ the passes
 
@@ -289,9 +340,82 @@ void windowBlock(const std::int16_t* in, int n, std::int16_t* out, int R) {
   }
 }
 
-template <typename Cell>
-void runPasses(const Geometry& gm, const std::vector<WalkResult>& walks, std::uint32_t far,
-               unsigned threads, Cell* grid) {
+// Stamps the occupied leaves of an octree walk into the bitset (clipped to the
+// box).
+void stampLeaves(const Geometry& gm, const std::vector<WalkResult>& walks, unsigned threads,
+                 std::uint64_t* bits) {
+  const int nx = gm.nx, ny = gm.ny, nz = gm.nz;
+  const std::size_t wpr = gm.words_per_row;
+  struct Chunk { const OccLeaf* p; std::size_t n; };
+  std::vector<Chunk> chunks;
+  constexpr std::size_t kChunk = 8192;
+  for (const WalkResult& w : walks)
+    for (std::size_t i = 0; i < w.occ.size(); i += kChunk)
+      chunks.push_back({w.occ.data() + i, std::min(kChunk, w.occ.size() - i)});
+  parallelFor(chunks.size(), threads, [&](std::size_t c, unsigned) {
+    for (std::size_t i = 0; i < chunks[c].n; ++i) {
+      const OccLeaf& L = chunks[c].p[i];
+      const int span = 1 << L.level;
+      int lo[3], hi[3];
+      const int n[3] = {nx, ny, nz};
+      bool empty = false;
+      for (int a = 0; a < 3; ++a) {
+        lo[a] = std::max(0, L.k[a] - gm.k0[a]);
+        hi[a] = std::min(n[a] - 1, L.k[a] - gm.k0[a] + span - 1);
+        empty |= lo[a] > hi[a];
+      }
+      if (empty) continue;
+      for (int zz = lo[2]; zz <= hi[2]; ++zz)
+        for (int yy = lo[1]; yy <= hi[1]; ++yy)
+          setBits(&bits[(static_cast<std::size_t>(zz) * ny + yy) * wpr], lo[0], hi[0]);
+    }
+  });
+}
+
+// Stamps a conservative grid's occupied and shell cells (the odd values) into
+// the bitset, which covers exactly the grid's box. Rows are independent.
+void stampGrid(const Geometry& gm, const std::uint8_t* cells, unsigned threads,
+               std::uint64_t* bits) {
+  const std::size_t nx = static_cast<std::size_t>(gm.nx);
+  const std::size_t rows = static_cast<std::size_t>(gm.ny) * gm.nz;
+  const std::size_t wpr = gm.words_per_row;
+  constexpr std::size_t kRowChunk = 64;
+  parallelFor((rows + kRowChunk - 1) / kRowChunk, threads, [&](std::size_t c, unsigned) {
+    const std::size_t r1 = std::min(rows, (c + 1) * kRowChunk);
+    for (std::size_t r = c * kRowChunk; r < r1; ++r) {
+      const std::uint8_t* row = cells + r * nx;
+      std::uint64_t* out = bits + r * wpr;
+      for (std::size_t w = 0; w < wpr; ++w) {
+        const std::uint8_t* p = row + 64 * w;
+        const std::size_t len = std::min<std::size_t>(64, nx - 64 * w);
+        std::uint64_t word = 0;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if (len == 64) {
+          // Bit 0 of each byte, gathered 8 at a time into the top byte by the
+          // multiply (no two partial products share a bit, so nothing carries).
+          for (int i = 0; i < 8; ++i) {
+            std::uint64_t x;
+            std::memcpy(&x, p + 8 * i, 8);
+            word |= (((x & 0x0101010101010101ULL) * 0x0102040810204080ULL) >> 56) << (8 * i);
+          }
+          out[w] = word;
+          continue;
+        }
+#endif
+        for (std::size_t i = 0; i < len; ++i)
+          word |= static_cast<std::uint64_t>(ConservativeGrid::isObstacle(
+                      static_cast<ConservativeGrid::Cell>(p[i])))
+                  << i;
+        out[w] = word;
+      }
+    }
+  });
+}
+
+// The passes; `stamp(bits)` sets the occupied cells' bits first.
+template <typename Cell, typename Stamp>
+void runPasses(const Geometry& gm, Stamp&& stamp, std::uint32_t far, unsigned threads,
+               Cell* grid) {
   const int nx = gm.nx, ny = gm.ny, nz = gm.nz;
   const std::size_t nxy = static_cast<std::size_t>(nx) * ny;
   const std::size_t rows = static_cast<std::size_t>(ny) * nz;
@@ -304,32 +428,7 @@ void runPasses(const Geometry& gm, const std::vector<WalkResult>& walks, std::ui
 
   // --- occupancy bitset
   std::vector<std::uint64_t> bits(wpr * rows, 0);
-  {
-    struct Chunk { const OccLeaf* p; std::size_t n; };
-    std::vector<Chunk> chunks;
-    constexpr std::size_t kChunk = 8192;
-    for (const WalkResult& w : walks)
-      for (std::size_t i = 0; i < w.occ.size(); i += kChunk)
-        chunks.push_back({w.occ.data() + i, std::min(kChunk, w.occ.size() - i)});
-    parallelFor(chunks.size(), threads, [&](std::size_t c, unsigned) {
-      for (std::size_t i = 0; i < chunks[c].n; ++i) {
-        const OccLeaf& L = chunks[c].p[i];
-        const int span = 1 << L.level;
-        int lo[3], hi[3];
-        const int n[3] = {nx, ny, nz};
-        bool empty = false;
-        for (int a = 0; a < 3; ++a) {
-          lo[a] = std::max(0, L.k[a] - gm.k0[a]);
-          hi[a] = std::min(n[a] - 1, L.k[a] - gm.k0[a] + span - 1);
-          empty |= lo[a] > hi[a];
-        }
-        if (empty) continue;
-        for (int zz = lo[2]; zz <= hi[2]; ++zz)
-          for (int yy = lo[1]; yy <= hi[1]; ++yy)
-            setBits(&bits[(static_cast<std::size_t>(zz) * ny + yy) * wpr], lo[0], hi[0]);
-      }
-    });
-  }
+  stamp(bits.data());
 
 #ifdef DRONE_CORE_DISTANCE_FIELD_TIMING
   auto t1 = Clock::now();
@@ -439,33 +538,121 @@ void runPasses(const Geometry& gm, const std::vector<WalkResult>& walks, std::ui
 #endif
 }
 
+// ------------------------------------------------------------- crop in keys
+
+// Far beyond octomap's 16-bit key range, and small enough that adding the key
+// offset cannot overflow an int.
+constexpr double kKeyClamp = 1 << 20;
+
+double cellCentre(int key, int offset, double res) {
+  return (static_cast<double>(key - offset) + 0.5) * res;  // octomap's keyToCoord
+}
+
+// The smallest key whose cell centre is >= v (NaN: an empty range).
+int firstKeyAtOrAbove(double v, double res, double inv_res, int offset) {
+  if (std::isnan(v)) return INT_MAX / 2;
+  const double t = std::ceil(v * inv_res - 0.5);
+  if (!(std::abs(t) < kKeyClamp)) return t < 0 ? -static_cast<int>(kKeyClamp) : static_cast<int>(kKeyClamp);
+  int k = static_cast<int>(t) + offset;
+  while (cellCentre(k, offset, res) < v) ++k;
+  while (cellCentre(k - 1, offset, res) >= v) --k;
+  return k;
+}
+
+// The largest key whose cell centre is <= v (NaN: an empty range).
+int lastKeyAtOrBelow(double v, double res, double inv_res, int offset) {
+  if (std::isnan(v)) return INT_MIN / 2;
+  const double t = std::floor(v * inv_res - 0.5);
+  if (!(std::abs(t) < kKeyClamp)) return t < 0 ? -static_cast<int>(kKeyClamp) : static_cast<int>(kKeyClamp);
+  int k = static_cast<int>(t) + offset;
+  while (cellCentre(k, offset, res) > v) --k;
+  while (cellCentre(k + 1, offset, res) <= v) ++k;
+  return k;
+}
+
 }  // namespace
 
 DistanceField::DistanceField(const octomap::OcTree& tree, double maxdist, unsigned threads)
+    : DistanceField(tree, maxdist, threads,
+                    Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity()),
+                    Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity())) {}
+
+DistanceField::DistanceField(const octomap::OcTree& tree, double maxdist, unsigned threads,
+                             const Eigen::Vector3d& crop_lo, const Eigen::Vector3d& crop_hi)
     : res_(tree.getResolution()),
       inv_res_(1.0 / tree.getResolution()),  // octomap's resolution_factor, bit for bit
       maxdist_(maxdist),
       key_offset_(1 << (tree.getTreeDepth() - 1)) {
   if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
+  if (tree.getRoot() == nullptr) return;  // empty tree: an empty box, every query reads -1
+
+  // The crop in keys, within octomap's key range.
+  const int kmax = (1 << tree.getTreeDepth()) - 1;
+  Clip crop;
+  bool cuts = false;
+  for (int a = 0; a < 3; ++a) {
+    crop.lo[a] = std::max(0, firstKeyAtOrAbove(crop_lo[a], res_, inv_res_, key_offset_));
+    crop.hi[a] = std::min(kmax, lastKeyAtOrBelow(crop_hi[a], res_, inv_res_, key_offset_));
+    if (crop.lo[a] > crop.hi[a]) return;  // the crop holds no cell: an empty box
+    cuts |= crop.lo[a] > 0 || crop.hi[a] < kmax;
+  }
 
 #ifdef DRONE_CORE_DISTANCE_FIELD_TIMING
   auto t0 = std::chrono::steady_clock::now();
 #endif
-  const std::vector<WalkResult> walks = walkTree(tree, threads);
+  int lo[3] = {INT_MAX, INT_MAX, INT_MAX}, hi[3] = {INT_MIN, INT_MIN, INT_MIN};
+  if (cuts) {
+    // The box by branch and bound (each bound searched only as far as the
+    // crop), so the walk below can skip everything outside the crop.
+    const std::uint16_t k0[3] = {0, 0, 0};
+    for (int a = 0; a < 3; ++a) {
+      Extent lower{tree, a, false, crop.lo[a], INT_MAX};
+      lower.search(tree.getRoot(), tree.getTreeDepth(), k0);
+      Extent higher{tree, a, true, crop.hi[a], INT_MIN};
+      higher.search(tree.getRoot(), tree.getTreeDepth(), k0);
+      lo[a] = std::max(lower.best, crop.lo[a]);
+      hi[a] = std::min(higher.best, crop.hi[a]);
+      if (lo[a] > hi[a]) return;  // nothing left: an empty box
+    }
+  }
+  const Clip clip = cuts ? Clip{{lo[0], lo[1], lo[2]}, {hi[0], hi[1], hi[2]}}
+                         : Clip{{0, 0, 0}, {kmax, kmax, kmax}};
+  const std::vector<WalkResult> walks = walkTree(tree, threads, clip);
 #ifdef DRONE_CORE_DISTANCE_FIELD_TIMING
   std::fprintf(stderr, "[DistanceField] walk %.1f ms\n",
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
                    .count());
 #endif
+  if (!cuts) {  // the box from the walk itself
+    for (const WalkResult& w : walks)
+      for (int a = 0; a < 3; ++a) {
+        lo[a] = std::min(lo[a], w.lo[a]);
+        hi[a] = std::max(hi[a], w.hi[a]);
+      }
+    if (lo[0] > hi[0]) return;  // no leaves (cannot happen with a root; kept as a guard)
+  }
+  // Occupied leaves reaching past the box are clipped by the stamping.
+  build(lo, hi, threads, [&](const Geometry& gm, std::uint64_t* bits) {
+    stampLeaves(gm, walks, threads, bits);
+  });
+}
 
-  int lo[3] = {INT_MAX, INT_MAX, INT_MAX}, hi[3] = {INT_MIN, INT_MIN, INT_MIN};
-  for (const WalkResult& w : walks)
-    for (int a = 0; a < 3; ++a) {
-      lo[a] = std::min(lo[a], w.lo[a]);
-      hi[a] = std::max(hi[a], w.hi[a]);
-    }
-  if (lo[0] > hi[0]) return;  // empty tree: an empty box, every query reads -1
+DistanceField::DistanceField(const ConservativeGrid& grid, double maxdist, unsigned threads)
+    : res_(grid.resolution()),
+      inv_res_(1.0 / grid.resolution()),  // the grid's, and so octomap's, bit for bit
+      maxdist_(maxdist),
+      key_offset_(grid.keyOffset()) {
+  if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
+  if (grid.empty()) return;  // an empty box, every query reads -1
+  const int lo[3] = {grid.keyX0(), grid.keyY0(), grid.keyZ0()};
+  const int hi[3] = {lo[0] + grid.sizeX() - 1, lo[1] + grid.sizeY() - 1, lo[2] + grid.sizeZ() - 1};
+  build(lo, hi, threads, [&](const Geometry& gm, std::uint64_t* bits) {
+    stampGrid(gm, grid.data(), threads, bits);
+  });
+}
 
+template <typename Stamp>
+void DistanceField::build(const int lo[3], const int hi[3], unsigned threads, Stamp&& stamp) {
   kx0_ = lo[0];
   ky0_ = lo[1];
   kz0_ = lo[2];
@@ -482,31 +669,46 @@ DistanceField::DistanceField(const octomap::OcTree& tree, double maxdist, unsign
                              static_cast<std::uint64_t>(nz_ - 1) * (nz_ - 1);
   const std::uint64_t cap = std::min<std::uint64_t>(dmax + 1, 0x7fffffffu);
   std::uint64_t far = 0;
-  if (maxdist > 0) {
-    const double rc = maxdist / res_;
+  if (maxdist_ > 0) {
+    const double rc = maxdist_ / res_;
     if (!(rc * rc < static_cast<double>(cap))) {
       far = cap;
     } else {
       far = static_cast<std::uint64_t>(rc * rc);
       far = far >= 2 ? far - 2 : 0;
-      while (far < cap && std::sqrt(static_cast<double>(far)) * res_ < maxdist) ++far;
+      while (far < cap && std::sqrt(static_cast<double>(far)) * res_ < maxdist_) ++far;
     }
   }
   far_ = static_cast<std::uint32_t>(far);
 
-  Geometry gm{nx_, ny_, nz_, {kx0_, ky0_, kz0_}, (static_cast<std::size_t>(nx_) + 63) / 64};
+  const Geometry gm{nx_, ny_, nz_, {kx0_, ky0_, kz0_}, (static_cast<std::size_t>(nx_) + 63) / 64};
+  const auto stampBits = [&](std::uint64_t* bits) { stamp(gm, bits); };
   const std::size_t cells = static_cast<std::size_t>(nx_) * ny_ * nz_;
   if (far_ <= 0xffffu) {
     sq16_.resize(cells);  // unwritten: the x pass writes every cell
-    runPasses<std::uint16_t>(gm, walks, far_, threads, sq16_.data());
+    runPasses<std::uint16_t>(gm, stampBits, far_, threads, sq16_.data());
     lut_.resize(static_cast<std::size_t>(far_) + 1);
     for (std::uint32_t d2 = 0; d2 < far_; ++d2)
       lut_[d2] = static_cast<float>(std::min(std::sqrt(static_cast<double>(d2)) * res_, maxdist_));
     lut_[far_] = static_cast<float>(maxdist_);
   } else {
     sq32_.resize(cells);  // unwritten: the x pass writes every cell
-    runPasses<std::uint32_t>(gm, walks, far_, threads, sq32_.data());
+    runPasses<std::uint32_t>(gm, stampBits, far_, threads, sq32_.data());
   }
+}
+
+Eigen::Vector3d DistanceField::boxMin() const {
+  if (nx_ == 0) return Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+  return Eigen::Vector3d(static_cast<double>(kx0_ - key_offset_) * res_,
+                         static_cast<double>(ky0_ - key_offset_) * res_,
+                         static_cast<double>(kz0_ - key_offset_) * res_);
+}
+
+Eigen::Vector3d DistanceField::boxMax() const {
+  if (nx_ == 0) return Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  return Eigen::Vector3d(static_cast<double>(kx0_ + nx_ - key_offset_) * res_,
+                         static_cast<double>(ky0_ + ny_ - key_offset_) * res_,
+                         static_cast<double>(kz0_ + nz_ - key_offset_) * res_);
 }
 
 float DistanceField::getDistance(const octomap::point3d& p) const {

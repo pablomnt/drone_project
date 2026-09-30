@@ -110,9 +110,9 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
   against analytic oracles — run it with `ctest -R corridor` on every planning edit),
   `rigid_transform` (the `map`↔`world` trajectory/state conversion, instant), `goal_projection` (invalid-goal → nearest-valid-state projection; analytic clearance fields and
   0.5 s solve budgets, ~3 s total, so it also runs on every planning edit),
-  `unknown_cost` (unknown-space surcharge + truncation's hard stop; analytic predicates, ~0.5 s,
-  also on every planning edit), `distance_field` (the distance field against brute force and
-  DynamicEDT3D), `autonomy_core` (plan→track→watchdog).
+  `unknown_cost` (unknown-space surcharge + truncation's hard stop, the unknown shell and the
+  conservative grid; ~2-3 s, also on every planning edit), `distance_field` (the distance field against brute force and
+  DynamicEDT3D, its crop and its build from a conservative grid; ~5-9 s), `autonomy_core` (plan→track→watchdog).
 - ROS packages use `ament_lint_auto` / `ament_lint_common` via `colcon test`; the python packages
   (`pc_publisher` C++ aside, `system_monitor_pkg`) carry the standard flake8/pep257/copyright triplet.
 
@@ -280,7 +280,7 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   stop → rest re-solve staged, stop point advanced → WAYPOINT solve staged. EVASION without an
   emergency not yet exercised.
   **The search box also bounds the trajectory (2026-09-29).** The search plans inside
-  `GeometricPlanner::kSearchLow/High` (x, y ±15 m, z −1.5…2.5), and `buildCorridor` clips every region
+  `GeometricPlanner::kSearchLow/High` (x, y ±30 m, z −1.5…5 since 2026-09-30; was ±15, 2.5), and `buildCorridor` clips every region
   (after the margin shrink, bridges included) to the same box via `CorridorParams::bounds_lo/hi`, grown
   to hold every waypoint of the path it is given. Reason: a trajectory's corridor is not limited by the
   search box, and the tester's drone ended at z = −1.62; a start outside the box is refused by OMPL
@@ -322,7 +322,7 @@ Module roles:
   `MapHandle`) and **`frames`**, which holds *all* ENU↔NED/FRD and OKVIS-yaw conversions (extracted
   from the old node so they are unit-testable). `logging.hpp` replaces ROS logging in the core.
 - **`planning`** — `GeometricPlanner` (a **runtime-selectable** OMPL planner over an SE(3) octree,
-  X/Y ±15 m, Z −1.5–2.5 m — `PlannerType` ∈ {RRTstar, BITstar, ABITstar, AITstar, EITstar}, built by
+  X/Y ±30 m, Z −1.5–5 m — `PlannerType` ∈ {RRTstar, BITstar, ABITstar, AITstar, EITstar}, built by
   a small factory `makePlanner()`; the BIT* lineage is heuristic/informed and far better at focusing
   the search on the start→goal corridor than plain RRT*). **All per-planner tunables live in
   `PlannerConfig` in `geometric_planner.hpp`** (the single place to tune them — edit + rebuild the
@@ -413,7 +413,7 @@ Module roles:
     cloud had arrived (it now builds its own shell every map), so keying off it meant a late or
     missing `/octomap_frontier` silently switched off both guards with the flag still on — visible
     only as `unk_cost` quietly vanishing from the `[plan]` line. The surcharge reads the raw octree,
-    where a cell with no node has never been observed; truncation's stop now reads the stamped copy
+    where a cell with no node has never been observed; truncation's stop now reads the conservative grid
     (see `TREAT_FRONTIER_AS_OBSTACLE`).
 
   Admissibility is preserved (the term is ≥ 0, so the integrand stays ≥ 1 and both heuristics remain
@@ -1265,29 +1265,36 @@ publish nothing and cost nothing when the flag is off:
   bench validation** — turn it off for a real flight so the NUC pays nothing for it.
 - `TREAT_FRONTIER_AS_OBSTACLE` (bool, **currently defaulted `false`** for corridor bench tests, so
   the decomposition is exercised against real obstacles alone; `true` is the intended flight
-  setting) — build a deep **copy** of each incoming octomap with `planning::stampUnknownShell`
-  (`core/planning/src/unknown_shell.cpp`): never-observed voxels within 0.5 m of the drone
-  (`kFrontierKeepOutRadius`) are marked **free**, then every never-observed voxel touching a free one
-  (26-neighbourhood) is stamped **occupied**. The result is a closed shell around explored space,
-  wrapped around the ball too, so it answers every distance/corridor question exactly as if the
-  whole unobserved volume were an obstacle. Computed from the octomap itself, in the map callback:
-  RTAB-Map's frontier cloud (`/octomap_frontier`, now commented out) arrived as a separate message
-  one map update late and had holes. The sweep uses a dense byte grid of the tree's bounding box
-  rather than 26 tree searches per free voxel (905 ms -> 55 ms on a synthetic 6x6x2.5 m room at 5 cm).
-  The copy is fed to the core as the **conservative** view (the raw map stays the optimistic search
-  view — dual-map). With `USE_CORRIDOR_QP` off the search itself runs on the conservative view
-  (legacy behavior); with it on, the conservative view drives truncation, corridor growth, the
-  trajectory monitor **and the search's cost objective** — but never its collision check, which
-  stays optimistic (see *Two fields, two questions*). NOTE: on a fresh map almost everything is
-  unobserved — the drone is boxed in until it has scanned its surroundings.
-  **This is the master switch for "is unmapped space a hazard".** It gates the shell,
+  setting) — build a `planning::ConservativeGrid` (`core/planning/src/conservative_grid.cpp`) from each
+  incoming octomap: one byte per voxel (free / occupied / shell / never observed) over the map's box,
+  cropped to the search box grown by the fields' saturation distance (`AutonomyCore::mapCrop`).
+  Never-observed voxels within 0.5 m of the drone (`kFrontierKeepOutRadius`) are marked **free**,
+  then every never-observed voxel touching a free one (26-neighbourhood) is marked **shell**. Occupied
+  + shell cells are the conservative obstacles, a closed shell around explored space wrapped around
+  the ball too, so it answers every distance/corridor question exactly as if the whole unobserved
+  volume were an obstacle. Computed from the octomap itself, in the map callback: RTAB-Map's frontier
+  cloud (`/octomap_frontier`, now commented out) arrived as a separate message one map update late
+  and had holes. **History (2026-09-30):** first a stamped deep copy of the octree
+  (`planning::stampUnknownShell`, kept as the tests' reference); the bench showed the copy (24 ms)
+  and writing ~240k shell voxels into it one by one (72 ms) were most of the step and grew fastest
+  with the map, so the grid itself became the conservative view. The core reads it three ways: the
+  conservative distance field is built straight from it (`DistanceField(grid)`), the corridor's
+  obstacle points come from `obstaclesIn`, and truncation/monitor/adoption ask `isUnknown` (unknown
+  or shell; outside the grid counts as unknown). The raw map stays the optimistic search view
+  (dual-map); its field is cropped to the same box. With `USE_CORRIDOR_QP` off the search's collision
+  check reads the conservative field (legacy behavior); with it on, the conservative field drives
+  truncation, corridor growth, the trajectory monitor **and the search's cost objective** — but
+  never its collision check, which stays optimistic (see *Two fields, two questions*). NOTE: on a
+  fresh map almost everything is unobserved — the drone is boxed in until it has scanned its
+  surroundings. **Memory:** the crop caps the grid and both fields at the search box (now 60 x 60 x
+  6.5 m, ~1 GB combined if a map ever filled it); room-sized maps cost what they span.
+  **This is the master switch for "is unmapped space a hazard".** It gates the grid,
   `UNKNOWN_WEIGHT`'s cost surcharge (reads the RAW octree), and the "never observed" stop in
-  truncation, the monitor and the adoption check (read the STAMPED copy, so the ball is free there
-  and all three agree with the corridor). Turn it off and unknown reads as ordinary free space
-  everywhere.
+  truncation, the monitor and the adoption check (read the grid, so the ball is free there and all
+  three agree with the corridor). Turn it off and unknown reads as ordinary free space everywhere.
 - `LOG_MAP_TIMING` (bool, default `true`) — one `[map]` line per octomap: time since the previous
-  one (and Hz), decode, shell (voxels stamped / freed / free leaves swept), distance fields, viz
-  publish, total.
+  one (and Hz), decode, shell (grid fill / ball / sweep times, grid size, shell cells, cells freed
+  around the drone), distance fields, viz publish, total.
 - `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
   short of the goal (the reachable point closest to it) instead of reporting "no path"; the worker
   keeps advancing the endpoint as the map grows.

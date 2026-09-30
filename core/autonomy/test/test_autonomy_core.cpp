@@ -330,8 +330,14 @@ int main() {
         }
       }
     }
-    // A separate object, as the node's frontier-stamped deep copy is.
-    auto conservative = std::make_shared<octomap::OcTree>(*octree);
+    // A conservative grid mirroring the map (no shell), as the node would build.
+    Eigen::Vector3d crop_lo, crop_hi;
+    core.mapCrop(crop_lo, crop_hi);
+    const auto mirror = [&](const octomap::OcTree& t) {
+      return std::make_shared<const planning::ConservativeGrid>(
+          t, octomap::point3d(0, 0, 1), 0.5, crop_lo, crop_hi, /*shell=*/false);
+    };
+    auto conservative = mirror(*octree);
     core.setMap(octree, conservative);
     core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
     core.reset();
@@ -345,7 +351,7 @@ int main() {
 
     // A second map arrives: again built before publication, not by the planner.
     auto octree2 = std::make_shared<octomap::OcTree>(*octree);
-    auto conservative2 = std::make_shared<octomap::OcTree>(*octree);
+    auto conservative2 = mirror(*octree);
     core.setMap(octree2, conservative2);
     fake_time += 1.0;
     core.planOnce();

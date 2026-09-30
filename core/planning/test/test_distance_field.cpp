@@ -13,6 +13,15 @@
 //   4. Eight threads querying one field concurrently get the single-threaded
 //      answers.
 //   5. Build time of DynamicEDT3D vs ours (informational only).
+//   6. Crops: a field built with a crop box equals, on every cell of the crop,
+//      brute force over the occupied voxels inside the crop only (merged
+//      occupied leaves cut by it included), reads -1 outside it, and is empty
+//      when the crop misses the map.
+//   7. The ConservativeGrid constructor: equal, bit for bit over the grid's
+//      box, to the tree constructor on the raw map with the grid's shell cells
+//      stamped occupied (uncropped and cropped), and to brute force; the grid's
+//      shell is exactly stampUnknownShell's when uncropped.
+//   8. boxMin()/boxMax() are the box's outer corners (lo > hi when empty).
 //
 // The ground truth is computed from occupancy read back cell by cell through
 // octomap's own search(), not from the field's octree walk, so a merged leaf
@@ -21,6 +30,8 @@
 // Everything runs in a few seconds in Release.
 
 #include "drone_core/planning/distance_field.hpp"
+#include "drone_core/planning/conservative_grid.hpp"
+#include "drone_core/planning/unknown_shell.hpp"
 
 #include <dynamicEDT3D/dynamicEDTOctomap.h>
 #include <octomap/OcTree.h>
@@ -853,6 +864,299 @@ void checkMediumMap(std::mt19937& rng) {
            "concurrent queries: thread " + std::to_string(t) + " got different answers");
 }
 
+
+// ---------------------------------------------------------------- check 6..8
+
+using drone_core::planning::ConservativeGrid;
+
+constexpr double kInfD = std::numeric_limits<double>::infinity();
+
+// The cells of `box` whose centres lie in [lo, hi] (octomap's own centres).
+Box cropOf(const OcTree& tree, const Box& box, const Eigen::Vector3d& lo, const Eigen::Vector3d& hi) {
+  Box b;
+  for (int a = 0; a < 3; ++a) {
+    int l = box.lo[a], h = box.lo[a] + box.n[a] - 1;
+    while (l <= h && !(tree.keyToCoord(static_cast<octomap::key_type>(l)) >= lo[a])) ++l;
+    while (h >= l && !(tree.keyToCoord(static_cast<octomap::key_type>(h)) <= hi[a])) --h;
+    if (l > h) return Box{};
+    b.lo[a] = l;
+    b.n[a] = h - l + 1;
+  }
+  return b;
+}
+
+// boxMin/boxMax are the outer corners of `box` (empty: lo > hi on every axis),
+// and a point a hair inside each corner is in the field, a hair outside is not.
+void checkCorners(const DistanceField& df, const Box& box, double res, const std::string& label) {
+  const Eigen::Vector3d lo = df.boxMin(), hi = df.boxMax();
+  if (box.cells() == 0) {
+    expect((lo.array() > hi.array()).all(), label + ": empty field, but boxMin <= boxMax");
+    return;
+  }
+  bool ok = true;
+  for (int a = 0; a < 3; ++a) {
+    ok &= lo[a] == (box.lo[a] - kO) * res;
+    ok &= hi[a] == (box.lo[a] + box.n[a] - kO) * res;
+  }
+  expect(ok, label + ": boxMin/boxMax are not the box's outer corners");
+  const Eigen::Vector3d e = Eigen::Vector3d::Constant(0.01 * res);
+  const auto at = [&](const Eigen::Vector3d& p) {
+    return df.getDistance(point3d(static_cast<float>(p.x()), static_cast<float>(p.y()),
+                                  static_cast<float>(p.z())));
+  };
+  expect(at(lo + e) >= 0.0f && at(hi - e) >= 0.0f, label + ": a point just inside a corner reads -1");
+  expect(at(lo - e) == -1.0f && at(hi + e) == -1.0f, label + ": a point just outside a corner reads >= 0");
+}
+
+void expectEmpty(const DistanceField& df, const point3d& probe, const std::string& label) {
+  expect(df.sizeX() == 0 && df.sizeY() == 0 && df.sizeZ() == 0, label + ": non-empty box");
+  expect(df.getDistance(probe) == -1.0f && df.getDistance(point3d(0, 0, 0)) == -1.0f,
+         label + ": a query read != -1");
+  checkCorners(df, Box{}, 0.05, label);
+}
+
+Scene carvedScene(std::mt19937& rng);
+
+void checkCrop(std::mt19937& rng) {
+  // A random map straddling the origin, and one of solid aligned blocks that
+  // prune into big occupied leaves, which the crops cut through.
+  std::vector<std::pair<Scene, std::string>> scenes;
+  {
+    const int lo[3] = {kO - 15, kO - 11, kO - 7}, n[3] = {30, 24, 20};
+    scenes.emplace_back(randomScene(0.05, lo, n, 0.02, 0.6, rng), "random map");
+  }
+  {
+    Scene s(0.05, kO - 16, kO - 16, kO - 8, 32, 32, 24);
+    s.fill(0, 0, 0, 31, 31, 23, kFree);
+    s.fill(8, 8, 8, 15, 15, 15, kOcc);    // an 8-cell occupied leaf
+    s.fill(16, 0, 0, 19, 3, 3, kOcc);     // 4-cell
+    s.fill(24, 24, 16, 31, 31, 23, kOcc); // 8-cell at the max corner
+    scenes.emplace_back(s, "block map");
+  }
+  scenes.emplace_back(carvedScene(rng), "carved map");  // ragged faces
+  for (const auto& [scene, name] : scenes) {
+    const Built b = build(scene, name, /*brute_force=*/false);
+    const OcTree& tree = *b.tree;
+    const double res = tree.getResolution();
+    const Eigen::Vector3d bmin((b.box.lo[0] - kO) * res, (b.box.lo[1] - kO) * res, (b.box.lo[2] - kO) * res);
+    const Eigen::Vector3d bmax((b.box.lo[0] + b.box.n[0] - kO) * res, (b.box.lo[1] + b.box.n[1] - kO) * res,
+                               (b.box.lo[2] + b.box.n[2] - kO) * res);
+    const double md = 0.4;
+    {
+      const DistanceField plain(tree, md, 4);
+      checkCorners(plain, b.box, res, name + " uncropped");
+      // An infinite crop is the plain constructor, bit for bit.
+      const DistanceField inf(tree, md, 4, Eigen::Vector3d::Constant(-kInfD), Eigen::Vector3d::Constant(kInfD));
+      const std::vector<float> a = allCells(plain, tree, b.box), c = allCells(inf, tree, b.box);
+      expect(inf.sizeX() == plain.sizeX() && inf.sizeY() == plain.sizeY() && inf.sizeZ() == plain.sizeZ() &&
+                 std::memcmp(a.data(), c.data(), a.size() * sizeof(float)) == 0,
+             name + ": an infinite crop differs from no crop");
+    }
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> crops;
+    // Random, not aligned to the grid, some reaching past the map.
+    std::uniform_real_distribution<double> ulo(-0.1, 0.7), ulen(0.15, 0.75);
+    for (int i = 0; i < 6; ++i) {
+      Eigen::Vector3d lo, hi;
+      for (int a = 0; a < 3; ++a) {
+        lo[a] = bmin[a] + ulo(rng) * (bmax[a] - bmin[a]);
+        hi[a] = lo[a] + ulen(rng) * (bmax[a] - bmin[a]);
+      }
+      crops.push_back({lo, hi});
+    }
+    // Bounds exactly on cell centres (inclusive) and through the big blocks.
+    crops.push_back({bmin + Eigen::Vector3d::Constant(10.5 * res), bmin + Eigen::Vector3d::Constant(19.5 * res)});
+    crops.push_back({bmin + Eigen::Vector3d(12 * res, -kInfD, 4 * res), Eigen::Vector3d(kInfD, bmin.y() + 20.2 * res, kInfD)});
+    // Bounds on the centres of the map's own first and second cells (and
+    // last), on each axis.
+    for (int a = 0; a < 3; ++a)
+      for (int off = 0; off <= 1; ++off) {
+        Eigen::Vector3d lo = Eigen::Vector3d::Constant(-kInfD), hi = Eigen::Vector3d::Constant(kInfD);
+        lo[a] = bmin[a] + (off + 0.5) * res;
+        crops.push_back({lo, Eigen::Vector3d::Constant(kInfD)});
+        hi[a] = bmax[a] - (off + 0.5) * res;
+        crops.push_back({Eigen::Vector3d::Constant(-kInfD), hi});
+      }
+    for (const auto& [lo, hi] : crops) {
+      const Box cbox = cropOf(tree, b.box, lo, hi);
+      const std::string label = name + " cropped to [" + std::to_string(lo.x()) + "," +
+                                std::to_string(lo.y()) + "," + std::to_string(lo.z()) + "]..[" +
+                                std::to_string(hi.x()) + "," + std::to_string(hi.y()) + "," +
+                                std::to_string(hi.z()) + "]";
+      expect(cbox.cells() > 0 && cbox.cells() <= b.box.cells(), label + ": empty crop (test setup)");
+      // Ground truth: only the occupied voxels inside the crop count.
+      const std::vector<std::uint8_t> occ = readOccupancy(tree, cbox);
+      const std::vector<std::int64_t> d2 = bruteForceD2(cbox, occ);
+      const DistanceField df(tree, md, 3, lo, hi);
+      checkField(df, tree, cbox, d2, md, label, rng);
+      checkCorners(df, cbox, res, label);
+      const DistanceField one(tree, md, 1, lo, hi);
+      const std::vector<float> a = allCells(df, tree, cbox), c = allCells(one, tree, cbox);
+      expect(std::memcmp(a.data(), c.data(), a.size() * sizeof(float)) == 0,
+             label + ": 1 thread differs from 3");
+    }
+    // Crops that leave nothing: beside the map, between two cell centres,
+    // inverted, NaN.
+    const point3d probe = cellCentre(tree, b.box, b.box.n[0] / 2, b.box.n[1] / 2, b.box.n[2] / 2);
+    const Eigen::Vector3d c(probe.x(), probe.y(), probe.z());
+    const Eigen::Vector3d nan = Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+    int k = 0;
+    for (const auto& [lo, hi] : std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>>{
+             {bmax + Eigen::Vector3d(0.1, -1, -1), bmax + Eigen::Vector3d(1, 1, 1)},
+             {c + Eigen::Vector3d::Constant(0.1 * res), c + Eigen::Vector3d::Constant(0.9 * res)},
+             {c, c - Eigen::Vector3d::Constant(res)},
+             {nan, Eigen::Vector3d::Constant(kInfD)}}) {
+      const DistanceField df(tree, md, 4, lo, hi);
+      expectEmpty(df, probe, name + " empty crop " + std::to_string(k++));
+    }
+  }
+  {
+    OcTree empty(0.05);
+    const DistanceField df(empty, 1.0, 4, Eigen::Vector3d::Constant(-1), Eigen::Vector3d::Constant(1));
+    expectEmpty(df, point3d(0, 0, 0), "empty tree cropped");
+  }
+}
+
+// A scene for the grid: a carved free region inside unknown space (so the
+// shell is big), clutter inside it and stray obstacles outside.
+Scene carvedScene(std::mt19937& rng) {
+  // 80 cells along x, so grid rows span two 64-cell words.
+  Scene s(0.05, kO - 40, kO - 10, kO - 7, 80, 20, 14);
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  for (int z = 0; z < 14; ++z)
+    for (int y = 0; y < 20; ++y)
+      for (int x = 0; x < 80; ++x) {
+        const double d1 = std::hypot(std::hypot(x - 16.0, y - 10.0), z - 7.0);
+        const double d2 = std::hypot(std::hypot(x - 58.0, y - 9.0), z - 6.0);
+        const double tunnel = std::hypot(y - 10.0, z - 7.0) + (x < 16 || x > 58 ? 99 : 0);
+        if (std::min({d1 - 7.0, d2 - 8.0, tunnel - 3.0}) < u(rng) - 0.5)
+          s.at(x, y, z) = u(rng) < 0.02 ? kOcc : kFree;
+        else if (u(rng) < 0.003)
+          s.at(x, y, z) = kOcc;
+      }
+  s.fill(8, 8, 4, 15, 15, 7, kFree);  // an aligned block, so free leaves merge
+  return s;
+}
+
+// `raw` with `grid`'s shell cells stamped occupied, the ball freed, and the
+// grid box's two opposite corners made known (free) if they were not, so the
+// tree's box holds the grid's.
+std::unique_ptr<OcTree> stampedFromGrid(const OcTree& raw, const ConservativeGrid& g) {
+  auto t = std::make_unique<OcTree>(raw);
+  const Box gb = [&] {
+    Box b;
+    b.lo[0] = g.keyX0(); b.lo[1] = g.keyY0(); b.lo[2] = g.keyZ0();
+    b.n[0] = g.sizeX(); b.n[1] = g.sizeY(); b.n[2] = g.sizeZ();
+    return b;
+  }();
+  for (int z = 0; z < gb.n[2]; ++z)
+    for (int y = 0; y < gb.n[1]; ++y)
+      for (int x = 0; x < gb.n[0]; ++x) {
+        const std::uint8_t c = g.data()[gb.index(x, y, z)];
+        const OcTreeKey k = gb.key(x, y, z);
+        if (c == ConservativeGrid::kShell) t->setNodeValue(k, t->getClampingThresMaxLog(), true);
+        else if (c == ConservativeGrid::kFree && !raw.search(k)) t->setNodeValue(k, t->getClampingThresMinLog(), true);
+      }
+  for (const OcTreeKey& k : {gb.key(0, 0, 0), gb.key(gb.n[0] - 1, gb.n[1] - 1, gb.n[2] - 1)})
+    if (!t->search(k)) t->setNodeValue(k, t->getClampingThresMinLog(), true);
+  t->updateInnerOccupancy();
+  return t;
+}
+
+Box gridBox(const ConservativeGrid& g) {
+  Box b;
+  if (g.empty()) return b;
+  b.lo[0] = g.keyX0(); b.lo[1] = g.keyY0(); b.lo[2] = g.keyZ0();
+  b.n[0] = g.sizeX(); b.n[1] = g.sizeY(); b.n[2] = g.sizeZ();
+  return b;
+}
+
+void checkGridField(std::mt19937& rng) {
+  std::vector<std::pair<Scene, std::string>> scenes;
+  scenes.emplace_back(carvedScene(rng), "carved map");
+  {
+    const int lo[3] = {kO - 15, kO - 11, kO - 7}, n[3] = {30, 24, 20};
+    scenes.emplace_back(randomScene(0.05, lo, n, 0.02, 0.6, rng), "random map");  // unknown everywhere
+  }
+  for (const auto& [scene, name] : scenes) {
+    const Built b = build(scene, name, /*brute_force=*/false);
+    const OcTree& raw = *b.tree;
+    const double res = raw.getResolution();
+    const point3d drone = cellCentre(raw, b.box, b.box.n[0] / 3, b.box.n[1] / 2, b.box.n[2] / 2);
+    const double radius = 0.2;
+
+    // The grid's shell is stampUnknownShell's.
+    OcTree stamped(raw);
+    const auto ref = drone_core::planning::stampUnknownShell(stamped, drone, radius);
+    const ConservativeGrid g(raw, drone, radius, Eigen::Vector3d::Constant(-kInfD),
+                             Eigen::Vector3d::Constant(kInfD), true, 4);
+    const Box gb = gridBox(g);
+    {
+      std::size_t mismatch = 0, shell = 0;
+      for (int z = 0; z < gb.n[2]; ++z)
+        for (int y = 0; y < gb.n[1]; ++y)
+          for (int x = 0; x < gb.n[0]; ++x) {
+            const OcTreeKey k = gb.key(x, y, z);
+            const auto* s = stamped.search(k);
+            const bool stamped_shell = !raw.search(k) && s && stamped.isNodeOccupied(s);
+            const bool grid_shell = g.data()[gb.index(x, y, z)] == ConservativeGrid::kShell;
+            mismatch += stamped_shell != grid_shell;
+            shell += grid_shell;
+          }
+      expect(mismatch == 0 && shell == ref.stamped && g.stats().shell == ref.stamped,
+             name + ": the grid's shell differs from stampUnknownShell's in " +
+                 std::to_string(mismatch) + " cells (" + std::to_string(shell) + " vs " +
+                 std::to_string(ref.stamped) + " stamped)");
+      expect(shell > 100, name + ": hardly any shell (test setup)");
+    }
+
+    // Uncropped and cropped grids against the tree constructor on the stamped
+    // equivalent (same crop), and against brute force.
+    const Eigen::Vector3d c(drone.x(), drone.y(), drone.z());
+    const std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> crops = {
+        {Eigen::Vector3d::Constant(-kInfD), Eigen::Vector3d::Constant(kInfD)},
+        {c - Eigen::Vector3d(0.33, 0.21, 0.4), c + Eigen::Vector3d(0.52, 0.17, 0.08)},
+        {c - Eigen::Vector3d(kInfD, 0.1, kInfD), Eigen::Vector3d::Constant(kInfD)},
+    };
+    for (std::size_t ci = 0; ci < crops.size(); ++ci) {
+      const auto& [lo, hi] = crops[ci];
+      const ConservativeGrid cg(raw, drone, radius, lo, hi, true, 4);
+      const Box cb = gridBox(cg);
+      const std::string label = name + " grid, crop " + std::to_string(ci);
+      expect(cb.cells() > 0, label + ": empty grid (test setup)");
+      const std::unique_ptr<OcTree> eq = stampedFromGrid(raw, cg);
+      std::vector<std::uint8_t> occ(cb.cells());
+      for (std::size_t i = 0; i < occ.size(); ++i)
+        occ[i] = ConservativeGrid::isObstacle(static_cast<ConservativeGrid::Cell>(cg.data()[i]));
+      const std::vector<std::int64_t> d2 = bruteForceD2(cb, occ);
+      for (double md : {0.3, 7.0}) {
+        const std::string l = label + " maxdist " + std::to_string(md);
+        const DistanceField fg(cg, md, 4);
+        const DistanceField ft(*eq, md, 4, lo, hi);
+        expect(fg.sizeX() == cb.n[0] && fg.sizeY() == cb.n[1] && fg.sizeZ() == cb.n[2],
+               l + ": the field's box is not the grid's");
+        expect(ft.sizeX() == cb.n[0] && ft.sizeY() == cb.n[1] && ft.sizeZ() == cb.n[2],
+               l + ": the stamped tree's box is not the grid's (test setup)");
+        if (fg.sizeX() != cb.n[0] || ft.sizeX() != cb.n[0]) continue;
+        const std::vector<float> a = allCells(fg, raw, cb), t = allCells(ft, raw, cb);
+        expect(std::memcmp(a.data(), t.data(), a.size() * sizeof(float)) == 0,
+               l + ": differs from the tree constructor on the stamped equivalent");
+        checkField(fg, raw, cb, d2, md, l, rng);
+        checkCorners(fg, cb, res, l);
+        for (unsigned th : {1u, 2u, 8u}) {
+          const DistanceField o(cg, md, th);
+          const std::vector<float> v = allCells(o, raw, cb);
+          expect(std::memcmp(a.data(), v.data(), a.size() * sizeof(float)) == 0,
+                 l + ": " + std::to_string(th) + " threads differ from 4");
+        }
+      }
+    }
+    // An empty grid gives an empty field.
+    const ConservativeGrid eg(raw, drone, radius, c + Eigen::Vector3d(0, 0, 40), c + Eigen::Vector3d(1, 1, 41));
+    expect(eg.empty(), name + ": a crop beside the map gave a non-empty grid (test setup)");
+    expectEmpty(DistanceField(eg, 1.0, 4), drone, name + " empty grid");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -862,6 +1166,8 @@ int main() {
   checkSmallMaps(rng);
   checkMediumMap(rng);
   checkPlatesMap(kPlatesSeed, rng);
+  checkCrop(rng);
+  checkGridField(rng);
 
   // The long maps under several thread counts too (they take the envelope and
   // 32-bit paths, whose work split differs from the windowed pass).

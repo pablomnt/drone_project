@@ -47,7 +47,7 @@
 #include "drone_interfaces/msg/controller_debug.hpp"
 
 #include "drone_core/autonomy/autonomy_core.hpp"
-#include "drone_core/planning/unknown_shell.hpp"
+#include "drone_core/planning/conservative_grid.hpp"
 #include "drone_core/common/frames.hpp"
 #include "drone_core/common/logging.hpp"
 
@@ -74,7 +74,7 @@ constexpr double kPresetMinAirborneZ = 0.8;   // reject a preset fired below thi
 
 
 // RTAB-Map's frontier cloud is no longer used: the shell is computed from the
-// octomap itself (planning::stampUnknownShell, see onOctomap). Kept for
+// octomap itself (planning::ConservativeGrid, see onOctomap). Kept for
 // reference.
 #if 0
 // Burn a frontier point cloud into an OcTree as *occupied* voxels. The frontier
@@ -717,15 +717,15 @@ private:
 
     // Dual-map feed. The raw map is the core's OPTIMISTIC view (unknown reads
     // as free — what the corridor pipeline's geometric search runs on so goals
-    // beyond the frontier are accepted). When frontier treatment is on, a deep
-    // copy with every never-observed voxel bordering free space stamped occupied
-    // becomes the CONSERVATIVE view, used for truncation, corridor growth,
-    // trajectory safety — and, with the corridor QP off, as the legacy single
-    // search map. Read live (map rate is sparse), matching the loop's
-    // live-parameter pattern.
-    std::shared_ptr<octomap::OcTree> conservative;
-    drone_core::planning::UnknownShellStats shell;
-    auto t_copied = t_decoded;
+    // beyond the frontier are accepted). When frontier treatment is on, a
+    // ConservativeGrid over it — cropped to the planning box, the ball around
+    // the drone freed, every never-observed voxel bordering free space marked
+    // shell — becomes the CONSERVATIVE view, used for truncation, corridor
+    // growth, trajectory safety and (corridor QP off) the legacy single obstacle
+    // model. It replaced a stamped deep copy of the octree: the copy and the
+    // one-by-one shell writes grew fastest with the map. Read live (map rate is
+    // sparse), matching the loop's live-parameter pattern.
+    std::shared_ptr<const drone_core::planning::ConservativeGrid> conservative;
     const bool want_frontier = get_parameter("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
     if (want_frontier) {
       // Snapshot the drone position under the lock rather than referencing it: this
@@ -742,11 +742,12 @@ private:
       // stays unconverted, but planning is paused then anyway (the core requires one).
       Eigen::Isometry3d world_from_map;
       if (lookupWorldFromMap(world_from_map)) p = world_from_map.inverse() * p;
-      conservative = std::make_shared<octomap::OcTree>(*map);
-      t_copied = Clock::now();
-      shell = drone_core::planning::stampUnknownShell(
-          *conservative, octomap::point3d(p.x(), p.y(), p.z()),
-          drone_core::planning::GeometricPlanner::frontierKeepOutRadius());
+      Eigen::Vector3d crop_lo, crop_hi;
+      core_->mapCrop(crop_lo, crop_hi);
+      conservative = std::make_shared<const drone_core::planning::ConservativeGrid>(
+          *map, octomap::point3d(p.x(), p.y(), p.z()),
+          drone_core::planning::GeometricPlanner::frontierKeepOutRadius(), crop_lo, crop_hi,
+          /*shell=*/true, /*threads=*/4);
     }
     const auto t_shell = Clock::now();
 
@@ -755,7 +756,11 @@ private:
     got_octomap_ = true;
     core_->setMap(map, conservative);  // builds both distance fields
     const auto t_fields = Clock::now();
-    publishOccupancyMap(conservative ? *conservative : *map);
+    if (conservative) {
+      publishOccupancyMap(*conservative);
+    } else {
+      publishOccupancyMap(*map);
+    }
     const auto t_done = Clock::now();
 
     if (get_parameter("LOG_MAP_TIMING").as_bool()) {
@@ -770,13 +775,14 @@ private:
         std::snprintf(arrival, sizeof(arrival), "first map");
       }
       char shell_note[256];
-      if (want_frontier) {
+      if (conservative) {
+        const auto& st = conservative->stats();
         std::snprintf(shell_note, sizeof(shell_note),
-                      "%.0f ms (copy %.0f, ball %.0f, grid %.0f, sweep %.0f, stamp %.0f ms; "
-                      "%zu stamped, %zu freed around the drone, %zu free leaves)",
-                      ms(t_decoded, t_shell), ms(t_decoded, t_copied), shell.ball_ms,
-                      shell.grid_ms, shell.sweep_ms, shell.stamp_ms, shell.stamped,
-                      shell.ball_freed, shell.free_leaves);
+                      "%.0f ms (fill %.0f, ball %.0f, sweep %.0f ms; %d x %d x %d cells, "
+                      "%zu shell, %zu freed around the drone)",
+                      ms(t_decoded, t_shell), st.fill_ms, st.ball_ms, st.sweep_ms,
+                      conservative->sizeX(), conservative->sizeY(), conservative->sizeZ(),
+                      st.shell, st.ball_freed);
       } else {
         std::snprintf(shell_note, sizeof(shell_note), "off");
       }
@@ -1600,6 +1606,30 @@ private:
   // gated by DEBUG_PLANNER_VIZ — it fires once per octomap
   // update (sparse, motion-gated), not per control tick, so it costs nothing on
   // the flight-critical path.
+  void publishOccupancyMap(const drone_core::planning::ConservativeGrid& grid) {
+    std::vector<Eigen::Vector3d> pts;
+    grid.obstaclesIn(Eigen::Vector3d::Constant(-1e9), Eigen::Vector3d::Constant(1e9), pts);
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.frame_id = kMapFrame;
+    cloud.header.stamp = now();
+    cloud.height = 1;
+    cloud.is_dense = true;
+    cloud.is_bigendian = false;
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2FieldsByString(1, "xyz");
+    mod.resize(pts.size());
+    sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iy(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iz(cloud, "z");
+    for (const auto& p : pts) {
+      *ix = static_cast<float>(p.x());
+      *iy = static_cast<float>(p.y());
+      *iz = static_cast<float>(p.z());
+      ++ix; ++iy; ++iz;
+    }
+    pub_occupancy_map_->publish(cloud);
+  }
+
   void publishOccupancyMap(const octomap::OcTree& map) {
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header.frame_id = kMapFrame;

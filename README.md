@@ -68,8 +68,8 @@ passed in by mistake. If you need a genuine measured acceleration, do not use th
 
 ### `planning/`
 
-- `GeometricPlanner` — a **runtime-selectable** OMPL planner over an SE(3) octree (X/Y ±15 m,
-  Z −1.5–2.5 m). `PlannerType` picks among `RRTstar`, `BITstar`, `ABITstar`, `AITstar`, `EITstar`
+- `GeometricPlanner` — a **runtime-selectable** OMPL planner over an SE(3) octree (X/Y ±30 m,
+  Z −1.5–5 m). `PlannerType` picks among `RRTstar`, `BITstar`, `ABITstar`, `AITstar`, `EITstar`
   (the BIT* lineage is heuristic/informed and concentrates the search on the start→goal corridor
   instead of sampling the whole box, which plain RRT* does); a small `makePlanner()` factory builds
   and configures the chosen one. **Every per-planner tunable lives in `PlannerConfig` in

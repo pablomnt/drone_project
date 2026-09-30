@@ -42,10 +42,28 @@ double steadyNowSeconds() {
 // capped at maxdist (metres). getDistance() then gives O(1) clearance lookups.
 // Points outside the box read negative, which makeClearanceFn turns into "no
 // obstacle within maxdist", matching the planner's treat-unknown-as-free policy.
+// The search box grown by `pad` [m] on every side, MAP frame.
+void searchBoxGrown(double pad, Eigen::Vector3d& lo, Eigen::Vector3d& hi) {
+  for (int i = 0; i < 3; ++i) {
+    lo(i) = planning::GeometricPlanner::kSearchLow[i] - pad;
+    hi(i) = planning::GeometricPlanner::kSearchHigh[i] + pad;
+  }
+}
+
+// Cropped to the search box grown by maxdist plus a voxel: nothing plans outside
+// the box, obstacles just outside it still count, and map beyond costs nothing.
+// 4 threads: nearly as fast as all 8 on the NUC, leaving room for VIO and SLAM.
 std::shared_ptr<const planning::DistanceField> buildEdt(
     const std::shared_ptr<octomap::OcTree>& tree, double maxdist) {
-  // 4 threads: nearly as fast as all 8 on the NUC, leaving room for VIO and SLAM.
-  return std::make_shared<const planning::DistanceField>(*tree, maxdist, /*threads=*/4);
+  Eigen::Vector3d lo, hi;
+  searchBoxGrown(maxdist + tree->getResolution(), lo, hi);
+  return std::make_shared<const planning::DistanceField>(*tree, maxdist, /*threads=*/4, lo, hi);
+}
+
+// The conservative grid is already cropped by the host (AutonomyCore::mapCrop).
+std::shared_ptr<const planning::DistanceField> buildEdt(const ConsGridHandle& grid,
+                                                        double maxdist) {
+  return std::make_shared<const planning::DistanceField>(*grid, maxdist, /*threads=*/4);
 }
 
 // Wrap a distance field as a clearance oracle. The planner's objective, the
@@ -119,6 +137,18 @@ planning::CorridorUnknownFn makeUnknownFn(planning::MapHandle map) {
     return map->search(octomap::point3d(static_cast<float>(x), static_cast<float>(y),
                                         static_cast<float>(z))) == nullptr;
   };
+}
+
+// "Never observed" for truncation and the trajectory monitor: from the
+// conservative grid when there is one (the ball around the drone free; shell,
+// unobserved cells and anything outside the grid unknown), so it agrees with the
+// corridor, whose obstacles come from the same grid; else from the raw octree.
+planning::CorridorUnknownFn makeUnknownFn(const planning::MapHandle& map,
+                                          const ConsGridHandle& grid) {
+  if (grid) {
+    return [grid](double x, double y, double z) { return grid->isUnknown(x, y, z); };
+  }
+  return makeUnknownFn(map);
 }
 
 // Remaining committed path from the drone's current position. Splits the committed
@@ -200,8 +230,7 @@ void AutonomyCore::setVehicleState(const common::State& state) {
   state_ = state;
 }
 
-void AutonomyCore::setMap(const planning::MapHandle& map,
-                          const planning::MapHandle& conservative) {
+void AutonomyCore::setMap(const planning::MapHandle& map, const ConsGridHandle& conservative) {
   // Fields first, map second: once a planner can see this map, the field built
   // from it is already installed, so no planner tick ever has to build one.
   prebuildFields(map, conservative);
@@ -215,19 +244,21 @@ namespace {
 // Whether `map` is one of the maps a cached field has been superseded for.
 // Owner comparison, so an expired entry never matches and a freed map's address
 // being reused by a new map cannot either.
-bool wasSuperseded(const std::vector<std::weak_ptr<octomap::OcTree>>& history,
-                   const planning::MapHandle& map) {
+template <class T>
+bool wasSuperseded(const std::vector<std::weak_ptr<T>>& history,
+                   const std::shared_ptr<T>& map) {
   for (const auto& w : history) {
     if (!w.owner_before(map) && !map.owner_before(w)) return true;
   }
   return false;
 }
 
-void pushSuperseded(std::vector<std::weak_ptr<octomap::OcTree>>& history,
-                    const planning::MapHandle& old_source, std::size_t cap) {
+template <class T>
+void pushSuperseded(std::vector<std::weak_ptr<T>>& history,
+                    const std::shared_ptr<T>& old_source, std::size_t cap) {
   if (!old_source) return;
   history.erase(std::remove_if(history.begin(), history.end(),
-                               [](const std::weak_ptr<octomap::OcTree>& w) { return w.expired(); }),
+                               [](const std::weak_ptr<T>& w) { return w.expired(); }),
                 history.end());
   history.push_back(old_source);
   if (history.size() > cap) history.erase(history.begin());
@@ -236,7 +267,7 @@ void pushSuperseded(std::vector<std::weak_ptr<octomap::OcTree>>& history,
 }  // namespace
 
 void AutonomyCore::prebuildFields(const planning::MapHandle& map,
-                                  const planning::MapHandle& conservative) {
+                                  const ConsGridHandle& conservative) {
   // The same saturation distances the planners will ask for (clearanceField from
   // the search, conservativeField from truncation/corridor and the search's cost).
   // Read from the newest config; a thread still on an older copy for a tick just
@@ -265,25 +296,35 @@ void AutonomyCore::prebuildFields(const planning::MapHandle& map,
       viz_sampled_map_.reset();  // debug clearance samples are of the old field
     }
   }
-  // Only a DISTINCT conservative view needs its own field; when it is the same
-  // object (no frontier information) conservativeField hands back the search one.
-  if (conservative && conservative != map && conservative->size() > 0) {
+  // Only a conservative grid needs its own field; without one (no frontier
+  // information) conservativeField hands back the search one.
+  if (conservative && !conservative->empty()) {
     bool have = false;
     {
       std::lock_guard<std::mutex> lock(edt_mutex_);
-      have = cons_edt_ && cons_edt_source_map_ == conservative && cons_edt_maxdist_ == cons_md;
+      have = cons_edt_ && cons_edt_source_grid_ == conservative && cons_edt_maxdist_ == cons_md;
     }
     if (!have) {
       auto field = buildEdt(conservative, cons_md);
       std::lock_guard<std::mutex> lock(edt_mutex_);
-      if (cons_edt_source_map_ != conservative) {
-        pushSuperseded(cons_edt_superseded_, cons_edt_source_map_, kSupersededHistory);
+      if (cons_edt_source_grid_ != conservative) {
+        pushSuperseded(cons_grid_superseded_, cons_edt_source_grid_, kSupersededHistory);
       }
       cons_edt_ = std::move(field);
-      cons_edt_source_map_ = conservative;
+      cons_edt_source_grid_ = conservative;
+      cons_edt_source_map_.reset();
       cons_edt_maxdist_ = cons_md;
     }
   }
+}
+
+void AutonomyCore::mapCrop(Eigen::Vector3d& lo, Eigen::Vector3d& hi) const {
+  double pad = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    pad = std::max(pending_config_.clearance_threshold, pending_config_.frontier_margin);
+  }
+  searchBoxGrown(pad + 0.1, lo, hi);  // + a voxel or two at any resolution we use
 }
 
 void AutonomyCore::setMapToWorld(const Eigen::Isometry3d& world_from_map) {
@@ -515,7 +556,7 @@ void AutonomyCore::setVizSampledMap(const planning::MapHandle& map) {
 bool AutonomyCore::planOnce() {
   common::State state;
   planning::MapHandle map;
-  planning::MapHandle conservative;
+  ConsGridHandle conservative;
   common::Goal goal;
   bool has_goal = false;
   Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
@@ -558,14 +599,14 @@ bool AutonomyCore::planOnce() {
   }
 
   common::Trajectory traj;
-  const planning::MapHandle cons = conservative ? conservative : map;
   // Truncation stops at unobserved space only when the operator asked for it.
-  // The predicate reads the stamped view — see the worker's copy of this.
+  // The predicate reads the conservative grid — see the worker's copy of this.
   TrajgenInfo info;
   if (!runTrajgen(path, anchor.t0, anchor.start,
-                  conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin)),
-                  cons,
-                  cfg_.treat_unknown_as_hazard ? makeUnknownFn(cons)
+                  conservativeField(map, conservative,
+                                    std::max(cfg_.clearance_threshold, cfg_.frontier_margin)),
+                  map, conservative,
+                  cfg_.treat_unknown_as_hazard ? makeUnknownFn(map, conservative)
                                                : planning::CorridorUnknownFn{},
                   traj, /*pin_waypoints=*/false, /*root_shift=*/-1.0, &info))
     return false;
@@ -626,21 +667,17 @@ std::vector<std::array<double, 4>> AutonomyCore::sampleClearanceField(double max
   // exists as a distinct view, and the search field otherwise. Both are current
   // for this tick: applyClearanceObjective runs before this and populates them.
   std::shared_ptr<const planning::DistanceField> field;
-  planning::MapHandle source;
   {
     // Pick the field up under the lock, then sample outside it: the walk is slow
     // and the other planner thread must not wait on it.
     std::lock_guard<std::mutex> lock(edt_mutex_);
-    const bool use_cons = cons_edt_ && cons_edt_source_map_ &&
-                          cons_edt_source_map_ != edt_source_map_;
-    field = use_cons ? cons_edt_ : edt_;
-    source = use_cons ? cons_edt_source_map_ : edt_source_map_;
+    field = (cons_edt_ && cons_edt_source_grid_) ? cons_edt_ : edt_;
   }
-  if (!field || !source) return out;
+  if (!field) return out;
 
-  double xmin, ymin, zmin, xmax, ymax, zmax;
-  source->getMetricMin(xmin, ymin, zmin);
-  source->getMetricMax(xmax, ymax, zmax);
+  const Eigen::Vector3d box_lo = field->boxMin(), box_hi = field->boxMax();
+  const double xmin = box_lo.x(), ymin = box_lo.y(), zmin = box_lo.z();
+  const double xmax = box_hi.x(), ymax = box_hi.y(), zmax = box_hi.z();
 
   constexpr double step = 0.15;  // grid spacing [m] — coarse, debug-only
   const double maxd = maxdist;
@@ -673,7 +710,7 @@ bool AutonomyCore::runGlobalPlan(const common::State& state, const common::Goal&
 bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                               const common::MotionState& start,
                               const std::shared_ptr<const planning::DistanceField>& cons_edt,
-                              const planning::MapHandle& cons_map,
+                              const planning::MapHandle& map, const ConsGridHandle& cons_grid,
                               const planning::CorridorUnknownFn& unknown_fn,
                               common::Trajectory& traj, bool pin_waypoints,
                               double root_shift, TrajgenInfo* info) {
@@ -682,7 +719,8 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
   if (info) *info = TrajgenInfo{};
   if (path.size() < 2) return false;
 
-  if (cfg_.use_corridor_qp && cons_edt && cons_map) {
+  if (cfg_.use_corridor_qp && cons_edt && map) {
+    const double res = cons_grid ? cons_grid->resolution() : map->getResolution();
     const double t_corridor = now();
     // Corridor pipeline: truncate the (possibly optimistic) path to the prefix
     // that is safely inside known-free space, grow one free box per resampled
@@ -716,7 +754,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     params.bridge_joints = !pin_waypoints;
     // Obstacle points are voxel centres; the corridor must clear the voxel's
     // worst-case corner, so tell it the map's half-diagonal.
-    params.voxel_half_diagonal = cons_map->getResolution() * std::sqrt(3.0) / 2.0;
+    params.voxel_half_diagonal = res * std::sqrt(3.0) / 2.0;
 
     // Truncation enforces the configured frontier margin (less kTruncationTolerance) — it is NOT
     // floored by the corridor margin, so FRONTIER_MARGIN means what it says and
@@ -733,7 +771,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     const auto committed =
         planning::truncatePath(cons_fn, epath, trunc_margin, cfg_.escape_ramp_dist,
                                /*sample_step=*/0.05, unknown_fn, &cut,
-                               /*start_floor_slack=*/cons_map->getResolution(),
+                               /*start_floor_slack=*/res,
                                /*start_floor_rel=*/kTruncationTolerance);
 
     // Why truncation stopped, for both log lines below. The escape ramp is
@@ -848,8 +886,9 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
                      << " m — " << describeCut());
     }
 
-    // Obstacle points for the decomposition: occupied leaves of the
-    // conservative map (real obstacles AND stamped frontier) within a window
+    // Obstacle points for the decomposition: the conservative grid's occupied
+    // and shell cells (real obstacles AND unobserved space; the raw map's
+    // occupied leaves when there is no grid) within a window
     // around the committed prefix. Windowed on purpose — a whole room at 5 cm
     // is 1e5-1e6 voxels and DecompUtil scans the list per segment, which would
     // never fit the 1 Hz trajgen budget. The window is the prefix's AABB grown
@@ -866,15 +905,18 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       const double pad = planning::corridorObstacleWindowPad(params);
       lo.array() -= pad;
       hi.array() += pad;
-      const double res = cons_map->getResolution();
       std::vector<Eigen::Vector3d> pts;
+      if (cons_grid) {  // occupied + shell cells: real obstacles and unobserved space
+        cons_grid->obstaclesIn(lo, hi, pts);
+        return pts;
+      }
       const octomap::point3d bmin(static_cast<float>(lo.x()), static_cast<float>(lo.y()),
                                   static_cast<float>(lo.z()));
       const octomap::point3d bmax(static_cast<float>(hi.x()), static_cast<float>(hi.y()),
                                   static_cast<float>(hi.z()));
-      for (auto it = cons_map->begin_leafs_bbx(bmin, bmax), end = cons_map->end_leafs_bbx();
+      for (auto it = map->begin_leafs_bbx(bmin, bmax), end = map->end_leafs_bbx();
            it != end; ++it) {
-        if (!cons_map->isNodeOccupied(*it)) continue;
+        if (!map->isNodeOccupied(*it)) continue;
         const double size = it.getSize();
         const octomap::point3d c = it.getCoordinate();
         if (size <= res * 1.5) {
@@ -1054,7 +1096,7 @@ void AutonomyCore::stagePending(const common::Trajectory& traj) {
 
 void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d& world_from_map,
                              const planning::MapHandle& map,
-                             const planning::MapHandle& conservative,
+                             const ConsGridHandle& conservative,
                              const std::vector<Eigen::Vector3d>& waypoints) {
   if (waypoints.size() < 2) {
     DRONE_LOG_INFO("[preset] ignored: need at least two waypoints, got " << waypoints.size());
@@ -1089,17 +1131,17 @@ void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d
     last_geometric_path_ = path;
   }
 
-  const planning::MapHandle cons = conservative ? conservative : map;
   common::Trajectory traj;
   // Pin the waypoints. For a preset the shape IS the test — with the junctions
   // free the QP is pinned only at the two ends and takes the cheapest route the
   // corridor allows, which for a closed square (last waypoint == first) is
   // barely moving at all. Planning deliberately leaves them free; see runTrajgen.
   const bool ok = runTrajgen(path, anchor.t0, anchor.start,
-                             conservativeField(cons, std::max(cfg_.clearance_threshold,
-                                                              cfg_.frontier_margin)),
-                             cons,
-                             cfg_.treat_unknown_as_hazard ? makeUnknownFn(cons)
+                             conservativeField(map, conservative,
+                                               std::max(cfg_.clearance_threshold,
+                                                        cfg_.frontier_margin)),
+                             map, conservative,
+                             cfg_.treat_unknown_as_hazard ? makeUnknownFn(map, conservative)
                                                           : planning::CorridorUnknownFn{},
                              traj, /*pin_waypoints=*/true);
   if (!ok) {
@@ -1230,18 +1272,40 @@ std::shared_ptr<const planning::DistanceField> AutonomyCore::clearanceField(
 }
 
 std::shared_ptr<const planning::DistanceField> AutonomyCore::conservativeField(
-    const planning::MapHandle& map, double maxdist) {
+    const planning::MapHandle& map, const ConsGridHandle& grid, double maxdist) {
   std::lock_guard<std::mutex> lock(edt_mutex_);
+  if (grid && !grid->empty()) {
+    // Same prebuilt / superseded / fallback logic as clearanceField, keyed on
+    // the grid.
+    if (cons_edt_ && maxdist == cons_edt_maxdist_ &&
+        (grid == cons_edt_source_grid_ || wasSuperseded(cons_grid_superseded_, grid))) {
+      return cons_edt_;
+    }
+    const ConsGridHandle target =
+        (cons_edt_source_grid_ && wasSuperseded(cons_grid_superseded_, grid)) ? cons_edt_source_grid_
+                                                                               : grid;
+    planner_field_builds_.fetch_add(1);
+    auto field = buildEdt(target, maxdist);
+    if (target != cons_edt_source_grid_) {
+      pushSuperseded(cons_grid_superseded_, cons_edt_source_grid_, kSupersededHistory);
+    }
+    cons_edt_ = std::move(field);
+    cons_edt_source_grid_ = target;
+    cons_edt_source_map_.reset();
+    cons_edt_maxdist_ = maxdist;
+    return cons_edt_;
+  }
   if (!map || map->size() == 0) {
     cons_edt_.reset();
     cons_edt_source_map_.reset();
+    cons_edt_source_grid_.reset();
     cons_edt_superseded_.clear();
+    cons_grid_superseded_.clear();
     return nullptr;
   }
-  // No frontier information => the conservative view IS the search map; reuse
-  // its field rather than building a second identical EDT.
+  // No conservative grid => the conservative view IS the search map; reuse its
+  // field rather than building a second identical one.
   if (edt_ && (map == edt_source_map_ || wasSuperseded(edt_superseded_, map))) return edt_;
-  // Same prebuilt / superseded / fallback logic as clearanceField.
   if (cons_edt_ && maxdist == cons_edt_maxdist_ &&
       (map == cons_edt_source_map_ || wasSuperseded(cons_edt_superseded_, map))) {
     return cons_edt_;
@@ -1256,15 +1320,22 @@ std::shared_ptr<const planning::DistanceField> AutonomyCore::conservativeField(
   }
   cons_edt_ = std::move(field);
   cons_edt_source_map_ = target;
+  cons_edt_source_grid_.reset();
   cons_edt_maxdist_ = maxdist;
   return cons_edt_;
 }
 
 bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
                                            const planning::MapHandle& map,
-                                           const planning::MapHandle& cons) {
+                                           const ConsGridHandle& cons) {
   auto edt = clearanceField(map, search_cfg_.clearance_threshold);
   if (!edt) return false;
+  const double cons_md = std::max(search_cfg_.clearance_threshold, search_cfg_.frontier_margin);
+  // Legacy mode (corridor QP off): the conservative field, when there is one, is
+  // the single obstacle model, collision check included.
+  if (!search_cfg_.use_corridor_qp && cons) {
+    if (auto cons_edt = conservativeField(map, cons, cons_md)) edt = cons_edt;
+  }
   // The search map's field drives the collision check (clearance > margin). It
   // has to be this view and not the conservative one, because the conservative
   // view stamps the frontier as occupied and a validity check against that
@@ -1281,20 +1352,18 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   // to the frontier. Scoring both against the same field aligns them, and the
   // prefix that survives truncation gets longer as a result.
   //
-  // The frontier is stamped as a thin shell of known-free voxels bordering
-  // unknown space, not as the whole unknown volume, so this field is
+  // The shell is the never-observed voxels bordering free space, not the whole
+  // unknown volume, so this field is
   // min(distance to a real obstacle, distance to that shell). It is therefore a
   // strict refinement of the optimistic field: identical wherever the shell is
   // not the nearest source, and additionally repulsive near the shell. Nothing
   // about real-obstacle avoidance is lost by scoring against it.
   //
-  // Skipped when the two views are the same object, which is the case with
-  // frontier stamping off and in the legacy non-corridor mode where the search
-  // already runs on the conservative view. There the override would be a no-op
-  // at best, and calling conservativeField would just hand back the same field.
-  if (cons && cons != map) {
-    if (auto cons_edt = conservativeField(
-            cons, std::max(search_cfg_.clearance_threshold, search_cfg_.frontier_margin))) {
+  // Skipped with no conservative grid (frontier treatment off), and in the legacy
+  // non-corridor mode, where the conservative field already is the validity
+  // field above.
+  if (cons && search_cfg_.use_corridor_qp) {
+    if (auto cons_edt = conservativeField(map, cons, cons_md)) {
       planner.setCostClearance(makeClearanceFn(cons_edt, search_cfg_.clearance_threshold));
     }
   }
@@ -1339,7 +1408,7 @@ void AutonomyCore::searchLoop() {
 
     common::State state;
     planning::MapHandle map;
-    planning::MapHandle conservative;
+    ConsGridHandle conservative;
     common::Goal goal;
     bool has_goal = false;
     bool new_goal = false;
@@ -1447,10 +1516,9 @@ void AutonomyCore::searchLoop() {
       // the mapped frontier instead of refusing it ("no goal states
       // available"); safety against unknown space is enforced downstream by
       // truncation + corridor, not by the search. Without corridor mode the
-      // legacy single-map behavior is preserved: the conservative
-      // (frontier-stamped) view, when present, is the one obstacle model.
-      const planning::MapHandle search_map =
-          (!search_cfg_.use_corridor_qp && conservative) ? conservative : map;
+      // legacy single-map behavior is preserved: the conservative field, when
+      // there is one, is the one obstacle model (applyClearanceObjective).
+      const planning::MapHandle search_map = map;
 
       // One planner per tick. Set the clearance fields FIRST, so the
       // committed-path re-check below sees the same obstacle model the search
@@ -1713,7 +1781,7 @@ void AutonomyCore::trajgenLoop() {
   while (running_.load()) {
     common::State state;
     planning::MapHandle map;
-    planning::MapHandle conservative;
+    ConsGridHandle conservative;
     bool preset_pending = false;
     std::vector<Eigen::Vector3d> preset_waypoints;
     // One snapshot per solve, used both to bring the state into the map frame and
@@ -1861,12 +1929,11 @@ void AutonomyCore::trajgenLoop() {
       // has been marked free and the shell occupied, so "never observed" means
       // the same thing to truncation, the monitor and the corridor (whose
       // obstacles come from the same view).
-      const planning::MapHandle cons = conservative ? conservative : map;
       const double t_field = now();
-      const auto cons_field =
-          conservativeField(cons, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
+      const auto cons_field = conservativeField(
+          map, conservative, std::max(cfg_.clearance_threshold, cfg_.frontier_margin));
       const double field_time = now() - t_field;
-      const auto unknown_fn = cfg_.treat_unknown_as_hazard ? makeUnknownFn(cons)
+      const auto unknown_fn = cfg_.treat_unknown_as_hazard ? makeUnknownFn(map, conservative)
                                                            : planning::CorridorUnknownFn{};
       const double factors_with_stub[] = {1.5, 2.25, 3.4};
       const int tries = stub_ideal > 0.0 ? 3 : 1;
@@ -1874,7 +1941,7 @@ void AutonomyCore::trajgenLoop() {
         const double factor = stub_ideal > 0.0 ? factors_with_stub[k] : 0.0;
         trajgen_stub_len_ = factor * stub_ideal;
         result.ok = runTrajgen(pathWithStub(factor), result.anchor.t0, result.anchor.start,
-                               cons_field, cons, unknown_fn, result.traj,
+                               cons_field, map, conservative, unknown_fn, result.traj,
                                /*pin_waypoints=*/false, root_shift, &result.info);
         if (stub_ideal > 0.0) {
           stub_note.str("");
@@ -2000,7 +2067,7 @@ void AutonomyCore::monitorLoop() {
     }
 
     planning::MapHandle map;
-    planning::MapHandle conservative;
+    ConsGridHandle conservative;
     Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
     {
       std::lock_guard<std::mutex> lock(io_mutex_);
@@ -2028,16 +2095,16 @@ void AutonomyCore::monitorLoop() {
     }
     std::uint64_t version = 0;
     const std::vector<std::vector<double>> path = committedPath(&version);
-    const planning::MapHandle cons = conservative ? conservative : map;
     const double maxd = std::max(c.clearance_threshold, c.frontier_margin);
     const Eigen::Isometry3d map_from_world = world_from_map.inverse();
     const bool corridor = c.use_corridor_qp;
-    const auto field = corridor ? conservativeField(cons, maxd) : nullptr;
+    const auto field = corridor ? conservativeField(map, conservative, maxd) : nullptr;
     const planning::CorridorClearanceFn clearance =
         field ? makeClearanceFn(field, maxd) : planning::CorridorClearanceFn{};
     // Read from the stamped view, like truncation's (see the solver).
     const planning::CorridorUnknownFn unknown =
-        c.treat_unknown_as_hazard ? makeUnknownFn(cons) : planning::CorridorUnknownFn{};
+        c.treat_unknown_as_hazard ? makeUnknownFn(map, conservative)
+                                  : planning::CorridorUnknownFn{};
 
     Needs needs;
     bool emergency = false;
@@ -2059,7 +2126,7 @@ void AutonomyCore::monitorLoop() {
           const double until = last ? 0.0 : recs[i + 1].traj.t0;
           if (!last && until <= t) continue;
           auto p = checkParams(c, recs[i].start_margin, recs[i].first_segment_end,
-                               cons->getResolution());
+                               map->getResolution());
           p.emergency_horizon =
               std::max(0.0, c.emergency_horizon - std::max(0.0, recs[i].traj.t0 - t));
           const auto check = planning::checkTrajectory(clearance, unknown, recs[i].traj,
@@ -2097,7 +2164,7 @@ void AutonomyCore::monitorLoop() {
         }
         const auto committed = planning::truncatePath(
             clearance, epath, c.frontier_margin * (1.0 - kTruncationTolerance), c.escape_ramp_dist,
-            0.05, unknown, nullptr, cons->getResolution(), kTruncationTolerance);
+            0.05, unknown, nullptr, map->getResolution(), kTruncationTolerance);
         if (committed.size() >= 2) {
           constexpr double kMinAdvance = 0.05;  // below this it is noise, not progress [m]
           trunc_arc_now = arcLengthAlong(path, committed.back());
@@ -2138,7 +2205,7 @@ void AutonomyCore::monitorLoop() {
             checkParams(c, r.info.start_margin,
                         r.traj.t0 + (r.traj.segment_times.empty() ? 0.0
                                                                   : r.traj.segment_times.front()),
-                        cons->getResolution()));
+                        map->getResolution()));
         if (!check.ok) {
           std::ostringstream os;
           os << "not safe on the current map ("
