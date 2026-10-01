@@ -22,7 +22,7 @@ std::optional<Eigen::Vector3d> findExitPoint(const std::vector<Eigen::Vector3d>&
 }
 
 std::vector<Viewpoint> viewpointCandidates(const Eigen::Vector3d& exit,
-                                           const Eigen::Vector3d& drone,
+                                           const Eigen::Vector3d& anchor,
                                            const PointTest& valid,
                                            const PointTest& see_through,
                                            const ViewpointParams& p) {
@@ -59,7 +59,7 @@ std::vector<Viewpoint> viewpointCandidates(const Eigen::Vector3d& exit,
         Viewpoint v;
         v.pos = pos;
         v.yaw = std::atan2(exit.y() - pos.y(), exit.x() - pos.x());
-        v.score = std::abs(dist - p.distance) + p.drone_weight * (pos - drone).norm();
+        v.score = std::abs(dist - p.distance) + p.anchor_weight * (pos - anchor).norm();
         out.push_back(v);
       }
     }

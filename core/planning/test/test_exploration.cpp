@@ -61,8 +61,8 @@ int main() {
       expect(!blocked, "a viewpoint's sight line crosses the wall");
     }
     if (!vps.empty()) {
-      expect(std::abs((exit - vps.front().pos).norm() - 3.0) < 0.01,
-             "the best viewpoint is not at the ideal 3 m");
+      expect(std::abs((exit - vps.front().pos).norm() - 2.5) < 0.01,
+             "the best viewpoint is not at the ideal 2.5 m");
       for (std::size_t i = 1; i < vps.size(); ++i) {
         expect(vps[i - 1].score <= vps[i].score, "viewpoints not sorted best first");
       }

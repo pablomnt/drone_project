@@ -111,6 +111,12 @@ int main() {
   check(v.exit.x() > 2.7 && v.exit.x() < 3.3, "exit point not at the east face (x " +
                                                   std::to_string(v.exit.x()) + ")");
   check(std::isfinite(v.target_yaw), "the viewpoint has no end heading");
+  // What /planner/mission draws: the path to the viewpoint ending there, the
+  // optimistic path the exit point came from, and the best-effort known point.
+  check(v.path.size() >= 2 && (v.path.back() - v.target).norm() < 1e-6,
+        "the view has no path ending at the viewpoint");
+  check(v.optimistic_path.size() >= 2, "the view has no optimistic path while uncovering");
+  check(v.has_best_known && v.best_known.x() > 1.0, "the view lost the best-effort known point");
   if (std::isfinite(v.target_yaw)) {
     const double facing = std::atan2(v.exit.y() - v.target.y(), v.exit.x() - v.target.x());
     check(std::abs(std::remainder(v.target_yaw - facing, 2.0 * M_PI)) < 1e-6,
@@ -132,6 +138,33 @@ int main() {
   check(waitFor([&] { return core.missionView().mode == Mode::kDone; }, 3.0), "not DONE at the goal");
 
   core.stopPlanner();
+
+  // 5. A new goal from a standstill, 90 deg to the left, with trajectories on:
+  //    TURN first (a hold-in-place trajectory facing the goal), ADVANCE only
+  //    after the turn (pi/2 at 0.8 rad/s, ~2 s) plus the 1 s wait.
+  {
+    autonomy::AutonomyCore::Config tcfg = cfg;
+    tcfg.plan_trajectory = true;
+    autonomy::AutonomyCore turner(tcfg);
+    setRoom(turner, -1.0, 3.0, start);
+    turner.setVehicleState(at(start));  // yaw 0: facing +x
+    common::Goal left;
+    left.pos = start + Eigen::Vector3d(0.0, 4.0, 0.0);
+    turner.setGoal(left);
+    const auto t_goal = std::chrono::steady_clock::now();
+    turner.startPlanner();
+    check(waitFor([&] { return turner.missionView().mode == Mode::kTurn; }, 1.0),
+          "no TURN for a goal off to the side");
+    check(turner.stagedTrajectoryCount() == 1, "TURN staged no hold trajectory");
+    check(waitFor([&] { return turner.missionView().mode == Mode::kAdvance; }, 5.0),
+          "no ADVANCE after the TURN");
+    const double waited =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_goal).count();
+    check(waited > 2.8, "ADVANCE before the turn and the wait were over (" +
+                            std::to_string(waited) + " s)");
+    turner.stopPlanner();
+  }
+
   if (g_failures == 0) {
     std::cout << "exploration_mission: all checks passed\n";
     return 0;

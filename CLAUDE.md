@@ -324,6 +324,15 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   the corridor — on top of the 0.5 m from mapped obstacles), so truncation should almost never cut.
   Phases (logged as `[mission] …`, plus a status line every 5 s; drawn on `/planner/mission`: green
   sphere = target, yellow = exit point, green arrow = heading to arrive with):
+  - **TURN** (only for a goal received at a standstill, with `PLAN_TRAJECTORY` on) — turn to face the
+    goal horizontally, then wait 1 s, before any planning, so the camera has mapped that way first. A
+    0.1 s hold-in-place trajectory with `end_yaw` set does the turn (the flatness mapper turns at
+    0.8 rad/s and holds the heading after the end); the phase lasts turn angle / 0.8 + 1 s. The
+    monitor knows nothing of that trajectory, so `stepControl` keeps it fresh while it is the latest
+    staged one and the search thread keeps renewing a 1 s deadline (`turn_hold_active_` /
+    `turn_fresh_until_`): a dead search thread still ends in hover-hold. A goal change mid-flight skips
+    it. On the transfer tester the simulated vehicle's yaw never changes, so the turn angle is computed
+    from its starting yaw every time.
   - **ADVANCE** — head for the reachable known point nearest the goal: a conservative **RRT\*** best-
     effort search to the goal, with the goal point itself exempt so nothing can connect to it through
     unknown space and the approximate solution ends at the nearest reachable point. RRT\* because
@@ -331,10 +340,14 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
     the result is random-ish, which the re-check every `RETARGET_PERIOD` (3 s) absorbs: a new
     target is taken only if `retarget_min_gain` (0.3 m) closer to the goal.
   - On arriving (`arrive_dist` 0.3 m, measured position) with nothing closer: **UNCOVER** — an
-    **optimistic** EIT\* search to the goal, the first point of it in unknown space is the exit point
-    (`planning::findExitPoint`), and `planning::viewpointCandidates` picks spots `VIEW_DISTANCE`
-    (3 m, 1.5–4 m) from it, conservative-valid, with a clear line of sight (no mapped obstacle) and
-    within 20° of level; the first of the best four the strict search reaches is flown to, ending
+    **optimistic** EIT\* search to the goal **from the best-effort known point** (not from the drone:
+    run from a viewpoint across the room it found the frontier around that viewpoint, and the drone
+    wandered away from the goal), the first point of it in unknown space is the exit point
+    (`planning::findExitPoint`), and `planning::viewpointCandidates` picks spots about
+    `VIEW_DISTANCE` (2.5 m, 1.5–4 m) from it, conservative-valid, with a clear line of sight (no
+    mapped obstacle) and within 20° of level, scored `|d − 2.5| + 0.5 × distance from the best-effort
+    known point` (it used to prefer exactly 3 m first, and flew 3 m back across the room for it); the
+    first of the best four the strict search reaches is flown to, ending
     **facing the exit point** (`Trajectory::end_yaw`, see the flatness mapper). After `view_dwell`
     (1.5 s) there, a closer known point means ADVANCE again; otherwise the next exit, the ones already
     looked at excluded from the optimistic search (`setExclusions`, 1 m).
@@ -344,10 +357,28 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
     re-checked on the current map (EIT\*, conservative) and replanned to the same target if blocked
     (or a new target chosen if the target itself became unreachable); every `RRT_IMPROVE_PERIOD` a
     cheaper path to the same target is adopted by `REPLAN_IMPROVE_RATIO`.
+  **Arrival** is the measured position within `arrive_dist` (0.3 m) of the target, **or** the
+  trajectory built for the current path having run out with the drone at its end and that end within
+  `arrive_short_dist` (1 m) of the target: the corridor pulls a path's end back when the end point
+  falls outside its shrunk last region (often at viewpoints, which sit right at the margins), and the
+  drone would otherwise wait forever 0.5–0.7 m short. Ending further short than that drops the target
+  and picks a new one. (2026-10-01; no unit test — the mission test runs without trajgen.)
+  **A target is given up** when it stops being reachable (the monitor's replan fails), when the
+  trajectory to it ends more than `arrive_short_dist` short, or when two NEW_PLAN / OBSTACLE_EVASION
+  solves in a row fail on the path to it (`trajgenFailures`, counted by the solver per committed-path
+  version: the corridor cannot be built along a path through a two-sided squeeze, which the search's
+  point clearance does not rule out). Given-up ADVANCE targets are avoided by the RRT\* search (0.5 m,
+  `setExclusions`), and dropping one forgets its distance to the goal (`best_gap`) — keeping it made
+  ADVANCE refuse anything not 0.3 m closer than an unreachable point and jump to UNCOVER.
   **On the bench, arrival is the measured position**, so a drone that does not move never leaves
-  its first ADVANCE target. Covered by `ctest -R exploration` (exit point / viewpoints) and
+  its first ADVANCE target. With `BENCH_TEST_TRANSFER_TESTER` the simulated vehicle is the one
+  flown; since 2026-10-01 it starts where the real drone is (it used to start at `POS_SP`, in unknown
+  space above the camera, and the mission went straight to NO EXITS). The keep-out stays on the real
+  drone, and the simulated one only sees what the real camera sees. NO EXITS retries from ADVANCE
+  every 10 s with the tried exits forgotten. Covered by `ctest -R exploration` (exit point / viewpoints) and
   `ctest -R exploration_mission` (threaded end to end on synthetic rooms: ADVANCE to the edge,
-  UNCOVER facing the exit, ADVANCE to the goal once revealed, DONE; ~3 s; mutation-checked).
+  UNCOVER facing the exit, ADVANCE to the goal once revealed, DONE, then a TURN before ADVANCE for a
+  goal off to the side; ~7 s; the first four steps mutation-checked).
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
 Module roles:
@@ -1018,7 +1049,7 @@ is explicitly assigned to one of two **mutually exclusive** groups:
 - **`cb_fast_`** — the 20 ms control timer and every estimator stream feeding it: `onPx4Odom`,
   `onVioOdom`, `onSensorCombined`, `onStatus`, `onJoy`, `onGoal`.
 - **`cb_slow_`** — everything that can block for longer than a tick: `onOctomap` (decode, unknown
-  shell, both distance fields — timed by `LOG_MAP_TIMING`) and the 500 ms viz timer. (`onFrontier`
+  shell, both distance fields — timed by `DEBUG_MAP`) and the 500 ms viz timer. (`onFrontier`
   is commented out along with the RTAB-Map frontier subscription.)
 - The node's **default group** is left holding only the parameter services, which is the third thread.
 
@@ -1349,7 +1380,7 @@ publish nothing and cost nothing when the flag is off:
   `UNKNOWN_WEIGHT`'s cost surcharge (reads the RAW octree), and the "never observed" stop in
   truncation, the monitor and the adoption check (read the grid, so the ball is free there and all
   three agree with the corridor). Turn it off and unknown reads as ordinary free space everywhere.
-- `LOG_MAP_TIMING` (bool, default `true`) — one `[map]` line per octomap: time since the previous
+- `DEBUG_MAP` (bool, default `false`; was `LOG_MAP_TIMING`, default true, until 2026-10-01) — one `[map]` line per octomap: time since the previous
   one (and Hz), decode, shell (grid fill / ball / sweep times, grid size, shell cells, cells freed
   around the drone), distance fields, viz publish, total.
 - `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops
@@ -1583,9 +1614,12 @@ and stale voxels decay back to free. The relevant `Grid/*` args (in `autonomy_vi
 `Grid/3D true`, `Grid/RayTracing true`, `Grid/CellSize 0.05`, `Grid/RangeMax` (far-noise vs.
 look-ahead), `Grid/DepthDecimation 1` + `Grid/NormalsSegmentation false` (density — rtabmap otherwise
 decimates and drops "ground", which for a flying drone is a real obstacle), and a gentle
-`Grid/NoiseFiltering*` pair for isolated speckle. There is **no `map_always_update`** — RTAB-Map only
-republishes the assembled octomap on map-graph updates (motion-gated), which is fine because the node
-latches and the subscriber retains the last map (below).
+`Grid/NoiseFiltering*` pair for isolated speckle. **Since 2026-10-01 `RGBD/LinearUpdate 0` + `RGBD/AngularUpdate 0`**: every processed frame becomes
+a node and updates the map, so a hovering drone keeps seeing changes (RTAB-Map's defaults, 0.1 m /
+0.1 rad, only added a node after the camera moved). The rate is capped by `Rtabmap/DetectionRate`
+(2.5 Hz); the cost is a graph growing by ~2.5 nodes/s, so memory and loop-closure work grow over a
+session. (`map_always_update`, the ROS-side alternative that refreshes the map without adding nodes,
+is not passed through by `rtabmap.launch.py`.)
 
 **Two non-obvious gotchas the switch exposed (both fixed in `autonomy_node.cpp`):**
 1. **`ColorOcTree`, not `OcTree`.** RTAB-Map publishes a `ColorOcTree` (it stores voxel colour);

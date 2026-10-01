@@ -257,8 +257,9 @@ private:
     // replan shrinks it; this stops that. Never fly with it on: every replan
     // would restart from zero velocity (warned while flying).
     declare_parameter("BENCH_TEST_REPLAN_DISABLER", false);
-    // BENCH ONLY, battery off. Simulates a vehicle that has taken off to POS_SP
-    // and then follows the tracker's reference perfectly: the core (planner and
+    // BENCH ONLY, battery off. Simulates a vehicle that starts where the real one
+    // is (POS_SP if no position is known), hovers there, and then follows the
+    // tracker's reference perfectly: the core (planner and
     // tracker) is fed that vehicle instead of the real one on the desk, so the
     // hand-over from POS_SP to a trajectory and from one trajectory to the next
     // can be watched on the /control/pos_ff marker. Bypasses the sensor warmup,
@@ -383,10 +384,16 @@ private:
     // so with this on the drone is boxed in until it has mapped its surroundings
     // (e.g. an initial 360deg scan) — flip it off for open-loop bench tests.
     declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", true);
+    // Lowest height [m, world frame: z = 0 where VIO started, i.e. the ground for
+    // a ground start] the search may route through, and the floor of the
+    // corridor's box. ONLY with TREAT_FRONTIER_AS_OBSTACLE false, where a
+    // never-seen floor reads as free and a path could otherwise dip under it.
+    // Relaxed to the drone's own height when it starts lower, so it can take off.
+    declare_parameter("MIN_ALTITUDE", 0.1);
     // One [map] line per octomap: time since the previous one, and how long
     // decoding, the unknown shell, the two distance fields, the occupancy-map
     // publish and the whole callback took.
-    declare_parameter("LOG_MAP_TIMING", true);
+    declare_parameter("DEBUG_MAP", false);
     // Best-effort goal seeking. When true (default), a goal in unreachable or
     // still-unmapped space no longer produces "no path": the planner routes to the
     // reachable point closest to the goal (the frontier edge) and the worker keeps
@@ -419,14 +426,14 @@ private:
     // Goal-directed exploration: the search plans only on the conservative map,
     // toward the reachable known point nearest the goal (ADVANCE); when none is
     // closer it plans optimistically to find where the way to the goal leaves
-    // explored space and flies to a viewpoint VIEW_DISTANCE from it, facing it
+    // explored space and flies to a viewpoint about VIEW_DISTANCE from it, facing it
     // (UNCOVER); DONE within GOAL_REACHED_DIST of the goal. RETARGET_PERIOD:
     // how often ADVANCE looks for a closer known point. Needs
     // TREAT_FRONTIER_AS_OBSTACLE and USE_CORRIDOR_QP. Logs `[mission]` lines;
     // drawn on /planner/mission.
     declare_parameter("EXPLORATION", true);
     declare_parameter("GOAL_REACHED_DIST", 1.0);
-    declare_parameter("VIEW_DISTANCE", 3.0);
+    declare_parameter("VIEW_DISTANCE", 2.5);
     declare_parameter("RETARGET_PERIOD", 3.0);
     // Clearance the corridor boxes keep from obstacles and unknown space [m].
     // A strictly harder test than the planner's 0.5 m collision margin: the
@@ -561,6 +568,7 @@ private:
     // conservative map view: that view only exists once a frontier cloud has
     // arrived, and both guards work off the raw octree without one.
     cfg.treat_unknown_as_hazard = param("TREAT_FRONTIER_AS_OBSTACLE").as_bool();
+    cfg.min_altitude = param("MIN_ALTITUDE").as_double();
     cfg.traj_monitor_rate = param("TRAJ_MONITOR_RATE").as_double();
     cfg.traj_improve_period = param("TRAJ_IMPROVE_PERIOD").as_double();
     cfg.traj_extend_dist = param("TRAJ_EXTEND_DIST").as_double();
@@ -827,7 +835,7 @@ private:
     }
     const auto t_done = Clock::now();
 
-    if (get_parameter("LOG_MAP_TIMING").as_bool()) {
+    if (get_parameter("DEBUG_MAP").as_bool()) {
       const auto ms = [](Clock::time_point from, Clock::time_point to) {
         return std::chrono::duration<double, std::milli>(to - from).count();
       };
@@ -1142,7 +1150,7 @@ private:
                             "for the battery-off bench only. Set it false.");
     }
     if (bench_transfer) {
-      benchTransferTick();
+      benchTransferTick(state, position_fresh);
       return;
     }
     if (bench_transfer_active_) {
@@ -1287,22 +1295,26 @@ private:
   // vehicle, which is what makes the hand-overs meaningful to watch: on
   // /control/pos_ff (and pos_sp in /control/debug), from POS_SP onto a trajectory
   // and from each trajectory onto the next.
-  void benchTransferTick() {
-    const auto pos_sp = get_parameter("POS_SP").as_double_array();
-    const Eigen::Vector3d sp = pos_sp.size() == 3
-                                   ? Eigen::Vector3d(pos_sp[0], pos_sp[1], pos_sp[2])
-                                   : Eigen::Vector3d::Zero();
+  void benchTransferTick(const drone_core::common::State& real, bool real_fresh) {
     if (!bench_transfer_active_) {
       bench_transfer_active_ = true;
       core_->reset();
+      // It starts where the real drone is, facing its way, and hovers there
+      // until a trajectory takes it away (POS_SP only if no position is known).
+      const auto pos_sp = get_parameter("POS_SP").as_double_array();
+      const Eigen::Vector3d sp = pos_sp.size() == 3
+                                     ? Eigen::Vector3d(pos_sp[0], pos_sp[1], pos_sp[2])
+                                     : Eigen::Vector3d::Zero();
+      bench_hold_pos_ = real_fresh ? real.pos : sp;
+      bench_hold_yaw_ = real_fresh ? real.yaw : kDefaultYaw;
       bench_state_ = drone_core::common::State{};
-      bench_state_.pos = sp;  // it has just taken off to POS_SP and hovers there
-      bench_state_.yaw = kDefaultYaw;
+      bench_state_.pos = bench_hold_pos_;
+      bench_state_.yaw = bench_hold_yaw_;
       bench_state_.stamp = get_clock()->now().seconds();
       core_->setVehicleState(bench_state_);
       reissueGoal();  // an active goal's path was planned from the real vehicle
       RCLCPP_WARN(get_logger(),
-                  "BENCH_TEST_TRANSFER_TESTER ON: simulated vehicle hovering at POS_SP and "
+                  "BENCH_TEST_TRANSFER_TESTER ON: simulated vehicle hovering where the real one is and "
                   "following the reference perfectly; sensor warmup, arm/offboard gate and "
                   "watchdog bypassed. NO commands are sent to PX4. Watch /control/pos_ff.");
     }
@@ -1311,7 +1323,7 @@ private:
     const double now_s = get_clock()->now().seconds();
     bench_state_.stamp = now_s;
     core_->setVehicleState(bench_state_);
-    core_->setSetpoint(sp, kDefaultYaw);
+    core_->setSetpoint(bench_hold_pos_, bench_hold_yaw_);
     core_->stepControl(kControlDt);  // the command is deliberately discarded
     // Perfect tracking: next tick the vehicle is wherever the reference is now.
     const auto& c = core_->controller();
@@ -1383,9 +1395,13 @@ private:
     }
   }
 
-  // Exploration (EXPLORATION): the current target as a green sphere and, while
-  // uncovering, the exit point being looked at as a yellow sphere with an arrow
-  // from the viewpoint along the heading it will arrive with.
+  // Exploration (EXPLORATION), on /planner/mission:
+  //   green sphere   the current target (ADVANCE: the best-effort known point;
+  //                  UNCOVER: the viewpoint), green arrow = heading to arrive with
+  //   green line     the conservative path being flown to it
+  //   blue sphere    the best-effort known point nearest the goal so far
+  //   yellow sphere  the exit point being looked at (UNCOVER)
+  //   magenta line   the optimistic path the exit point came from (UNCOVER)
   void publishMission() {
     const auto v = core_->missionView();
     visualization_msgs::msg::MarkerArray arr;
@@ -1411,6 +1427,28 @@ private:
     };
     if (v.has_target) sphere("mission_target", v.target, 0.1f, 0.9f, 0.1f);
     if (v.has_exit) sphere("mission_exit", v.exit, 1.0f, 0.9f, 0.0f);
+    if (v.has_best_known) sphere("mission_best_known", v.best_known, 0.2f, 0.4f, 1.0f);
+    const auto line = [&](const char* ns, const std::vector<Eigen::Vector3d>& pts, double width,
+                          float r, float g, float b) {
+      if (pts.size() < 2) return;
+      visualization_msgs::msg::Marker l;
+      l.header = clear.header;
+      l.ns = ns;
+      l.id = 0;
+      l.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      l.action = visualization_msgs::msg::Marker::ADD;
+      l.pose.orientation.w = 1.0;
+      l.scale.x = width;
+      l.color.r = r; l.color.g = g; l.color.b = b; l.color.a = 1.0f;
+      for (const auto& q : pts) {
+        geometry_msgs::msg::Point pt;
+        pt.x = q.x(); pt.y = q.y(); pt.z = q.z();
+        l.points.push_back(pt);
+      }
+      arr.markers.push_back(l);
+    };
+    line("mission_path", v.path, 0.04, 0.1f, 0.9f, 0.1f);
+    line("mission_optimistic", v.optimistic_path, 0.02, 0.9f, 0.1f, 0.9f);
     if (v.has_target && std::isfinite(v.target_yaw)) {
       visualization_msgs::msg::Marker a;
       a.header = clear.header;
@@ -1786,7 +1824,7 @@ private:
   // Written by onOctomap, read by warnIfNoMap on the viz timer — both slow group,
   // so unguarded.
   bool got_octomap_{false};  // has onOctomap ever fired? (see warnIfNoMap)
-  // Arrival time of the previous octomap, for LOG_MAP_TIMING. Slow group only.
+  // Arrival time of the previous octomap, for DEBUG_MAP. Slow group only.
   std::chrono::steady_clock::time_point last_map_arrival_{};
 
   rclcpp::Publisher<px4_msgs::msg::VehicleAttitudeSetpoint>::SharedPtr pub_attitude_;
@@ -1829,6 +1867,8 @@ private:
   bool controller_running_{false};
   bool bench_transfer_active_{false};  // BENCH_TEST_TRANSFER_TESTER is running the tracker
   drone_core::common::State bench_state_;  // the simulated vehicle it runs on
+  Eigen::Vector3d bench_hold_pos_{Eigen::Vector3d::Zero()};  // where it hovers without a trajectory
+  double bench_hold_yaw_{0.0};
 
   // Last-receive wall-clock times [s] per estimator stream, for the in-flight
   // sensor-liveness watchdog (see controlLoop). Negative == never received.

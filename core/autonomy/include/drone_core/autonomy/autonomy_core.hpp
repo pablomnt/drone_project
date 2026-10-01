@@ -131,6 +131,13 @@ public:
     // the raw octree, where a cell with no node has never been observed — so
     // they should stay on whenever the operator asked for them.
     bool treat_unknown_as_hazard{true};
+    // Without treat_unknown_as_hazard, a never-seen floor reads as free and the
+    // search could route a path under it. min_altitude [m, world frame, z = 0
+    // where VIO started] is then the lowest a search point may be (relaxed to
+    // the start's height, so a drone on the ground climbs out) and the floor of
+    // the corridor's box. -inf disables it; ignored with treat_unknown_as_hazard
+    // on, where unknown space is an obstacle anyway.
+    double min_altitude{-std::numeric_limits<double>::infinity()};
     // Keep the search's path where the camera can see it
     // (GeometricPlanner::setUnknownSlopeLimit): the camera looks forward and
     // roughly level (the D435's depth view is about +-29 deg vertically).
@@ -154,8 +161,13 @@ public:
     double goal_reached_dist{1.0};     // the goal counts as reached within this [m]
     double retarget_period{3.0};       // how often ADVANCE looks for a closer known point [s]
     double retarget_min_gain{0.3};     // a new known point must be this much closer to the goal [m]
-    double view_distance{3.0};         // ideal viewpoint distance from the exit point [m]
+    double view_distance{2.5};         // ideal viewpoint distance from the exit point [m]
     double arrive_dist{0.3};           // the drone has reached its target within this [m]
+    // ...or the trajectory built for the path to it has run out with the drone
+    // at its end and that end within this of the target: the corridor pulls a
+    // path's end back when the end point falls outside its shrunk last region,
+    // and the drone then stops short however long it waits [m].
+    double arrive_short_dist{1.0};
     double view_dwell{1.5};            // wait at a viewpoint for the map to catch up [s]
     double exit_exclusion_radius{1.0}; // exit points looked at are avoided by this much [m]
     // Trajectory monitor (see monitorLoop). The trajectory being flown is kept
@@ -395,7 +407,7 @@ public:
   bool hasCommittedPath() const { return !committedPath().empty(); }
 
   // The exploration's current state, for logs and visualisation (map frame).
-  enum class MissionMode { kIdle, kAdvance, kUncover, kDone, kNoExits };
+  enum class MissionMode { kIdle, kTurn, kAdvance, kUncover, kDone, kNoExits };
   struct MissionView {
     MissionMode mode = MissionMode::kIdle;
     bool has_target = false;
@@ -403,6 +415,13 @@ public:
     double target_yaw = std::numeric_limits<double>::quiet_NaN();  // heading to arrive with
     bool has_exit = false;
     Eigen::Vector3d exit = Eigen::Vector3d::Zero();    // the exit point being looked at (UNCOVER)
+    // The best-effort known point nearest the goal found so far (kept while
+    // uncovering), the conservative path to the target being flown, and the
+    // optimistic path the exit point came from (UNCOVER).
+    bool has_best_known = false;
+    Eigen::Vector3d best_known = Eigen::Vector3d::Zero();
+    std::vector<Eigen::Vector3d> path;
+    std::vector<Eigen::Vector3d> optimistic_path;
   };
   MissionView missionView() const;
   static const char* toString(MissionMode m);
@@ -525,10 +544,14 @@ private:
   bool explorationActive(const ConsGridHandle& cons) const;
   // One search tick of it: `start` is where to plan from (the predicted splice
   // point, as for the classic search), `drone` the measured position, both map
-  // frame.
+  // frame; `drone_yaw` the measured heading, world frame.
+  // min_altitude in the map frame (maps are gravity-aligned, so only the
+  // transform's height offset matters), or -inf when it does not apply.
+  static double floorInMap(const Config& c, const Eigen::Isometry3d& world_from_map);
   void explorationTick(const planning::MapHandle& map, const ConsGridHandle& cons,
                        const Eigen::Vector3d& goal, const Eigen::Vector3d& start,
-                       const Eigen::Vector3d& drone, double t);
+                       const Eigen::Vector3d& drone, double drone_yaw,
+                       const Eigen::Isometry3d& map_from_world, double t);
 
   // Which map the debug clearance samples were taken from. Guarded by
   // edt_mutex_ with the fields it belongs to, since clearanceField clears it on
@@ -693,6 +716,14 @@ private:
   bool preset_pending_{false};
   std::atomic<bool> preset_active_{false};
   std::atomic<double> preset_end_{0.0};
+  // The mission's TURN (see explorationTick) stages a hold-in-place trajectory
+  // the monitor knows nothing about, so nothing sends health signals for it.
+  // While it is the latest staged trajectory (turn_hold_active_, cleared by
+  // stagePending), the search thread keeps pushing turn_fresh_until_ a second
+  // ahead and stepControl keeps the trajectory fresh until then — so a dead
+  // search thread still ends in the usual hover-hold.
+  std::atomic<bool> turn_hold_active_{false};
+  std::atomic<double> turn_fresh_until_{0.0};
   // Raised by stepControl when the tracker abandons a trajectory for divergence.
   // One flag per planner thread, because both have to react and each consumes
   // its own: the search thread drops the committed path and re-searches from the
@@ -731,6 +762,13 @@ private:
   mutable std::mutex path_mutex_;
   std::vector<std::vector<double>> committed_path_;
   double committed_end_yaw_{std::numeric_limits<double>::quiet_NaN()};  // guarded by path_mutex_
+  // Consecutive failed NEW_PLAN / OBSTACLE_EVASION solves on committed-path
+  // version path_fail_version_ (the solver writes, the exploration reads: a
+  // path the corridor cannot be built along twice is given up). Guarded by
+  // path_mutex_.
+  std::uint64_t path_fail_version_{0};
+  int path_fail_count_{0};
+  int trajgenFailures(std::uint64_t version) const;
 
   // Exploration state, search thread only (missionView copies it under traj_mutex_).
   struct Mission {
@@ -748,7 +786,15 @@ private:
     Eigen::Vector3d exit = Eigen::Vector3d::Zero();
     std::vector<Eigen::Vector3d> tried_exits;
     int failed_exits = 0;
+    // Targets given up because no trajectory could be built along the path to
+    // them; the ADVANCE search avoids them (setExclusions, 0.5 m).
+    std::vector<Eigen::Vector3d> failed_targets;
+    bool has_best_known = false;
+    Eigen::Vector3d best_known = Eigen::Vector3d::Zero();
+    std::vector<Eigen::Vector3d> optimistic_path;
     double last_status = -1.0e9;
+    double no_exits_at = 0.0;
+    double turn_until = 0.0;  // TURN: when the turn toward the goal and the wait after it end
   } mission_;
   MissionView mission_view_;  // guarded by traj_mutex_
   std::uint64_t path_version_{0};  // bumped on every setCommittedPath; guarded by path_mutex_

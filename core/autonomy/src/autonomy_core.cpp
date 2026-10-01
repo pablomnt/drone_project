@@ -414,6 +414,7 @@ void AutonomyCore::reset() {
   // measured position, which is what a fresh engage needs; anything solved or
   // waiting against the old ones is thrown away (splice_epoch_).
   splice_epoch_.fetch_add(1);
+  turn_hold_active_.store(false);
   std::lock_guard<std::mutex> lock(traj_mutex_);
   has_pending_ = false;
   has_last_planned_ = false;
@@ -479,6 +480,8 @@ common::Command AutonomyCore::stepControl(double dt) {
   // Health signal from the trajectory monitor: the trajectory being flown was
   // just re-checked against the current map and is safe.
   if (heartbeat_.exchange(false)) tracker_.keepFresh(t);
+  // The mission's TURN hold has no monitor behind it (see turn_hold_active_).
+  if (turn_hold_active_.load() && t < turn_fresh_until_.load()) tracker_.keepFresh(t);
 
   // Emergency stop from the monitor: hold here now. The monitor has already
   // dropped everything staged or solved against the abandoned trajectory, so the
@@ -567,6 +570,11 @@ void AutonomyCore::setCommittedPath(std::vector<std::vector<double>> path, doubl
   ++path_version_;  // a new plan: the monitor treats the trajectory built on the old one as invalid
 }
 
+int AutonomyCore::trajgenFailures(std::uint64_t version) const {
+  std::lock_guard<std::mutex> lock(path_mutex_);
+  return path_fail_version_ == version ? path_fail_count_ : 0;
+}
+
 double AutonomyCore::committedEndYaw() const {
   std::lock_guard<std::mutex> lock(path_mutex_);
   return committed_end_yaw_;
@@ -580,6 +588,7 @@ AutonomyCore::MissionView AutonomyCore::missionView() const {
 const char* AutonomyCore::toString(MissionMode m) {
   switch (m) {
     case MissionMode::kIdle: return "IDLE";
+    case MissionMode::kTurn: return "TURN";
     case MissionMode::kAdvance: return "ADVANCE";
     case MissionMode::kUncover: return "UNCOVER";
     case MissionMode::kDone: return "DONE";
@@ -791,6 +800,16 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     for (int i = 0; i < 3; ++i) {
       params.bounds_lo(i) = planning::GeometricPlanner::kSearchLow[i];
       params.bounds_hi(i) = planning::GeometricPlanner::kSearchHigh[i];
+    }
+    // And above min_altitude when it applies (grown down to the start like any
+    // waypoint, so a drone on the ground can still take off).
+    {
+      Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
+      {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        world_from_map = world_from_map_;
+      }
+      params.bounds_lo(2) = std::max(params.bounds_lo(2), floorInMap(cfg_, world_from_map));
     }
     // Same distance the truncation ramp uses, and for the same reason: it is
     // how far from the drone we accept reduced clearance in exchange for being
@@ -1189,6 +1208,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
 
 void AutonomyCore::stagePending(const common::Trajectory& traj) {
   staged_count_.fetch_add(1);
+  turn_hold_active_.store(false);  // whatever replaces a TURN hold is kept fresh its own way
   std::lock_guard<std::mutex> lock(traj_mutex_);
   pending_ = traj;
   last_planned_ = traj;
@@ -1487,6 +1507,13 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   return true;
 }
 
+double AutonomyCore::floorInMap(const Config& c, const Eigen::Isometry3d& world_from_map) {
+  if (c.treat_unknown_as_hazard || !std::isfinite(c.min_altitude)) {
+    return -std::numeric_limits<double>::infinity();
+  }
+  return (world_from_map.inverse() * Eigen::Vector3d(0.0, 0.0, c.min_altitude)).z();
+}
+
 bool AutonomyCore::explorationActive(const ConsGridHandle& cons) const {
   return search_cfg_.use_exploration && search_cfg_.treat_unknown_as_hazard &&
          search_cfg_.use_corridor_qp && cons && !cons->empty();
@@ -1511,7 +1538,8 @@ bool AutonomyCore::explorationActive(const ConsGridHandle& cons) const {
 // The drone then holds where it is.
 void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGridHandle& cons,
                                    const Eigen::Vector3d& goal, const Eigen::Vector3d& start,
-                                   const Eigen::Vector3d& drone, double t) {
+                                   const Eigen::Vector3d& drone, double drone_yaw,
+                                   const Eigen::Isometry3d& map_from_world, double t) {
   using V = Eigen::Vector3d;
   using Path = std::vector<std::vector<double>>;
   constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -1526,8 +1554,14 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     v.target_yaw = m.target_yaw;
     v.has_exit = m.has_exit && m.mode == MissionMode::kUncover;
     v.exit = m.exit;
+    v.has_best_known = m.has_best_known;
+    v.best_known = m.best_known;
+    if (m.has_target) {
+      for (const auto& w : committedPath()) v.path.emplace_back(w[0], w[1], w[2]);
+    }
+    if (m.mode == MissionMode::kUncover) v.optimistic_path = m.optimistic_path;
     std::lock_guard<std::mutex> lock(traj_mutex_);
-    mission_view_ = v;
+    mission_view_ = std::move(v);
   };
   const auto fmt = [](const V& v) {
     std::ostringstream os;
@@ -1537,11 +1571,74 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
   const auto sv = [](const V& v) { return std::vector<double>{v.x(), v.y(), v.z()}; };
   const auto toV = [](const std::vector<double>& w) { return V(w[0], w[1], w[2]); };
 
-  if (m.mode == MissionMode::kDone || m.mode == MissionMode::kNoExits) return;
-  if (m.mode == MissionMode::kIdle) {
+  if (turn_hold_active_.load()) turn_fresh_until_.store(t + 1.0);
+  if (m.mode == MissionMode::kDone) return;
+  // NO EXITS may be temporary: the map keeps growing (and on the bench, the
+  // camera may be carried somewhere new). Start over from ADVANCE every 10 s,
+  // with the tried exits forgotten.
+  constexpr double kNoExitsRetry = 10.0;  // [s]
+  if (m.mode == MissionMode::kNoExits) {
+    if (t - m.no_exits_at < kNoExitsRetry) return;
     m.mode = MissionMode::kAdvance;
     m.need_retarget = true;
-    DRONE_LOG_INFO("[mission] new goal " << fmt(goal) << ": ADVANCE");
+    m.tried_exits.clear();
+    m.failed_exits = 0;
+    m.has_exit = false;
+    DRONE_LOG_INFO("[mission] NO EXITS for " << kNoExitsRetry << " s: trying again from ADVANCE");
+  }
+  // A new goal from a standstill: first turn to face it (horizontally) and wait
+  // a second, so the camera has mapped what lies that way before anything is
+  // planned. A hold-in-place trajectory with an end heading does the turn: the
+  // flatness mapper turns to it at end_yaw_rate and holds it after the end.
+  // Mid-flight (a goal change) there is no turn; the splice carries on.
+  if (m.mode == MissionMode::kIdle) {
+    bool flying = false;
+    {
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      flying = has_last_planned_ && !last_planned_.empty() &&
+               t < last_planned_.t0 + last_planned_.total_duration && !tracker_holding_.load();
+    }
+    const Eigen::Isometry3d world_from_map = map_from_world.inverse();
+    const V goal_w = world_from_map * goal;
+    const V drone_w = world_from_map * drone;
+    const V to_goal = goal_w - drone_w;
+    if (c.plan_trajectory && !flying && (drone - goal).norm() > c.goal_reached_dist &&
+        to_goal.head<2>().norm() > 1e-3) {
+      constexpr double kTurnDwell = 1.0;  // [s] wait after the turn
+      const double bearing = std::atan2(to_goal.y(), to_goal.x());
+      const double turn = std::abs(std::remainder(bearing - drone_yaw, 2.0 * M_PI));
+      common::Trajectory hold;
+      hold.segment_times = {0.1};
+      hold.total_duration = 0.1;
+      for (int k = 0; k < 3; ++k) {
+        Eigen::VectorXd coeffs = Eigen::VectorXd::Zero(8);
+        coeffs(0) = drone_w(k);
+        (k == 0 ? hold.coeffs_x : k == 1 ? hold.coeffs_y : hold.coeffs_z).push_back(coeffs);
+      }
+      hold.end_yaw = bearing;
+      hold.t0 = now() + kLeadMin;
+      stagePending(hold);
+      turn_hold_active_.store(true);
+      turn_fresh_until_.store(t + 1.0);
+      m.mode = MissionMode::kTurn;
+      m.turn_until = t + turn / control::FlatnessMapper::Params{}.end_yaw_rate + kTurnDwell;
+      DRONE_LOG_INFO("[mission] new goal " << fmt(goal) << ": TURN " << std::fixed
+                     << std::setprecision(0) << turn * 180.0 / M_PI << " deg to face it, then wait "
+                     << kTurnDwell << " s");
+    } else {
+      m.mode = MissionMode::kAdvance;
+      m.need_retarget = true;
+      DRONE_LOG_INFO("[mission] new goal " << fmt(goal) << ": ADVANCE");
+    }
+  }
+  if (m.mode == MissionMode::kTurn) {
+    if (t < m.turn_until) {
+      publishView();
+      return;
+    }
+    m.mode = MissionMode::kAdvance;
+    m.need_retarget = true;
+    DRONE_LOG_INFO("[mission] facing the goal: ADVANCE");
   }
   if ((drone - goal).norm() <= c.goal_reached_dist ||
       (m.has_target && (drone - m.target).norm() <= c.arrive_dist && m.best_gap <= c.goal_reached_dist)) {
@@ -1602,6 +1699,7 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     planning::GeometricPlanner be(map, c.rrt_solve_time);
     configure(be, planning::PlannerType::RRTstar, /*conservative=*/true);
     be.setBestEffort(true);
+    be.setExclusions(m.failed_targets, 0.5);
     if (!be.planPath(sv(start), sv(goal), out) || out.size() < 2) return false;
     gap = (toV(out.back()) - goal).norm();
     return true;
@@ -1632,10 +1730,70 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
         m.has_target = false;
         m.need_retarget = m.mode == MissionMode::kAdvance;
         m.need_viewpoint = m.mode == MissionMode::kUncover;
+        // Forget how close the dropped target was, or ADVANCE would only accept
+        // something retarget_min_gain closer than an unreachable point.
+        if (m.mode == MissionMode::kAdvance) m.best_gap = std::numeric_limits<double>::infinity();
       }
     }
   }
-  const bool arrived = m.has_target && (drone - m.target).norm() <= c.arrive_dist;
+
+  // ---- The corridor cannot be built along this path (twice in a row): give
+  // the target up and avoid it, rather than retrying the same path forever. ----
+  if (m.has_target) {
+    std::uint64_t version = 0;
+    committedPath(&version);
+    if (trajgenFailures(version) >= 2) {
+      DRONE_LOG_INFO("[mission] " << toString(m.mode) << ": no trajectory could be built along the path to "
+                                  << fmt(m.target) << " (twice): giving it up");
+      m.failed_targets.push_back(m.target);
+      setCommittedPath({});
+      m.has_target = false;
+      m.need_retarget = m.mode == MissionMode::kAdvance;
+      m.need_viewpoint = m.mode == MissionMode::kUncover;
+      if (m.mode == MissionMode::kAdvance) m.best_gap = std::numeric_limits<double>::infinity();
+    }
+  }
+  // Arrived: within arrive_dist of the target, or the trajectory built for the
+  // current path has run out with the drone at its end, that end within
+  // arrive_short_dist of the target (the corridor pulled it back). Ended further
+  // short than that, the target is treated as unreachable.
+  bool arrived = m.has_target && (drone - m.target).norm() <= c.arrive_dist;
+  if (m.has_target && !arrived) {
+    std::uint64_t version = 0;
+    committedPath(&version);
+    bool ended = false;
+    V end = V::Zero();
+    {
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      if (!records_.empty() && records_.back().path_version == version &&
+          t >= records_.back().traj.t0 + records_.back().traj.total_duration) {
+        const auto& tr = records_.back().traj;
+        end = map_from_world * common::sampleMotion(tr, tr.t0 + tr.total_duration).pos;
+        ended = true;
+      }
+    }
+    if (ended && (drone - end).norm() <= c.arrive_dist) {
+      const double short_by = (end - m.target).norm();
+      if (short_by <= c.arrive_short_dist) {
+        arrived = true;
+        if (!std::isfinite(m.arrived_at)) {
+          DRONE_LOG_INFO("[mission] " << toString(m.mode) << ": the trajectory to " << fmt(m.target)
+                                      << " ended " << short_by
+                                      << " m short of it (the corridor pulled the end back): arrived");
+        }
+      } else {
+        DRONE_LOG_INFO("[mission] " << toString(m.mode) << ": the trajectory to " << fmt(m.target)
+                                    << " ended " << short_by << " m short of it: choosing a new target");
+        setCommittedPath({});
+        m.has_target = false;
+        m.need_retarget = m.mode == MissionMode::kAdvance;
+        m.need_viewpoint = m.mode == MissionMode::kUncover;
+        if (m.mode == MissionMode::kAdvance) m.best_gap = std::numeric_limits<double>::infinity();
+        publishView();
+        return;
+      }
+    }
+  }
 
   // ---- Improve: a cheaper path to the same target. ----
   const auto improve = [&]() {
@@ -1663,6 +1821,8 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
       double gap = std::numeric_limits<double>::infinity();
       if (bestKnown(p, gap) && gap < m.best_gap - c.retarget_min_gain) {
         commit(p, kNaN);
+        m.has_best_known = true;
+        m.best_known = m.target;
         DRONE_LOG_INFO("[mission] ADVANCE: heading for " << fmt(m.target) << ", " << gap
                                                           << " m from the goal (was "
                                                           << m.best_gap << " m)");
@@ -1687,9 +1847,14 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     configure(opt, c.planner_type, /*conservative=*/false);
     opt.setBestEffort(true);
     opt.setExclusions(m.tried_exits, c.exit_exclusion_radius);
+    // From the best-effort known point, not from wherever the drone is: after
+    // a look from a viewpoint across the room, a search from there found the
+    // frontier around that spot instead of the one nearest the goal.
+    const V from = m.has_best_known ? m.best_known : start;
     Path p;
-    if (!opt.planPath(sv(start), sv(goal), p) || p.size() < 2) {
+    if (!opt.planPath(sv(from), sv(goal), p) || p.size() < 2) {
       m.mode = MissionMode::kNoExits;
+      m.no_exits_at = t;
       DRONE_LOG_INFO("[mission] NO EXITS: no route to the goal even through unknown space ("
                      << m.tried_exits.size() << " exit point(s) looked at); holding");
       publishView();
@@ -1697,6 +1862,7 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     }
     std::vector<V> ep;
     for (const auto& w : p) ep.push_back(toV(w));
+    m.optimistic_path = ep;
     const auto exit = planning::findExitPoint(
         ep, [&](const V& q) { return unknown_fn(q.x(), q.y(), q.z()); });
     if (!exit) {
@@ -1714,8 +1880,10 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     m.exit = *exit;
     planning::ViewpointParams vp;
     vp.distance = c.view_distance;
+    // Viewpoints near the best-effort known point (the frontier side), not near
+    // wherever the drone happens to be.
     const auto candidates = planning::viewpointCandidates(
-        *exit, drone, [&](const V& q) { return strict.isValidPoint(q.x(), q.y(), q.z()); },
+        *exit, from, [&](const V& q) { return strict.isValidPoint(q.x(), q.y(), q.z()); },
         [&](const V& q) { return opt_fn(q.x(), q.y(), q.z()) > 0.5 * res; }, vp);
     constexpr std::size_t kTries = 4;
     for (std::size_t i = 0; i < std::min(kTries, candidates.size()); ++i) {
@@ -1736,6 +1904,7 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     m.need_viewpoint = true;
     if (++m.failed_exits > 5) {
       m.mode = MissionMode::kNoExits;
+      m.no_exits_at = t;
       DRONE_LOG_INFO("[mission] NO EXITS: no reachable viewpoint for 6 exit points in a row; holding");
     }
     publishView();
@@ -1749,6 +1918,8 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
       if (bestKnown(p, gap) && gap < m.best_gap - c.retarget_min_gain) {
         m.mode = MissionMode::kAdvance;
         commit(p, kNaN);
+        m.has_best_known = true;
+        m.best_known = m.target;
         DRONE_LOG_INFO("[mission] UNCOVER uncovered a way on: ADVANCE to " << fmt(m.target) << ", "
                                                                           << gap << " m from the goal (was "
                                                                           << m.best_gap << " m)");
@@ -1894,7 +2065,8 @@ void AutonomyCore::searchLoop() {
       // Goal-directed exploration replaces the classic search below when on
       // (see explorationTick).
       if (explorationActive(conservative)) {
-        explorationTick(map, conservative, goal.pos, pos_map, world_from_map.inverse() * state.pos, t);
+        explorationTick(map, conservative, goal.pos, pos_map, world_from_map.inverse() * state.pos,
+                        state.yaw, world_from_map.inverse(), t);
       } else {
 
         // Which map view the geometric search (and the committed-path monitor)
@@ -1919,6 +2091,7 @@ void AutonomyCore::searchLoop() {
         planner.setPlannerType(search_cfg_.planner_type);
         planner.setBestEffort(search_cfg_.best_effort_goal);
         planner.setEscapeRamp(search_cfg_.escape_ramp_dist);
+        planner.setFloor(floorInMap(search_cfg_, world_from_map));
         applyClearanceObjective(planner, search_map, conservative);
         // Never-observed space here is the grid's view when there is one (the
         // keep-out around the drone counts as seen, so it can still climb off the
@@ -2366,6 +2539,21 @@ void AutonomyCore::trajgenLoop() {
       }
       trajgen_stub_len_ = 0.0;
       result.cancelled = solve_cancel_.load();
+      // Count consecutive failures of the solves that must succeed (a new plan,
+      // an evasion) on this committed path, for the exploration (see
+      // trajgenFailures). Improves and extensions failing in a tight spot are
+      // harmless: the current trajectory carries on.
+      if (!result.cancelled && (job.needs.new_plan || job.needs.evasion)) {
+        std::lock_guard<std::mutex> lock(path_mutex_);
+        if (result.ok) {
+          if (path_fail_version_ == result.version) path_fail_count_ = 0;
+        } else if (path_fail_version_ == result.version) {
+          ++path_fail_count_;
+        } else {
+          path_fail_version_ = result.version;
+          path_fail_count_ = 1;
+        }
+      }
       // A failure with the anchor far off the path means the path is stale (it was
       // planned from a predicted start the trajectory has since left): drop it so
       // the search re-plans from a fresh one, instead of retrying it.

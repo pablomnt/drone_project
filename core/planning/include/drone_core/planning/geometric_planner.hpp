@@ -2,6 +2,7 @@
 
 #include <array>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -273,6 +274,11 @@ public:
   // cannot root a path at all).
   void setEscapeRamp(double dist) { escape_ramp_ = dist; }
 
+  // Lowest height [m, search frame] a point may have, or -inf (the default) for
+  // none beyond the search box. Relaxed to the start's own height when that is
+  // lower, so a drone sitting on the ground can still climb out above it.
+  void setFloor(double z) { floor_z_ = z; }
+
   // Straight-line distance [m] from the endpoint of the most recent planPath
   // solution to the goal it was asked for: 0 for an exact solution, positive for
   // an approximate (best-effort) one that stops short, +infinity if the last
@@ -477,6 +483,7 @@ private:
   // before each validity sweep, hence mutable so the const isPathValid can
   // anchor it.
   mutable std::array<double, 3> start_pos_{};
+  double floor_z_ = -std::numeric_limits<double>::infinity();  // see setFloor
   // Floor under the escape ramp [m]: the start's clearance less half a voxel,
   // so a path may not approach an obstacle more closely than the start already
   // does (see positionValid). Cached with start_pos_ since positionValid is hot.

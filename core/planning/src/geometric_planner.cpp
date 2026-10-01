@@ -246,6 +246,8 @@ bool GeometricPlanner::positionValid(double x, double y, double z) const {
   const double ez = z - start_pos_[2];
   const double from_start = std::sqrt(ex * ex + ey * ey + ez * ez);
 
+  if (z < floor_z_ && z < start_pos_[2]) return false;  // see setFloor
+
   // The slope cone (see setUnknownSlopeLimit): never-observed space steeper
   // than the limit from the start is where the camera will not be looking.
   if (slopeActive() && std::abs(ez) > max_slope_tan_ * std::hypot(ex, ey) &&

@@ -520,13 +520,14 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 |---|---|---|
 | `USE_CORRIDOR_QP` | bool, `true` | Use the corridor-constrained QP instead of plain min-snap. False is the legacy, obstacle-blind path. |
 | `TREAT_FRONTIER_AS_OBSTACLE` | bool, `true` | **The single switch for "is unmapped space a hazard".** Gates the stamped frontier shell, `UNKNOWN_WEIGHT`'s surcharge, and truncation's stop at unobserved cells. On a fresh map almost everything is frontier, so with this on the drone is boxed in until it has scanned around itself — leave it off for bench and preset work, on for real exploration. |
+| `MIN_ALTITUDE` | double, `0.1` | **Only with `TREAT_FRONTIER_AS_OBSTACLE` false.** Lowest height [m, world frame, z = 0 where VIO started] the search may route through, and the floor of the corridor's box: with unknown space free, a floor the camera never saw would otherwise let a path dip under it. Relaxed to the drone's own height when it starts lower, so a ground start can take off. Ignored with the flag on. |
 | `VMAX` / `AMAX` / `JMAX` | double, `1.0` / `1.5` / `3.0` | Per-axis velocity, acceleration and jerk limits enforced by the QP. Box bounds, so the true norm can reach √3× in the corner case. |
 | `FRONTIER_MARGIN` | double, `0.5` m | Clearance the committed *path prefix* keeps from mapped obstacles during truncation (and from unknown space when `UNKNOWN_MARGIN` is not smaller). |
 | `MAX_UNKNOWN_SLOPE` / `UNKNOWN_SLOPE_WEIGHT` | double, `0` (off) deg / `5` | Keep the search's path where the camera can see it: points in never-observed space steeper than the limit from the start are invalid, and edges steeper than it through unknown space cost the weight per vertical metre beyond it (`steep` in the `[plan]` cost). Any slope through explored space. Every planner obeys it. 0 disables. |
 | `UNKNOWN_MARGIN` | double, `0.25` m | Clearance from never-observed space for truncation, the corridor and the trajectory monitor, when smaller than their margin from mapped obstacles (`FRONTIER_MARGIN`, `CORRIDOR_MARGIN`). At or above those it changes nothing. |
 | `EXPLORATION` | bool, `true` | Goal-directed exploration: plan only on the conservative map toward the reachable known point nearest the goal (ADVANCE); when none is closer, fly to a viewpoint facing where the way to the goal leaves explored space (UNCOVER); DONE within `GOAL_REACHED_DIST`. Logs `[mission]`, drawn on `/planner/mission`. Needs `TREAT_FRONTIER_AS_OBSTACLE` and `USE_CORRIDOR_QP`. |
 | `GOAL_REACHED_DIST` | double, `1.0` m | The goal counts as reached within this. |
-| `VIEW_DISTANCE` | double, `3.0` m | Ideal distance from a viewpoint to the exit point it looks at. |
+| `VIEW_DISTANCE` | double, `2.5` m | Ideal distance from a viewpoint to the exit point it looks at. |
 | `RETARGET_PERIOD` | double, `3.0` s | How often ADVANCE looks for a known point closer to the goal. |
 | `ESCAPE_RAMP_DIST` | double, `1.0` m | Distance over which truncation's clearance requirement ramps from zero at the drone up to the full margin, so a vehicle in a tight spot can still commit a path. Also where the corridor's first-region relaxation ends. Deliberately independent of the margin. `≤ 0` disables both. |
 | `CORRIDOR_MARGIN` | double, `0.4` m | Clearance the corridor *regions* keep from obstacles. A strictly harder test than the planner's own check — it must hold over a whole 3D volume, not just a centreline. **This is the clearance you actually fly with**, so weigh it against the airframe's half-width. First suspect when a decomposition fails. |
@@ -753,6 +754,29 @@ cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
   /fmu/out/vehicle_status /smooth_trajectory /planner/goal_marker \
   /control/pos_ff /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
 ```
+
+**Thesis / presentation set** — the estimator-debug set plus everything needed to replay the
+exploration mission in RViz afterwards: `/planner/mission` (target, exit points, viewpoints and their
+heading, the flown and the optimistic path), `/planner/corridor` (the safe-flight corridors; needs
+`DEBUG_PLANNER_VIZ`, on by default), `/planner/occupancy_map` (the map the planner actually plans on:
+occupied voxels plus the unknown shell, the "unknown as obstacle" picture the raw octomap cannot show)
+and a compressed colour camera view for video (`cam0_matches` is OKVIS's grayscale feature view).
+```bash
+cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
+  /debug/telemetry /okvis/cam0_matches/compressed /okvis/okvis_odometry /okvis/okvis_path \
+  /fmu/out/sensor_combined /fmu/out/vehicle_odometry /fmu/out/vehicle_status_v1 \
+  /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_attitude_setpoint_v1 \
+  /fmu/out/vehicle_status /smooth_trajectory /planner/goal_marker \
+  /control/pos_ff /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static \
+  /planner/mission /planner/corridor /planner/occupancy_map \
+  /camera/camera/color/image_raw/compressed
+```
+Before the flight, check the two unknowns on the bench with the stack up. The compressed camera
+topic only exists with the image_transport compressed plugin (`ros2 topic list | grep compressed`);
+never record the raw image instead, it is far too heavy. And `ros2 topic bw /planner/occupancy_map`
+in a cluttered room should be a few MB/s at most (obstacles plus the shell, at most 2.5 Hz — nothing
+like the camera point cloud); if it is much more, drop it, the octomap is still in the bag. The
+`/planner/clearance_field` cloud is deliberately left out (heavy, debug only).
 
 Two things to know about the extra topics. `/fmu/out/sensor_combined` is the raw IMU stream (~100 Hz
 received in flight) — by far the heaviest thing in either list, so use this tier when you are chasing a

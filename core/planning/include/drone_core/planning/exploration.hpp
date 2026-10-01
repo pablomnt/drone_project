@@ -20,16 +20,17 @@ std::optional<Eigen::Vector3d> findExitPoint(const std::vector<Eigen::Vector3d>&
                                              const PointTest& is_unknown, double step = 0.05);
 
 struct ViewpointParams {
-  double distance = 3.0;           // ideal distance from the exit point [m]
+  double distance = 2.5;           // ideal distance from the exit point [m]
   double min_distance = 1.5;       // [m]
   double max_distance = 4.0;       // [m]
   // The camera looks forward and roughly level: the exit point may sit at most
   // this far above or below the viewpoint's horizontal [deg].
   double max_elevation_deg = 20.0;
   int azimuth_steps = 24;          // directions tried around the exit point
-  // Score = |distance - ideal| + drone_weight x distance from the drone: near the
-  // ideal distance first, then the one closest to where the drone is.
-  double drone_weight = 0.2;
+  // Score = |distance - ideal| + anchor_weight x distance from the anchor (the
+  // caller's: the best-effort known point): near the ideal distance, but not at
+  // the price of a trip across explored space to get exactly there.
+  double anchor_weight = 0.5;
   double los_step = 0.05;          // line-of-sight sampling step [m]
 };
 
@@ -48,7 +49,7 @@ struct Viewpoint {
 // exit point (the caller's "not inside a mapped obstacle"). Reachability is left
 // to the caller, which plans to them in this order.
 std::vector<Viewpoint> viewpointCandidates(const Eigen::Vector3d& exit,
-                                           const Eigen::Vector3d& drone,
+                                           const Eigen::Vector3d& anchor,
                                            const PointTest& valid,
                                            const PointTest& see_through,
                                            const ViewpointParams& params = {});
