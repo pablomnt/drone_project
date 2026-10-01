@@ -979,11 +979,49 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     trajgen_corridor_time_ = now() - t_corridor;
     if (!built) {
       snapshotRegions(attempt, /*accepted=*/false);
+      // The path's tightest clearance from each kind of hazard against what the
+      // corridor holds it to: mapped obstacles (raw field) at CORRIDOR_MARGIN,
+      // never-observed space (where the conservative field reads nearer than
+      // the raw one) at UNKNOWN_MARGIN when smaller. Context, not the cause:
+      // the parenthesis says which check failed.
+      std::ostringstream tight;
+      tight << "tightest clearance on the path: ";
+      const auto obs_edt = cons_grid ? clearanceField(map, cfg_.clearance_threshold) : nullptr;
+      if (cons_grid) {
+        const auto obs_fn = obs_edt ? makeClearanceFn(obs_edt, cfg_.clearance_threshold)
+                                    : planning::CorridorClearanceFn(
+                                          [md = cfg_.clearance_threshold](double, double, double) {
+                                            return md;
+                                          });
+        double to_obs = std::numeric_limits<double>::infinity();
+        double to_unknown = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i + 1 < committed.size(); ++i) {
+          const Eigen::Vector3d d = committed[i + 1] - committed[i];
+          const int n = std::max(1, static_cast<int>(std::ceil(d.norm() / 0.05)));
+          for (int k = 0; k <= n; ++k) {
+            const Eigen::Vector3d q = committed[i] + (static_cast<double>(k) / n) * d;
+            const double o = obs_fn(q.x(), q.y(), q.z());
+            const double c = cons_fn(q.x(), q.y(), q.z());
+            to_obs = std::min(to_obs, o);
+            if (c < o - 1e-6) to_unknown = std::min(to_unknown, c);
+          }
+        }
+        tight << "mapped obstacles " << to_obs << " m (needs " << params.margin
+              << " m, CORRIDOR_MARGIN), unknown space ";
+        if (std::isfinite(to_unknown)) {
+          tight << to_unknown << " m";
+        } else {
+          tight << "never nearer than the obstacles";
+        }
+        tight << " (needs " << std::min(params.margin, cfg_.unknown_margin)
+              << " m, UNKNOWN_MARGIN)";
+      } else {
+        tight << minConservativeClearance(committed) << " m (needs " << params.margin
+              << " m, CORRIDOR_MARGIN)";
+      }
       DRONE_LOG_INFO("[trajgen] corridor: decomposition FAILED (" << why << ") over "
-                     << committed.size() << " wp / " << polylineLength(committed)
-                     << " m — tightest conservative clearance "
-                     << minConservativeClearance(committed) << " m vs required " << params.margin
-                     << " m (CORRIDOR_MARGIN), " << obstacles.size()
+                     << committed.size() << " wp / " << polylineLength(committed) << " m — "
+                     << tight.str() << ", " << obstacles.size()
                      << " obstacle pts -> no new trajectory");
       return false;
     } else {
@@ -1563,18 +1601,8 @@ void AutonomyCore::searchLoop() {
       // bench), else the raw map's.
       if (search_cfg_.treat_unknown_as_hazard) {
         planner.setUnknownSlopeLimit(makeUnknownFn(search_map, conservative),
-                                     search_cfg_.max_unknown_slope);
-        // EIT* and AIT* check edges with their own point-by-point test and never
-        // consult the motion validator the limit lives in. Say so once per change.
-        const bool bypassed = search_cfg_.max_unknown_slope > 0.0 &&
-                              (search_cfg_.planner_type == planning::PlannerType::EITstar ||
-                               search_cfg_.planner_type == planning::PlannerType::AITstar);
-        if (bypassed && !slope_bypass_warned_) {
-          DRONE_LOG_INFO("[plan] WARNING: " << planning::toString(search_cfg_.planner_type)
-                                   << " checks edges itself and ignores MAX_UNKNOWN_SLOPE; use "
-                                      "ABITstar, BITstar or RRTstar for the slope limit");
-        }
-        slope_bypass_warned_ = bypassed;
+                                     search_cfg_.max_unknown_slope,
+                                     search_cfg_.unknown_slope_weight);
       }
 
       // Debug-only: re-sample the clearance field when the map changes (the EDT
@@ -1629,6 +1657,7 @@ void AutonomyCore::searchLoop() {
         term(cb.split ? " + obst " : " + clr ", cb.clearance - cb.frontier);
         if (cb.split) term(" + frontier ", cb.frontier);
         if (show_unknown || cb.unknown > 0.0) term(" + unknown ", cb.unknown);
+        if (cb.steep > 0.0) term(" + steep ", cb.steep);
         os << ")";
         return os.str();
       };
@@ -1647,9 +1676,11 @@ void AutonomyCore::searchLoop() {
       if (path_invalid || improve_run) {
         std::vector<std::vector<double>> candidate;
         // A path is needed now: a short budget. Improving one can take the full one.
-        planner.setPlanningTime(path_invalid ? std::min(search_cfg_.rrt_solve_time,
-                                                        search_cfg_.rrt_replan_solve_time)
-                                             : search_cfg_.rrt_solve_time);
+        // A path is needed now: stop at RRT_REPLAN_SOLVE_TIME if one reaching the
+        // goal has been found by then, else keep going to RRT_SOLVE_TIME. An
+        // improve gets the full RRT_SOLVE_TIME.
+        planner.setPlanningTime(search_cfg_.rrt_solve_time);
+        planner.setEarlyStop(path_invalid ? search_cfg_.rrt_replan_solve_time : 0.0);
         const double t_search = now();
         search_running_.store(true);
         const bool solved = planner.planPath(start, goal_vec, candidate);
@@ -2125,11 +2156,13 @@ void AutonomyCore::monitorLoop() {
     planning::MapHandle map;
     ConsGridHandle conservative;
     Eigen::Isometry3d world_from_map = Eigen::Isometry3d::Identity();
+    Eigen::Vector3d measured_pos = Eigen::Vector3d::Zero();  // world frame
     {
       std::lock_guard<std::mutex> lock(io_mutex_);
       map = map_;
       conservative = conservative_map_;
       world_from_map = world_from_map_;
+      measured_pos = state_.pos;
       if (monitor_config_dirty_) {
         monitor_cfg_ = pending_config_;
         monitor_config_dirty_ = false;
@@ -2227,8 +2260,15 @@ void AutonomyCore::monitorLoop() {
         const TrajRecord& active =
             (recs.size() > 1 && t < recs.back().traj.t0) ? recs.front() : recs.back();
         // Rooted where the reference is now, with the waypoints behind it dropped
-        // (see the solver).
-        const Eigen::Vector3d ref = map_from_world * common::sampleMotion(active.traj, t).pos;
+        // (see the solver). With bench_replan_from_state the solver starts every
+        // trajectory from the measured position instead, and on a disarmed bench
+        // the reference runs on while the drone stays put: rooted at the
+        // reference, this asked for a stop point the solver, rooted at the drone,
+        // could never reach, and every WAYPOINT solve was scrapped in a loop. So
+        // root it where the solver will.
+        const Eigen::Vector3d ref =
+            map_from_world * (c.bench_replan_from_state ? measured_pos
+                                                        : common::sampleMotion(active.traj, t).pos);
         std::vector<Eigen::Vector3d> epath;
         for (const auto& w : remainingCommittedSuffix(path, {ref.x(), ref.y(), ref.z()})) {
           epath.emplace_back(w[0], w[1], w[2]);

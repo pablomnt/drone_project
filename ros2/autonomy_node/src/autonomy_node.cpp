@@ -276,11 +276,8 @@ private:
     declare_parameter("RRT_REPLAN_SOLVE_TIME", 0.3);
     // Which OMPL planner to run: RRTstar | BITstar | ABITstar | AITstar | EITstar.
     // Live-reconfigurable so you can A/B them on the bench. Per-planner internal
-    // tunables live in geometric_planner.hpp (PlannerConfig). ABIT* since
-    // 2026-10-01: EIT* and AIT* check edges with their own point-by-point test
-    // and never consult the motion validator, so MAX_UNKNOWN_SLOPE does nothing
-    // for them.
-    declare_parameter<std::string>("PLANNER_TYPE", "ABITstar");
+    // tunables live in geometric_planner.hpp (PlannerConfig).
+    declare_parameter<std::string>("PLANNER_TYPE", "EITstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
     declare_parameter("CLEARANCE_WEIGHT", 1.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
@@ -291,12 +288,15 @@ private:
     // USE_CORRIDOR_QP on. The [plan] line's cost splits into `obst` and
     // `frontier` to show which is costing what.
     declare_parameter("FRONTIER_WEIGHT", 0.0);
-    // Steepest the search may route through never-observed space [deg]: the
-    // camera looks forward and roughly level (D435 depth view about +-29 deg
-    // vertically), so a path climbing or diving steeply into unknown space goes
-    // where the drone cannot see. Any slope through explored space. Needs
-    // TREAT_FRONTIER_AS_OBSTACLE; 0 disables it.
+    // Keep the search's path where the camera can see it (it looks forward and
+    // roughly level, D435 depth view about +-29 deg vertically): points in
+    // never-observed space steeper than MAX_UNKNOWN_SLOPE [deg] from the start
+    // are invalid, and edges steeper than it through unknown space cost
+    // UNKNOWN_SLOPE_WEIGHT per vertical metre beyond it (the `steep` term of
+    // the [plan] cost). Any slope through explored space. Needs
+    // TREAT_FRONTIER_AS_OBSTACLE; MAX_UNKNOWN_SLOPE 0 disables both.
     declare_parameter("MAX_UNKNOWN_SLOPE", 20.0);
+    declare_parameter("UNKNOWN_SLOPE_WEIGHT", 5.0);
     // Flat extra cost per metre of path routed through never-observed space.
     // CLEARANCE_WEIGHT cannot do this job: the distance field saturates at
     // CLEARANCE_THRESHOLD, so anything further than that from a mapped obstacle
@@ -381,7 +381,7 @@ private:
     // by what it cannot see beside it. Live-reconfigurable. NOTE: on a fresh map almost everything is frontier,
     // so with this on the drone is boxed in until it has mapped its surroundings
     // (e.g. an initial 360deg scan) — flip it off for open-loop bench tests.
-    declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", false);
+    declare_parameter("TREAT_FRONTIER_AS_OBSTACLE", true);
     // One [map] line per octomap: time since the previous one, and how long
     // decoding, the unknown shell, the two distance fields, the occupancy-map
     // publish and the whole callback took.
@@ -414,7 +414,7 @@ private:
     // the trajectory monitor, when smaller than their margins from mapped
     // obstacles (FRONTIER_MARGIN, CORRIDOR_MARGIN), which then apply to mapped
     // obstacles only. At or above them it changes nothing.
-    declare_parameter("UNKNOWN_MARGIN", 0.25);
+    declare_parameter("UNKNOWN_MARGIN", 0.2);
     // Clearance the corridor boxes keep from obstacles and unknown space [m].
     // A strictly harder test than the planner's 0.5 m collision margin: the
     // search only validates its centreline (and exempts a sphere at the start),
@@ -540,6 +540,7 @@ private:
     cfg.clearance_threshold = param("CLEARANCE_THRESHOLD").as_double();
     cfg.frontier_weight = param("FRONTIER_WEIGHT").as_double();
     cfg.max_unknown_slope = param("MAX_UNKNOWN_SLOPE").as_double();
+    cfg.unknown_slope_weight = param("UNKNOWN_SLOPE_WEIGHT").as_double();
     cfg.unknown_weight = param("UNKNOWN_WEIGHT").as_double();
     // Whether unmapped space is a hazard at all — drives the cost surcharge and
     // truncation's refusal to commit into unobserved cells. Passed as its own

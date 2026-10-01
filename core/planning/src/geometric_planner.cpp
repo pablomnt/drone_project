@@ -10,7 +10,6 @@
 #include <limits>
 #include <utility>
 
-#include <ompl/base/DiscreteMotionValidator.h>
 #include <ompl/base/PlannerData.h>
 #include <ompl/base/objectives/StateCostIntegralObjective.h>
 #include <ompl/base/samplers/informed/PathLengthDirectInfSampler.h>
@@ -45,11 +44,13 @@ public:
                      GeometricPlanner::ClearanceFn clearance, double weight,
                      GeometricPlanner::ClearanceFn frontier, double frontier_weight,
                      double threshold, GeometricPlanner::UnknownFn is_unknown,
-                     double unknown_weight)
+                     double unknown_weight, GeometricPlanner::UnknownFn steep_unknown = {},
+                     double slope_tan = 0.0, double steep_weight = 0.0)
       : ompl::base::StateCostIntegralObjective(si, /*enableMotionCostInterpolation=*/true),
         clearance_(std::move(clearance)), weight_(weight), frontier_(std::move(frontier)),
         frontier_weight_(frontier_weight), threshold_(threshold),
-        unknown_(std::move(is_unknown)), unknown_weight_(unknown_weight) {
+        unknown_(std::move(is_unknown)), unknown_weight_(unknown_weight),
+        steep_unknown_(std::move(steep_unknown)), slope_tan_(slope_tan), steep_weight_(steep_weight) {
     // Register a state->goal cost-to-go heuristic (distance to the goal region).
     // This is what RRT*'s informed sampler and the BIT*-lineage goal heuristic
     // query via hasCostToGoHeuristic()/costToGo(); without it OMPL warns that
@@ -57,6 +58,29 @@ public:
     // reason as motionCostHeuristic below: our integrand is >= 1, so true cost is
     // always >= geometric distance.
     setCostToGoHeuristic(&ompl::base::goalRegionCostToGo);
+  }
+
+  // The state integral, plus the steep-into-unknown term (see
+  // GeometricPlanner::setUnknownSlopeLimit): steep_weight x the vertical metres
+  // beyond the slope limit, times the fraction of the edge in unknown space.
+  ompl::base::Cost motionCost(const ompl::base::State* s1,
+                              const ompl::base::State* s2) const override {
+    const ompl::base::Cost base = ompl::base::StateCostIntegralObjective::motionCost(s1, s2);
+    if (!(steep_weight_ > 0.0) || !(slope_tan_ > 0.0) || !steep_unknown_) return base;
+    const auto* a = s1->as<ompl::base::RealVectorStateSpace::StateType>();
+    const auto* b = s2->as<ompl::base::RealVectorStateSpace::StateType>();
+    const double dx = b->values[0] - a->values[0], dy = b->values[1] - a->values[1],
+                 dz = b->values[2] - a->values[2];
+    const double excess = std::abs(dz) - slope_tan_ * std::hypot(dx, dy);
+    if (!(excess > 0.0)) return base;
+    constexpr double kStep = 0.1;  // [m]
+    const int n = std::max(1, static_cast<int>(std::ceil(std::sqrt(dx * dx + dy * dy + dz * dz) / kStep)));
+    int unknown = 0;
+    for (int i = 0; i <= n; ++i) {
+      const double t = static_cast<double>(i) / n;
+      unknown += steep_unknown_(a->values[0] + t * dx, a->values[1] + t * dy, a->values[2] + t * dz) ? 1 : 0;
+    }
+    return ompl::base::Cost(base.value() + steep_weight_ * excess * unknown / (n + 1));
   }
 
   ompl::base::Cost stateCost(const ompl::base::State* state) const override {
@@ -117,33 +141,9 @@ private:
   double threshold_;
   GeometricPlanner::UnknownFn unknown_;
   double unknown_weight_;
-};
-
-// The usual sampled collision check along an edge, plus an extra edge test
-// (the slope limit in unknown space) run first, since it is free for the
-// common shallow edge.
-class EdgeRuleMotionValidator : public ompl::base::DiscreteMotionValidator {
-public:
-  using EdgeRule = std::function<bool(const ompl::base::State*, const ompl::base::State*)>;
-  EdgeRuleMotionValidator(const ompl::base::SpaceInformationPtr& si, EdgeRule rule)
-      : ompl::base::DiscreteMotionValidator(si), rule_(std::move(rule)) {}
-
-  bool checkMotion(const ompl::base::State* s1, const ompl::base::State* s2) const override {
-    return rule_(s1, s2) && ompl::base::DiscreteMotionValidator::checkMotion(s1, s2);
-  }
-  bool checkMotion(const ompl::base::State* s1, const ompl::base::State* s2,
-                   std::pair<ompl::base::State*, double>& last_valid) const override {
-    if (!rule_(s1, s2)) {
-      // The rule is about the edge as a whole: nothing past its start is usable.
-      if (last_valid.first) si_->copyState(last_valid.first, s1);
-      last_valid.second = 0.0;
-      return false;
-    }
-    return ompl::base::DiscreteMotionValidator::checkMotion(s1, s2, last_valid);
-  }
-
-private:
-  EdgeRule rule_;
+  GeometricPlanner::UnknownFn steep_unknown_;
+  double slope_tan_;
+  double steep_weight_;
 };
 
 }  // namespace
@@ -179,36 +179,16 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
   // truncatePath, which samples every 5 cm. Convert the step to that fraction so
   // the search checks the same points truncation will.
   si_->setStateValidityCheckingResolution(kValidityCheckStep / space_->getMaximumExtent());
-  si_->setMotionValidator(std::make_shared<EdgeRuleMotionValidator>(
-      si_, [this](const ompl::base::State* a, const ompl::base::State* b) { return slopeOk(a, b); }));
   si_->setup();
 }
 
-void GeometricPlanner::setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg) {
+void GeometricPlanner::setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg,
+                                            double steep_weight) {
   slope_unknown_fn_ = std::move(is_unknown);
   max_slope_tan_ = max_slope_deg > 0.0 && max_slope_deg < 90.0
                        ? std::tan(max_slope_deg * M_PI / 180.0)
                        : 0.0;
-}
-
-bool GeometricPlanner::slopeOk(const ompl::base::State* a, const ompl::base::State* b) const {
-  if (!(max_slope_tan_ > 0.0) || !slope_unknown_fn_) return true;
-  const auto* pa = a->as<ompl::base::RealVectorStateSpace::StateType>();
-  const auto* pb = b->as<ompl::base::RealVectorStateSpace::StateType>();
-  const double dx = pb->values[0] - pa->values[0];
-  const double dy = pb->values[1] - pa->values[1];
-  const double dz = pb->values[2] - pa->values[2];
-  if (std::abs(dz) <= max_slope_tan_ * std::hypot(dx, dy)) return true;
-  // Steep: allowed only if no part of it is in never-observed space.
-  const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
-  const int n = std::max(1, static_cast<int>(std::ceil(len / kSlopeCheckStep)));
-  for (int i = 0; i <= n; ++i) {
-    const double t = static_cast<double>(i) / n;
-    if (slope_unknown_fn_(pa->values[0] + t * dx, pa->values[1] + t * dy, pa->values[2] + t * dz)) {
-      return false;
-    }
-  }
-  return true;
+  steep_weight_ = std::max(0.0, steep_weight);
 }
 
 void GeometricPlanner::anchorStart(double x, double y, double z) const {
@@ -253,6 +233,14 @@ bool GeometricPlanner::positionValid(double x, double y, double z) const {
   const double ey = y - start_pos_[1];
   const double ez = z - start_pos_[2];
   const double from_start = std::sqrt(ex * ex + ey * ey + ez * ez);
+
+  // The slope cone (see setUnknownSlopeLimit): never-observed space steeper
+  // than the limit from the start is where the camera will not be looking.
+  if (slopeActive() && std::abs(ez) > max_slope_tan_ * std::hypot(ex, ey) &&
+      slope_unknown_fn_(x, y, z)) {
+    return false;
+  }
+
   const double margin =
       escape_ramp_ > 0.0
           ? std::min(kCollisionMargin,
@@ -451,6 +439,9 @@ ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
     case PlannerType::BITstar: {
       auto p = std::make_shared<ompl::geometric::BITstar>(si_);
       const auto& c = params_.bitstar;
+      // OMPL renames a k-nearest BIT* itself, with a warning; name it first so
+      // the warning does not print on every search.
+      if (c.use_k_nearest) p->setName("kBITstar");
       p->setSamplesPerBatch(c.samples_per_batch);
       p->setRewireFactor(c.rewire_factor);
       p->setUseKNearest(c.use_k_nearest);
@@ -463,6 +454,7 @@ ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
       // truncation knobs.
       auto p = std::make_shared<ompl::geometric::ABITstar>(si_);
       const auto& c = params_.bitstar;
+      if (c.use_k_nearest) p->setName("kABITstar");  // see BIT* above
       p->setSamplesPerBatch(c.samples_per_batch);
       p->setRewireFactor(c.rewire_factor);
       p->setUseKNearest(c.use_k_nearest);
@@ -509,7 +501,8 @@ ompl::base::PlannerPtr GeometricPlanner::makePlanner() const {
 }
 
 ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective(
-    bool include_unknown, bool include_obstacles, bool include_frontier) const {
+    bool include_unknown, bool include_obstacles, bool include_frontier,
+    bool include_steep) const {
   // With no clearance function the per-state cost is a constant 1, so this is
   // exactly a path-length objective; with one it adds the proximity penalty.
   // With a separate cost field (see setCostClearance) the obstacle penalty is
@@ -524,7 +517,7 @@ ompl::base::OptimizationObjectivePtr GeometricPlanner::makeObjective(
       split ? cost_clearance_fn_ : ClearanceFn{}, include_frontier ? frontier_weight_ : 0.0,
       clearance_threshold_,
       (include_unknown && unknownPenaltyActive()) ? unknown_fn_ : UnknownFn{},
-      unknown_weight_);
+      unknown_weight_, slope_unknown_fn_, max_slope_tan_, include_steep ? steep_weight_ : 0.0);
 }
 
 bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
@@ -636,7 +629,27 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   planner->setup();
   t_setup = lap(mark);
 
-  const ompl::base::PlannerStatus solved = planner->solve(planning_time_);
+  // The budget, or (setEarlyStop) less once a path reaching the goal exists.
+  // Planners report such paths as they find them through the intermediate
+  // solution callback; hasExactSolution covers those that only add one to the
+  // problem definition.
+  ompl::base::PlannerTerminationCondition ptc =
+      ompl::base::timedPlannerTerminationCondition(planning_time_);
+  bool found_exact = false;
+  if (early_stop_ > 0.0 && early_stop_ < planning_time_) {
+    pdef->setIntermediateSolutionCallback(
+        [&found_exact](const ompl::base::Planner*, const std::vector<const ompl::base::State*>&,
+                       const ompl::base::Cost) { found_exact = true; });
+    const auto t_start = std::chrono::steady_clock::now();
+    const double early = early_stop_;
+    ptc = ompl::base::plannerOrTerminationCondition(
+        ptc, ompl::base::PlannerTerminationCondition([&found_exact, &pdef, t_start, early]() {
+          const double t =
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+          return t >= early && (found_exact || pdef->hasExactSolution());
+        }));
+  }
+  const ompl::base::PlannerStatus solved = planner->solve(ptc);
   t_solve = lap(mark);
 
   // Capture the tree for debug visualisation before the planner goes out of
@@ -814,12 +827,19 @@ GeometricPlanner::costBreakdown(const std::vector<std::vector<double>>& path) co
   if (unknownPenaltyActive()) {
     unknown = total - geo.cost(makeObjective(/*include_unknown=*/false)).value();
   }
-  CostBreakdown cb{length, total - length - unknown, unknown, total};
+  double steep = 0.0;
+  if (slopeActive() && steep_weight_ > 0.0) {
+    steep = total - geo.cost(makeObjective(true, true, true, /*include_steep=*/false)).value();
+  }
+  CostBreakdown cb{length, total - length - unknown - steep, unknown, total};
+  cb.steep = steep;
   // The frontier's share, with the obstacle weight switched off. The integral
   // is linear in the per-state terms, so the obstacle share is the rest.
   if (cost_clearance_fn_ && clearance_fn_) {
     const double frontier =
-        geo.cost(makeObjective(/*include_unknown=*/false, /*include_obstacles=*/false)).value() -
+        geo.cost(makeObjective(/*include_unknown=*/false, /*include_obstacles=*/false,
+                               /*include_frontier=*/true, /*include_steep=*/false))
+            .value() -
         length;
     cb.frontier = std::clamp(frontier, 0.0, std::max(cb.clearance, 0.0));
     cb.split = true;

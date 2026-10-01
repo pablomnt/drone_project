@@ -289,8 +289,9 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   **Goal changes mid-flight (2026-09-29).** Three changes, driven by a goal behind the drone at cruise
   that retried infeasible splices until the old trajectory ran out: (1) the search thread wakes at once
   on a new goal or a divergence replan instead of waiting out `RRT_MONITOR_PERIOD`, and a search that
-  must produce a path now (new goal, blocked or missing path) uses `RRT_REPLAN_SOLVE_TIME` (0.3 s)
-  instead of `RRT_SOLVE_TIME`; (2) while a trajectory is flown the search starts from the point where
+  must produce a path now (new goal, blocked or missing path) stops at `RRT_REPLAN_SOLVE_TIME` (0.3 s)
+  if a path reaching the goal exists by then, else runs on to `RRT_SOLVE_TIME` (since 2026-10-01,
+  `GeometricPlanner::setEarlyStop`; it used to get 0.3 s flat); (2) while a trajectory is flown the search starts from the point where
   the new trajectory will be spliced on (the current trajectory at now + budget + half a monitor tick
   + `kTrajgenLead`), not from the drone, so path and trajectory start together; (3) the solver roots
   every path with `remainingCommittedSuffix` (it used to only overwrite the first waypoint, leaving a
@@ -771,7 +772,11 @@ shrinks to zero within its duration (observed 2026-09-16: 1.91 → 1.81 → 1.02
 replan period apart, with the geometric path unchanged). In flight it would restart every replan
 from zero velocity, so the node warns every 2 s while it is on and the controller is engaged.
 Covered by the bench-flag block in `test_autonomy_core` (flag off must splice ahead, on must start
-at the measured position).
+at the measured position). With the flag on, the trajectory monitor's `WAYPOINT_ADVANCED`
+re-truncation is also rooted at the measured position, not the reference (2026-10-01): on the
+disarmed bench the reference runs on while the drone stays put, so it asked for a stop point the
+solver (rooted at the drone) never reached, and every WAYPOINT solve was scrapped in a loop
+(`stops 0.47 m short of the current stop point`).
 
 So `POS_SP` is a **pre-takeoff / no-goal setpoint only**. There is no "return to setpoint" or abort
 path through it, and **there is no goal-cancel API at all**: `AutonomyCore::has_goal_` is set by
@@ -1275,9 +1280,8 @@ publish nothing and cost nothing when the flag is off:
   false the planner never extracts the OMPL tree (`getPlannerData`), the EDT is never sampled, the
   corridor snapshot is never taken, and the publish methods early-return. **Now defaulted true for
   bench validation** — turn it off for a real flight so the NUC pays nothing for it.
-- `TREAT_FRONTIER_AS_OBSTACLE` (bool, **currently defaulted `false`** for corridor bench tests, so
-  the decomposition is exercised against real obstacles alone; `true` is the intended flight
-  setting) — build a `planning::ConservativeGrid` (`core/planning/src/conservative_grid.cpp`) from each
+- `TREAT_FRONTIER_AS_OBSTACLE` (bool, default `true` since 2026-10-01, the intended flight setting;
+  it was `false` for the early corridor bench tests) — build a `planning::ConservativeGrid` (`core/planning/src/conservative_grid.cpp`) from each
   incoming octomap: one byte per voxel (free / occupied / shell / never observed) over the map's box,
   cropped to the search box grown by the fields' saturation distance (`AutonomyCore::mapCrop`).
   Never-observed voxels inside a keep-out around the drone are marked **free** — a 0.6 m ball behind
@@ -1325,24 +1329,27 @@ publish nothing and cost nothing when the flag is off:
   *path prefix* keeps from mapped obstacles, and from unknown space unless `UNKNOWN_MARGIN` is
   smaller. Enforced exactly as set; a committed point must still have strictly positive clearance
   whatever the value, so the prefix can never reach into an occupied or unknown voxel.
-- `MAX_UNKNOWN_SLOPE` (double, default `20` deg, 2026-10-01, NOT yet benched) — steepest edge the
-  search may route through never-observed space (`GeometricPlanner::setUnknownSlopeLimit`, read from
-  the conservative grid so the keep-out counts as seen). The camera looks forward and roughly level
-  (D435 depth about ±29° vertically), so the optimistic path should only go where the drone will be
-  looking when it gets there; through explored space any slope is fine. Enforced in a custom
-  `MotionValidator` (`EdgeRuleMotionValidator`), so the search, `isPathValid` and the shortcuts all
-  obey it, and it only removes edges (heuristics stay admissible). **EIT\* and AIT\* bypass it**:
-  they check edges with their own point-by-point test and never call the motion validator, and OMPL
-  offers no hook, so the node's default `PLANNER_TYPE` became `ABITstar` and the search logs a
-  `WARNING` when the limit is on with either. Goes with `UNKNOWN_WEIGHT` = `FRONTIER_WEIGHT` = 0 (node
-  defaults since the same day): the idea is to take the genuinely shortest optimistic route and let
-  truncation advance as the camera confirms it, rather than steer away from unknown space.
-  `ctest -R unknown_cost` test 10 (mutation-checked). **Open: an intermittent segfault inside OMPL's
-  BIT\*/ABIT\*** (`BITstar::bestPathFromGoalToStart` → `Vertex::state`, while publishing a
-  solution), seen in that test about 1 run in 5, and in a scratch reproducer 1 in 25-60 solves with
-  ABIT\* + the slope rule and once in 60 with BIT\* + the rule; not yet seen without the rule, but too
-  few runs to say. It would kill the node, so resolve it before flying with ABIT\*/BIT\*.
-- `UNKNOWN_MARGIN` (double, default `0.25` m, 2026-10-01, NOT yet benched) — clearance from
+- `MAX_UNKNOWN_SLOPE` (double, default `20` deg) / `UNKNOWN_SLOPE_WEIGHT` (default `5`)
+  (2026-10-01, NOT yet benched) — keep the search's path where the camera can see it: it looks
+  forward and roughly level (D435 depth about ±29° vertically), so the optimistic path should only
+  go where the drone will be looking (`GeometricPlanner::setUnknownSlopeLimit`, unknown read from the
+  conservative grid so the keep-out counts as seen; any slope through explored space). **Hard, per
+  point:** a point in unknown space steeper than the limit *from the start* is invalid (a cone
+  anchored with the escape ramp in `positionValid`) — a point check, so every planner obeys it, goal
+  projection included. **Soft, per edge:** an edge steeper than the limit through unknown space costs
+  `UNKNOWN_SLOPE_WEIGHT` × the vertical metres beyond it × its fraction in unknown space
+  (`ClearanceObjective::motionCost`; the `steep` term on the `[plan]` cost) — the cone alone would
+  allow a steep stretch far from the start. **History:** it was first a hard *edge* rule in a custom
+  `MotionValidator` (`96e56ea`); EIT\*/AIT\* never call the motion validator (they check edges point by
+  point themselves), and with BIT\*/ABIT\* it made OMPL segfault intermittently in
+  `BITstar::bestPathFromGoalToStart` (seeded repro: 5/200 ABIT\*, 8/200 BIT\*, only with the rule
+  *and* pruning on) and starved the first search (100 samples over the 60 × 60 × 6.5 m box could not
+  find a gentle detour in 0.3 s). The cone + cost replaced it the same day: 0/200 crashes, 200/200
+  paths in 0.3 s with ABIT\* and BIT\*. Goes with `UNKNOWN_WEIGHT` = `FRONTIER_WEIGHT` = 0 (take the
+  shortest optimistic route, let truncation advance as the camera confirms). Expect more replans: the
+  cone's apex moves with the drone, so points further along a committed path can leave it and the
+  monitor calls the path blocked. `ctest -R unknown_cost` test 10 (ABIT\* and EIT\*).
+- `UNKNOWN_MARGIN` (double, default `0.2` m (0.25 until later on 2026-10-01), NOT yet benched) — clearance from
   never-observed space for truncation, the corridor and the trajectory monitor, when smaller than
   their margins from mapped obstacles (`FRONTIER_MARGIN` for truncation, `CORRIDOR_MARGIN` for the
   corridor and the monitor). Truncation and the monitor test `min(d_raw, d_cons + margin −

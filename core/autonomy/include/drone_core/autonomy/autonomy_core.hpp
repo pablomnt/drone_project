@@ -131,13 +131,16 @@ public:
     // the raw octree, where a cell with no node has never been observed — so
     // they should stay on whenever the operator asked for them.
     bool treat_unknown_as_hazard{true};
-    // Steepest edge the search may route through never-observed space [deg]
+    // Keep the search's path where the camera can see it
     // (GeometricPlanner::setUnknownSlopeLimit): the camera looks forward and
-    // roughly level (the D435's depth view is about +-29 deg vertically), so a
-    // path climbing or diving steeply into unknown space goes where the drone
-    // cannot see. Through explored space any slope is allowed. Only with
-    // treat_unknown_as_hazard; <= 0 disables it.
+    // roughly level (the D435's depth view is about +-29 deg vertically).
+    // Points in never-observed space steeper than max_unknown_slope [deg] from
+    // the start are invalid, and edges steeper than it through unknown space
+    // cost unknown_slope_weight per vertical metre beyond it. Through explored
+    // space any slope is allowed. Only with treat_unknown_as_hazard; <= 0
+    // disables both.
     double max_unknown_slope{20.0};
+    double unknown_slope_weight{5.0};
     // Trajectory monitor (see monitorLoop). The trajectory being flown is kept
     // until there is a reason to replace it; the monitor looks for one this many
     // times a second.
@@ -180,7 +183,7 @@ public:
     // trajectory monitor [m], when smaller than their margin from mapped
     // obstacles (frontier_margin for truncation, corridor_margin for the other
     // two); a value at or above those leaves them as they were.
-    double unknown_margin{0.25};
+    double unknown_margin{0.2};
     // Clearance the corridor boxes must have from obstacles AND unknown space
     // [m]. This is a strictly harder test than the planner's collision margin:
     // the search only checks its centreline (and exempts a sphere at the
@@ -685,7 +688,6 @@ private:
   mutable std::mutex path_mutex_;
   std::vector<std::vector<double>> committed_path_;
   std::uint64_t path_version_{0};  // bumped on every setCommittedPath; guarded by path_mutex_
-  bool slope_bypass_warned_{false};  // search thread only: see the slope limit in searchLoop
 
   // What the trajectory being flown lacks, worked out by the monitor at the
   // start of every tick (see monitorLoop).

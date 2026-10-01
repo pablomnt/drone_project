@@ -196,16 +196,21 @@ public:
   // samples independently at its own resolution.
   void setUnknownPenalty(UnknownFn is_unknown, double weight);
 
-  // Forbid edges (the straight segments between waypoints) steeper than
-  // `max_slope_deg` from horizontal wherever they touch never-observed space
-  // (`is_unknown`, sampled every kSlopeCheckStep along a steep edge). The camera
-  // only looks forward and roughly level, so a path that climbs or dives steeply
-  // into unknown space goes where the drone cannot see; through explored space
-  // any slope is fine. Enforced in the motion validator, so it holds for the
-  // search, isPathValid and every shortcut alike, and only removes edges (no
-  // cost changes, so the informed planners' heuristics stay admissible). An
-  // empty function or max_slope_deg <= 0 disables it (the default).
-  void setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg);
+  // Keep the path where the camera can see it: it only looks forward and
+  // roughly level, so climbing or diving steeply into never-observed space
+  // (`is_unknown`) goes where the drone cannot look. Two parts:
+  //  - HARD, per point: a point in unknown space is invalid when the slope of
+  //    the line from the start to it exceeds `max_slope_deg` (a cone around the
+  //    start, anchored where the escape ramp is). A point check, so every OMPL
+  //    planner obeys it (EIT*/AIT* never call the motion validator) and nothing
+  //    unusual reaches OMPL's pruning.
+  //  - SOFT, per edge: the cost gains steep_weight x the vertical metres an edge
+  //    climbs beyond that slope, times the fraction of it in unknown space —
+  //    which catches a steep stretch far from the start that the cone allows.
+  //    Never negative, so the planners' heuristics stay admissible.
+  // Through explored space any slope is fine. An empty function or
+  // max_slope_deg <= 0 disables both (the default).
+  void setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg, double steep_weight);
 
   // Select which OMPL planner planPath builds. The per-planner parameters come
   // from the PlannerConfig defaults in this header. Default is RRT*.
@@ -224,6 +229,11 @@ public:
 
   // Optimisation budget for the next planPath [s] (the constructor sets the first).
   void setPlanningTime(double seconds) { planning_time_ = seconds; }
+  // Stop the next planPath early: once `seconds` have passed AND a path that
+  // reaches the goal has been found (else it runs the full planning time). For
+  // the searches that must produce a path now: quick when the path is easy,
+  // the full budget when it is not. <= 0 (the default) disables it.
+  void setEarlyStop(double seconds) { early_stop_ = seconds; }
 
   // Distance [m] over which the validity margin ramps from 0 at the start to
   // the full collision margin (see positionValid). The host passes the same
@@ -315,6 +325,7 @@ public:
     double total;      // length + clearance + unknown (== pathCost(path))
     double frontier = 0.0;  // the frontier's share of `clearance` (see above)
     bool split = false;     // `frontier` was computed (two distinct fields)
+    double steep = 0.0;     // steep-into-unknown term (setUnknownSlopeLimit), in total
   };
   CostBreakdown costBreakdown(const std::vector<std::vector<double>>& path) const;
 
@@ -384,7 +395,8 @@ private:
   // costBreakdown uses them to separate the terms.
   ompl::base::OptimizationObjectivePtr makeObjective(bool include_unknown = true,
                                                      bool include_obstacles = true,
-                                                     bool include_frontier = true) const;
+                                                     bool include_frontier = true,
+                                                     bool include_steep = true) const;
 
   // Construct and configure the OMPL planner selected by planner_type_, applying
   // the matching PlannerConfig sub-struct. Called once per planPath.
@@ -428,6 +440,7 @@ private:
   ompl::base::SpaceInformationPtr si_;
 
   double planning_time_;  // optimisation budget per solve [s]
+  double early_stop_ = 0.0;  // see setEarlyStop [s]
   PlannerType planner_type_ = PlannerType::RRTstar;  // which OMPL planner to build
   PlannerConfig params_{};                           // per-planner tunables (header defaults)
 
@@ -462,9 +475,8 @@ private:
   // Slope limit in never-observed space (see setUnknownSlopeLimit).
   UnknownFn slope_unknown_fn_;
   double max_slope_tan_ = 0.0;  // tan of the limit; <= 0 disables
-  static constexpr double kSlopeCheckStep = 0.05;  // [m]
-  // Whether the edge a -> b obeys the slope limit.
-  bool slopeOk(const ompl::base::State* a, const ompl::base::State* b) const;
+  double steep_weight_ = 0.0;
+  bool slopeActive() const { return max_slope_tan_ > 0.0 && static_cast<bool>(slope_unknown_fn_); }
 
   // Largest search (in sampled states) whose tree is copied out for the debug
   // viz; see planPath. Measured 2026-09-29: normal searches sample 500-2000

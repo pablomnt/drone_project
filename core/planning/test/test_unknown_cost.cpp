@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -799,42 +800,86 @@ int main() {
     expect(holes == 0, "the shell has " + std::to_string(holes) + " holes");
   }
 
-  // 10. The slope limit in unknown space (setUnknownSlopeLimit): a goal 2 m up
-  //     and 3 m along (34 deg). With everything never observed, no edge of the
-  //     path may be steeper than 20 deg; with everything observed the limit
-  //     must not bite (a steep edge is fine); and isPathValid must reject a
-  //     steep edge through unknown space.
+  // 10. Keeping the path where the camera can see it (setUnknownSlopeLimit).
+  //     Hard: no point of a path in unknown space steeper than 20 deg from the
+  //     start, for every planner (EIT* included — it is a point check). Soft:
+  //     an edge steeper than 20 deg through unknown space costs weight x the
+  //     vertical metres beyond it. Through explored space neither applies.
   {
-    const auto slopeDeg = [](const std::vector<double>& a, const std::vector<double>& b) {
-      const double h = std::hypot(b[0] - a[0], b[1] - a[1]);
-      return std::atan2(std::abs(b[2] - a[2]), h) * 180.0 / M_PI;
+    const auto slopeFrom = [](const std::vector<double>& a, const std::vector<double>& b) {
+      return std::atan2(std::abs(b[2] - a[2]), std::hypot(b[0] - a[0], b[1] - a[1])) * 180.0 / M_PI;
     };
     const auto allUnknown = [](double, double, double) { return true; };
     const auto allKnown = [](double, double, double) { return false; };
-    {
-      GeometricPlanner planner(empty, /*planning_time=*/1.0);
-      planner.setPlannerType(PlannerType::ABITstar);  // EIT*/AIT* check edges themselves and bypass the rule
+    for (const PlannerType type : {PlannerType::ABITstar, PlannerType::EITstar}) {
+      const std::string name = toString(type);
+      // A reachable goal (9.5 deg): every waypoint inside the cone.
+      GeometricPlanner planner(empty, /*planning_time=*/0.5);
+      planner.setPlannerType(type);
       planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
-      planner.setUnknownSlopeLimit(allUnknown, 20.0);
+      planner.setUnknownSlopeLimit(allUnknown, 20.0, 5.0);
       std::vector<std::vector<double>> path;
-      const bool ok = planner.planPath({0, 0, 1}, {3, 0, 3}, path);
-      expect(ok && path.size() >= 2, "slope limit: no path to a goal reachable with a gentler climb");
+      expect(planner.planPath({0, 0, 1}, {6, 0, 2}, path) && path.size() >= 2,
+             name + " slope cone: no path to a 9.5 deg goal");
       double worst = 0.0;
-      for (std::size_t i = 0; i + 1 < path.size(); ++i) worst = std::max(worst, slopeDeg(path[i], path[i + 1]));
+      for (const auto& w : path) worst = std::max(worst, slopeFrom(path.front(), w));
       expect(worst <= 20.0 + 1e-6,
-             "slope limit: an edge through unknown space climbs at " + std::to_string(worst) + " deg");
-      expect(!planner.isPathValid({{0, 0, 1}, {3, 0, 3}}),
-             "slope limit: isPathValid accepted a 34 deg edge through unknown space");
-      expect(planner.isPathValid({{0, 0, 1}, {6, 0, 2}}),
-             "slope limit: isPathValid rejected a 9.5 deg edge");
+             name + " slope cone: a waypoint at " + std::to_string(worst) + " deg from the start");
+      // A goal outside the cone (34 deg): best effort ends inside it.
+      GeometricPlanner be(empty, /*planning_time=*/0.5);
+      be.setPlannerType(type);
+      be.setBestEffort(true);
+      be.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+      be.setUnknownSlopeLimit(allUnknown, 20.0, 5.0);
+      std::vector<std::vector<double>> p2;
+      if (be.planPath({0, 0, 1}, {3, 0, 3}, p2) && p2.size() >= 2) {
+        expect(slopeFrom(p2.front(), p2.back()) <= 20.0 + 1e-6,
+               name + " slope cone: best effort ended outside the cone");
+      }
     }
     {
       GeometricPlanner planner(empty, /*planning_time=*/0.5);
       planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
-      planner.setUnknownSlopeLimit(allKnown, 20.0);
-      expect(planner.isPathValid({{0, 0, 1}, {3, 0, 3}}),
-             "slope limit: a steep edge through explored space was rejected");
+      planner.setUnknownSlopeLimit(allUnknown, 20.0, 5.0);
+      expect(!planner.isPathValid({{0, 0, 1}, {1, 0, 2}}),
+             "slope cone: isPathValid accepted a 45 deg point in unknown space");
+      // The cost: 2 m up over 1 m, 20 deg allows 0.364 m, so 1.636 m beyond, x5.
+      const auto cb = planner.costBreakdown({{0, 0, 1}, {1, 0, 3}});
+      expectNear(cb.steep, 5.0 * (2.0 - std::tan(20.0 * M_PI / 180.0)), 1e-6,
+                 "slope cost: wrong steep term");
+      expectNear(cb.total, cb.length + cb.clearance + cb.unknown + cb.steep, 1e-9,
+                 "slope cost: terms do not sum to the total");
+      expectNear(planner.costBreakdown({{0, 0, 1}, {6, 0, 2}}).steep, 0.0, 1e-12,
+                 "slope cost: charged a shallow edge");
     }
+    {
+      GeometricPlanner planner(empty, /*planning_time=*/0.5);
+      planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+      planner.setUnknownSlopeLimit(allKnown, 20.0, 5.0);
+      expect(planner.isPathValid({{0, 0, 1}, {1, 0, 2}}),
+             "slope cone: a steep point in explored space was rejected");
+      expectNear(planner.costBreakdown({{0, 0, 1}, {1, 0, 3}}).steep, 0.0, 1e-12,
+                 "slope cost: charged a steep edge through explored space");
+    }
+  }
+
+  // 11. Early stop (setEarlyStop): with a 1 s budget and a 0.2 s early stop, an
+  //     easy path returns soon after 0.2 s; without it RRT* uses the full second.
+  {
+    const auto timed = [&](double early) {
+      GeometricPlanner planner(empty, /*planning_time=*/1.0);
+      planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+      planner.setEarlyStop(early);
+      std::vector<std::vector<double>> path;
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool ok = planner.planPath({0, 0, 1}, {3, 0, 1}, path);
+      const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      expect(ok, "early stop: no path on an empty map");
+      return t;
+    };
+    const double with = timed(0.2), without = timed(0.0);
+    expect(with < 0.5, "early stop: an easy search took " + std::to_string(with) + " s, not ~0.2 s");
+    expect(without > 0.8, "early stop: without it the search ended at " + std::to_string(without) + " s");
   }
 
   // 9. ConservativeGrid, the stamp-free replacement for 8: the same shell,
