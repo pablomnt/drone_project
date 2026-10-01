@@ -122,6 +122,27 @@ planning::CorridorClearanceFn makeClearanceFn(std::shared_ptr<const planning::Di
   };
 }
 
+// A clearance for a test that wants `margin` from mapped obstacles but only
+// `margin - relief` from never-observed space: min(d_obstacles, d_all + relief),
+// with d_all the conservative field (obstacles and the unknown shell) and
+// d_obstacles the raw map's (`obstacles`, null when nothing is mapped: then as
+// far as it could say). Held to `margin`, that is exactly d_obstacles >= margin
+// and d_all >= margin - relief. relief <= 0 gives the conservative field as is.
+planning::CorridorClearanceFn makeSplitClearanceFn(
+    planning::CorridorClearanceFn all, std::shared_ptr<const planning::DistanceField> obstacles,
+    double obstacles_maxd, double relief) {
+  if (!(relief > 0.0)) return all;
+  if (!obstacles) {
+    return [all = std::move(all), obstacles_maxd, relief](double x, double y, double z) {
+      return std::min(obstacles_maxd, all(x, y, z) + relief);
+    };
+  }
+  return [all = std::move(all), obs = makeClearanceFn(std::move(obstacles), obstacles_maxd),
+          relief](double x, double y, double z) {
+    return std::min(obs(x, y, z), all(x, y, z) + relief);
+  };
+}
+
 // "Has this point ever been observed?" as a predicate over the octree. A cell
 // with no node has never been touched by a sensor ray, which is exactly the
 // question, and search() is an O(log n) descent with no allocation. Correct
@@ -644,11 +665,6 @@ std::vector<std::vector<double>> AutonomyCore::sampledPlannedPath(double sample_
   return path;
 }
 
-std::vector<std::vector<double>> AutonomyCore::geometricPath() const {
-  std::lock_guard<std::mutex> lock(traj_mutex_);
-  return last_geometric_path_;
-}
-
 std::vector<std::array<double, 4>> AutonomyCore::clearanceSamples() const {
   std::lock_guard<std::mutex> lock(traj_mutex_);
   return last_clearance_samples_;
@@ -734,10 +750,18 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
 
     const double maxd = std::max(cfg_.clearance_threshold, cfg_.frontier_margin);
     const planning::CorridorClearanceFn cons_fn = makeClearanceFn(cons_edt, maxd);
+    // Truncation holds mapped obstacles to frontier_margin and never-observed
+    // space only to unknown_margin (when that is smaller and there is a grid).
+    const planning::CorridorClearanceFn trunc_fn =
+        cons_grid ? makeSplitClearanceFn(cons_fn, clearanceField(map, cfg_.clearance_threshold),
+                                         cfg_.clearance_threshold,
+                                         cfg_.frontier_margin - cfg_.unknown_margin)
+                  : cons_fn;
 
     planning::CorridorParams params;
     params.max_segment_len = cfg_.max_segment_len;
     params.margin = cfg_.corridor_margin;
+    params.unknown_margin = cons_grid ? cfg_.unknown_margin : -1.0;
     params.local_bbox = cfg_.corridor_bbox;
     // The trajectory stays inside the box the search plans in (grown by
     // buildCorridor to hold the path's own waypoints).
@@ -770,7 +794,7 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
     planning::TruncationCut cut;
     const double trunc_margin = cfg_.frontier_margin * (1.0 - kTruncationTolerance);
     const auto committed =
-        planning::truncatePath(cons_fn, epath, trunc_margin, cfg_.escape_ramp_dist,
+        planning::truncatePath(trunc_fn, epath, trunc_margin, cfg_.escape_ramp_dist,
                                /*sample_step=*/0.05, unknown_fn, &cut,
                                /*start_floor_slack=*/res,
                                /*start_floor_rel=*/kTruncationTolerance);
@@ -787,7 +811,8 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
         os << "never-observed space";
       } else {
         os << "clearance " << cut.clearance << " m < required " << cut.required
-           << " m (FRONTIER_MARGIN " << cfg_.frontier_margin << " m less "
+           << " m (FRONTIER_MARGIN " << cfg_.frontier_margin << " m from obstacles, UNKNOWN_MARGIN "
+           << cfg_.unknown_margin << " m from unknown, less "
            << kTruncationTolerance * 100.0 << "% tolerance, ramped over ESCAPE_RAMP_DIST "
            << cfg_.escape_ramp_dist << " m, floored at " << cut.floor
            << " m from the root's clearance " << cut.root_clearance << " m)";
@@ -910,6 +935,13 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       std::vector<Eigen::Vector3d> pts;
       if (cons_grid) {  // occupied + shell cells: real obstacles and unobserved space
         cons_grid->obstaclesIn(lo, hi, pts);
+        // Mapped obstacles first, then the shell, which the corridor holds to
+        // unknown_margin (CorridorParams::first_unknown).
+        const auto shell_from =
+            std::stable_partition(pts.begin(), pts.end(), [&](const Eigen::Vector3d& q) {
+              return cons_grid->at(q.x(), q.y(), q.z()) != planning::ConservativeGrid::kShell;
+            });
+        params.first_unknown = static_cast<std::size_t>(shell_from - pts.begin());
         return pts;
       }
       const octomap::point3d bmin(static_cast<float>(lo.x()), static_cast<float>(lo.y()),
@@ -1124,12 +1156,6 @@ void AutonomyCore::runPreset(const common::State& state, const Eigen::Isometry3d
   path.reserve(waypoints.size());
   for (const auto& w : waypoints) path.push_back({w.x(), w.y(), w.z()});
   path.front() = {anchor.start.pos.x(), anchor.start.pos.y(), anchor.start.pos.z()};
-
-  // Republish the preset as the geometric path so it shows on /planner/geometric_path.
-  {
-    std::lock_guard<std::mutex> lock(traj_mutex_);
-    last_geometric_path_ = path;
-  }
 
   common::Trajectory traj;
   // Pin the waypoints. For a preset the shape IS the test — with the junctions
@@ -1384,8 +1410,8 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   //
   // This never touches validity, so unknown space stays enterable and a goal
   // beyond the frontier is still accepted — it just stops being free.
-  if (cfg_.treat_unknown_as_hazard) {
-    planner.setUnknownPenalty(makeUnknownFn(map), cfg_.unknown_weight);
+  if (search_cfg_.treat_unknown_as_hazard) {
+    planner.setUnknownPenalty(makeUnknownFn(map), search_cfg_.unknown_weight);
   }
   return true;
 }
@@ -1503,12 +1529,10 @@ void AutonomyCore::searchLoop() {
       const std::vector<double> start = {pos_map.x(), pos_map.y(), pos_map.z()};
       const std::vector<double> goal_vec = {goal.pos.x(), goal.pos.y(), goal.pos.z()};
 
-      // Commit a path: keep it on the worker and republish for visualisation.
+      // Commit a path: keep it on the worker and publish it to trajgen.
       auto adopt = [this, &committed_path](const std::vector<std::vector<double>>& p) {
         committed_path = p;
         setCommittedPath(p);
-        std::lock_guard<std::mutex> lock(traj_mutex_);
-        last_geometric_path_ = p;  // viz copy; presets write this one too
       };
 
       // Which map view the geometric search (and the committed-path monitor)
@@ -1534,6 +1558,24 @@ void AutonomyCore::searchLoop() {
       planner.setBestEffort(search_cfg_.best_effort_goal);
       planner.setEscapeRamp(search_cfg_.escape_ramp_dist);
       applyClearanceObjective(planner, search_map, conservative);
+      // Never-observed space here is the grid's view when there is one (the
+      // keep-out around the drone counts as seen, so it can still climb off the
+      // bench), else the raw map's.
+      if (search_cfg_.treat_unknown_as_hazard) {
+        planner.setUnknownSlopeLimit(makeUnknownFn(search_map, conservative),
+                                     search_cfg_.max_unknown_slope);
+        // EIT* and AIT* check edges with their own point-by-point test and never
+        // consult the motion validator the limit lives in. Say so once per change.
+        const bool bypassed = search_cfg_.max_unknown_slope > 0.0 &&
+                              (search_cfg_.planner_type == planning::PlannerType::EITstar ||
+                               search_cfg_.planner_type == planning::PlannerType::AITstar);
+        if (bypassed && !slope_bypass_warned_) {
+          DRONE_LOG_INFO("[plan] WARNING: " << planning::toString(search_cfg_.planner_type)
+                                   << " checks edges itself and ignores MAX_UNKNOWN_SLOPE; use "
+                                      "ABITstar, BITstar or RRTstar for the slope limit");
+        }
+        slope_bypass_warned_ = bypassed;
+      }
 
       // Debug-only: re-sample the clearance field when the map changes (the EDT
       // is now current for this tick). Gated so a regular flight never walks the
@@ -2113,8 +2155,23 @@ void AutonomyCore::monitorLoop() {
     const Eigen::Isometry3d map_from_world = world_from_map.inverse();
     const bool corridor = c.use_corridor_qp;
     const auto field = corridor ? conservativeField(map, conservative, maxd) : nullptr;
-    const planning::CorridorClearanceFn clearance =
+    const planning::CorridorClearanceFn cons_clearance =
         field ? makeClearanceFn(field, maxd) : planning::CorridorClearanceFn{};
+    // The trajectory check holds mapped obstacles to corridor_margin and
+    // never-observed space to unknown_margin, as the corridor was built; the
+    // WAYPOINT truncation re-run uses truncation's own split (see the solver).
+    const auto obstacle_field =
+        field && conservative ? clearanceField(map, c.clearance_threshold) : nullptr;
+    const planning::CorridorClearanceFn clearance =
+        field && conservative
+            ? makeSplitClearanceFn(cons_clearance, obstacle_field, c.clearance_threshold,
+                                   c.corridor_margin - c.unknown_margin)
+            : cons_clearance;
+    const planning::CorridorClearanceFn trunc_clearance =
+        field && conservative
+            ? makeSplitClearanceFn(cons_clearance, obstacle_field, c.clearance_threshold,
+                                   c.frontier_margin - c.unknown_margin)
+            : cons_clearance;
     // Read from the stamped view, like truncation's (see the solver).
     const planning::CorridorUnknownFn unknown =
         c.treat_unknown_as_hazard ? makeUnknownFn(map, conservative)
@@ -2177,7 +2234,7 @@ void AutonomyCore::monitorLoop() {
           epath.emplace_back(w[0], w[1], w[2]);
         }
         const auto committed = planning::truncatePath(
-            clearance, epath, c.frontier_margin * (1.0 - kTruncationTolerance), c.escape_ramp_dist,
+            trunc_clearance, epath, c.frontier_margin * (1.0 - kTruncationTolerance), c.escape_ramp_dist,
             0.05, unknown, nullptr, map->getResolution(), kTruncationTolerance);
         if (committed.size() >= 2) {
           constexpr double kMinAdvance = 0.05;  // below this it is noise, not progress [m]

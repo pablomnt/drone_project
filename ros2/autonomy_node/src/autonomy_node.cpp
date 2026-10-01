@@ -195,7 +195,6 @@ public:
     pub_command_ = create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
     pub_debug_ = create_publisher<drone_interfaces::msg::ControllerDebug>("/debug/telemetry", 10);
     pub_path_ = create_publisher<nav_msgs::msg::Path>("/smooth_trajectory", 10);
-    pub_geom_path_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/geometric_path", 10);
     pub_goal_marker_ = create_publisher<visualization_msgs::msg::Marker>("/planner/goal_marker", 10);
     pub_clearance_field_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/clearance_field", 10);
     pub_occupancy_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/occupancy_map", 10);
@@ -277,8 +276,11 @@ private:
     declare_parameter("RRT_REPLAN_SOLVE_TIME", 0.3);
     // Which OMPL planner to run: RRTstar | BITstar | ABITstar | AITstar | EITstar.
     // Live-reconfigurable so you can A/B them on the bench. Per-planner internal
-    // tunables live in geometric_planner.hpp (PlannerConfig).
-    declare_parameter<std::string>("PLANNER_TYPE", "EITstar");
+    // tunables live in geometric_planner.hpp (PlannerConfig). ABIT* since
+    // 2026-10-01: EIT* and AIT* check edges with their own point-by-point test
+    // and never consult the motion validator, so MAX_UNKNOWN_SLOPE does nothing
+    // for them.
+    declare_parameter<std::string>("PLANNER_TYPE", "ABITstar");
     declare_parameter("REPLAN_IMPROVE_RATIO", 0.85);
     declare_parameter("CLEARANCE_WEIGHT", 1.0);
     declare_parameter("CLEARANCE_THRESHOLD", 1.0);
@@ -288,7 +290,13 @@ private:
     // nearest mapped obstacle. Used only with TREAT_FRONTIER_AS_OBSTACLE and
     // USE_CORRIDOR_QP on. The [plan] line's cost splits into `obst` and
     // `frontier` to show which is costing what.
-    declare_parameter("FRONTIER_WEIGHT", 1.0);
+    declare_parameter("FRONTIER_WEIGHT", 0.0);
+    // Steepest the search may route through never-observed space [deg]: the
+    // camera looks forward and roughly level (D435 depth view about +-29 deg
+    // vertically), so a path climbing or diving steeply into unknown space goes
+    // where the drone cannot see. Any slope through explored space. Needs
+    // TREAT_FRONTIER_AS_OBSTACLE; 0 disables it.
+    declare_parameter("MAX_UNKNOWN_SLOPE", 20.0);
     // Flat extra cost per metre of path routed through never-observed space.
     // CLEARANCE_WEIGHT cannot do this job: the distance field saturates at
     // CLEARANCE_THRESHOLD, so anything further than that from a mapped obstacle
@@ -308,7 +316,7 @@ private:
     // covers the whole state space and the search spreads everywhere. Measured
     // with the goal beyond the frontier, fraction of tree nodes near the direct
     // line: 0 -> 100%, 0.5 -> 91%, 1 -> 49%, 2 -> 17%, 10 -> 9%.
-    declare_parameter("UNKNOWN_WEIGHT", 0.5);
+    declare_parameter("UNKNOWN_WEIGHT", 0.0);
     // Trajectory monitor: the trajectory being flown is kept until there is a
     // reason to replace it — a new plan, the monitor finding it unsafe on the
     // current map, truncation's stop point moving on (TRAJ_EXTEND_DIST, or at all
@@ -402,6 +410,11 @@ private:
     // Clearance the committed trajectory must keep from unknown space [m];
     // may exceed the 0.5 m collision margin (unknown is riskier than a wall).
     declare_parameter("FRONTIER_MARGIN", 0.5);
+    // Clearance from never-observed space [m] for truncation, the corridor and
+    // the trajectory monitor, when smaller than their margins from mapped
+    // obstacles (FRONTIER_MARGIN, CORRIDOR_MARGIN), which then apply to mapped
+    // obstacles only. At or above them it changes nothing.
+    declare_parameter("UNKNOWN_MARGIN", 0.25);
     // Clearance the corridor boxes keep from obstacles and unknown space [m].
     // A strictly harder test than the planner's 0.5 m collision margin: the
     // search only validates its centreline (and exempts a sphere at the start),
@@ -526,6 +539,7 @@ private:
     cfg.clearance_weight = param("CLEARANCE_WEIGHT").as_double();
     cfg.clearance_threshold = param("CLEARANCE_THRESHOLD").as_double();
     cfg.frontier_weight = param("FRONTIER_WEIGHT").as_double();
+    cfg.max_unknown_slope = param("MAX_UNKNOWN_SLOPE").as_double();
     cfg.unknown_weight = param("UNKNOWN_WEIGHT").as_double();
     // Whether unmapped space is a hazard at all — drives the cost surcharge and
     // truncation's refusal to commit into unobserved cells. Passed as its own
@@ -551,6 +565,7 @@ private:
     cfg.amax = param("AMAX").as_double();
     cfg.jmax = param("JMAX").as_double();
     cfg.frontier_margin = param("FRONTIER_MARGIN").as_double();
+    cfg.unknown_margin = param("UNKNOWN_MARGIN").as_double();
     cfg.corridor_margin = param("CORRIDOR_MARGIN").as_double();
     cfg.escape_ramp_dist = param("ESCAPE_RAMP_DIST").as_double();
     cfg.traj_solve_budget = param("TRAJ_SOLVE_BUDGET").as_double();
@@ -1353,7 +1368,6 @@ private:
   void publishViz() {
     warnIfNoMap();
     publishGoalMarker();
-    publishGeometricPath();
     publishPlannedPath();
     publishClearanceField();
     publishCorridor();
@@ -1413,71 +1427,21 @@ private:
     pub_goal_marker_->publish(m);
   }
 
-  // Raw RRT* waypoints (drone position -> goal) as an RViz MarkerArray: a line
-  // strip through the waypoints plus a sphere at each one. Independent of the
-  // min-snap trajectory, so it renders even when PLAN_TRAJECTORY is false.
-  void publishGeometricPath() {
-    const auto wps = core_->geometricPath();
-
-    visualization_msgs::msg::MarkerArray arr;
-
-    // Clear stale markers first so an empty/failed plan removes the old path.
-    visualization_msgs::msg::Marker clear;
-    clear.header.frame_id = kMapFrame;
-    clear.header.stamp = now();
-    clear.action = visualization_msgs::msg::Marker::DELETEALL;
-    arr.markers.push_back(clear);
-
-    if (wps.size() >= 2) {
-      visualization_msgs::msg::Marker line;
-      line.header.frame_id = kMapFrame;
-      line.header.stamp = now();
-      line.ns = "geometric_path";
-      line.id = 0;
-      line.type = visualization_msgs::msg::Marker::LINE_STRIP;
-      line.action = visualization_msgs::msg::Marker::ADD;
-      line.pose.orientation.w = 1.0;
-      line.scale.x = 0.03;  // line width [m]
-      line.color.r = 0.1f; line.color.g = 1.0f; line.color.b = 0.2f; line.color.a = 1.0f;
-
-      visualization_msgs::msg::Marker nodes;
-      nodes.header = line.header;
-      nodes.ns = "geometric_path";
-      nodes.id = 1;
-      nodes.type = visualization_msgs::msg::Marker::SPHERE_LIST;
-      nodes.action = visualization_msgs::msg::Marker::ADD;
-      nodes.pose.orientation.w = 1.0;
-      nodes.scale.x = nodes.scale.y = nodes.scale.z = 0.12;  // sphere diameter [m]
-      nodes.color.r = 0.2f; nodes.color.g = 0.4f; nodes.color.b = 1.0f; nodes.color.a = 1.0f;
-
-      for (const auto& w : wps) {
-        geometry_msgs::msg::Point p;
-        p.x = w[0]; p.y = w[1]; p.z = w[2];
-        line.points.push_back(p);
-        nodes.points.push_back(p);
-      }
-      arr.markers.push_back(line);
-      arr.markers.push_back(nodes);
-    }
-
-    pub_geom_path_->publish(arr);
-  }
-
   // Debug-only (gated by DEBUG_PLANNER_VIZ): the corridor-QP pipeline's
   // intermediate products, in one MarkerArray on /planner/corridor:
   //   - "boxes": the free axis-aligned boxes the trajectory is confined to, as
   //     semi-transparent CUBEs (alpha 0.2) so the map and trajectory stay
   //     readable through them;
   //   - "committed": the TRUNCATED prefix as a white line strip. Where it stops
-  //     short of the green /planner/geometric_path is exactly where truncation
-  //     cut the optimistic path against unknown space;
+  //     short of the magenta "untruncated" line is where truncation cut the
+  //     optimistic path;
   //   - "committed_goal": an orange sphere at the truncation endpoint — the
   //     intermediate goal inside known-safe space, which should ratchet toward
   //     the red final goal marker as the drone maps more of the room;
   //   - "untruncated": the path as it went INTO truncation, a thinner magenta
   //     line strip, only on ticks where truncation cut it. It starts at the
-  //     splice point, so unlike /planner/geometric_path it lines up with the
-  //     white prefix exactly and the cut-off stretch reads directly.
+  //     splice point, so it lines up with the white prefix exactly and the
+  //     cut-off stretch reads directly.
   // Empty (apart from "untruncated") when the corridor QP is off, when a tick
   // truncates to nothing, or when corridor construction failed — in all of those the array is just the
   // DELETEALL, which erases the previous drawing rather than leaving a stale
@@ -1764,7 +1728,6 @@ private:
   rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr pub_command_;
   rclcpp::Publisher<drone_interfaces::msg::ControllerDebug>::SharedPtr pub_debug_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_geom_path_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_goal_marker_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_clearance_field_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_occupancy_map_;

@@ -131,6 +131,13 @@ public:
     // the raw octree, where a cell with no node has never been observed — so
     // they should stay on whenever the operator asked for them.
     bool treat_unknown_as_hazard{true};
+    // Steepest edge the search may route through never-observed space [deg]
+    // (GeometricPlanner::setUnknownSlopeLimit): the camera looks forward and
+    // roughly level (the D435's depth view is about +-29 deg vertically), so a
+    // path climbing or diving steeply into unknown space goes where the drone
+    // cannot see. Through explored space any slope is allowed. Only with
+    // treat_unknown_as_hazard; <= 0 disables it.
+    double max_unknown_slope{20.0};
     // Trajectory monitor (see monitorLoop). The trajectory being flown is kept
     // until there is a reason to replace it; the monitor looks for one this many
     // times a second.
@@ -165,10 +172,15 @@ public:
     double vmax{1.0};              // per-axis velocity limit [m/s]
     double amax{1.5};              // per-axis acceleration limit [m/s^2]
     double jmax{3.0};              // per-axis jerk limit [m/s^3]
-    // Required clearance from unknown space for the committed trajectory [m].
-    // Enforced by truncation against the conservative (frontier-stamped) map;
-    // may exceed the collision margin (unknown is riskier than a mapped wall).
+    // Truncation's required clearance [m]: how close the committed prefix may
+    // come to mapped obstacles, and to never-observed space unless
+    // unknown_margin (below) is smaller.
     double frontier_margin{0.5};
+    // Clearance from never-observed space for truncation, the corridor and the
+    // trajectory monitor [m], when smaller than their margin from mapped
+    // obstacles (frontier_margin for truncation, corridor_margin for the other
+    // two); a value at or above those leaves them as they were.
+    double unknown_margin{0.25};
     // Clearance the corridor boxes must have from obstacles AND unknown space
     // [m]. This is a strictly harder test than the planner's collision margin:
     // the search only checks its centreline (and exempts a sphere at the
@@ -214,9 +226,8 @@ public:
     // it keeps the window from narrowing when max_segment_len is lowered, which
     // would otherwise trade a region's length for its width.
     Eigen::Vector3d corridor_bbox{1.0, 2.0, 2.0};
-    // When false the worker stops after RRT*: it stores the geometric path for
-    // visualisation but never runs min-snap or hands a trajectory to the
-    // tracker, so control keeps following the direct setpoint. Used to bring the
+    // When false the worker stops after RRT*: it commits the geometric path
+    // but never runs min-snap or hands a trajectory to the tracker, so control keeps following the direct setpoint. Used to bring the
     // planner online geometry-first, decoupled from control.
     bool plan_trajectory{true};
     // Single switch for the debug planner visualisation (search-tree capture +
@@ -358,11 +369,10 @@ public:
   // WORLD frame: this is the trajectory as handed to the tracker.
   std::vector<std::vector<double>> sampledPlannedPath(double sample_dt = 0.1) const;
 
-  // Raw waypoints of the most recent RRT* geometric plan (start..goal), for
-  // visualisation, MAP frame (as are the search tree, clearance samples and
-  // corridor snapshot below). Independent of trajectory generation, so it is populated even
-  // when plan_trajectory is false.
-  std::vector<std::vector<double>> geometricPath() const;
+  // Whether the search has committed a path (it is cleared when the goal
+  // changes or the trajectory is abandoned). Independent of trajectory
+  // generation, so it works with plan_trajectory false.
+  bool hasCommittedPath() const { return !committedPath().empty(); }
 
   // Coarse samples of the cached clearance (EDT) field as {x, y, z, distance}
   // (distance clamped at clearance_threshold), for debug visualisation. Empty
@@ -374,9 +384,7 @@ public:
   // solver — its last point is the intermediate goal inside known-safe space,
   // which ratchets toward the real goal as the map grows — and `regions` are
   // the convex free polyhedra grown along it (one per resampled segment), i.e.
-  // the volume the trajectory is provably confined to. Comparing `committed`
-  // against geometricPath() shows exactly where truncation cut the optimistic
-  // path. Empty unless cfg.debug_planner_viz AND cfg.use_corridor_qp are set,
+  // the volume the trajectory is provably confined to. Empty unless cfg.debug_planner_viz AND cfg.use_corridor_qp are set,
   // and cleared whenever a trajgen tick truncates to nothing or fails to build
   // a corridor, so a stale corridor is never drawn as if it were current.
   // Thread-safe copy.
@@ -665,7 +673,6 @@ private:
   common::Trajectory last_planned_;  // WORLD frame; retained for visualisation and as the splice source
   double last_planned_at_{0.0};      // when it was staged, for the staleness check
   bool has_last_planned_{false};     // cleared on reset() — see spliceAnchor
-  std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
   std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
   CorridorSnapshot last_corridor_;  // debug viz; empty unless corridor QP + viz on
 
@@ -674,11 +681,11 @@ private:
   std::thread monitor_worker_;
   std::atomic<bool> running_{false};
 
-  // The committed path (see committedPath/setCommittedPath). Distinct from
-  // last_geometric_path_, which is viz only and is also written by presets.
+  // The committed path (see committedPath/setCommittedPath).
   mutable std::mutex path_mutex_;
   std::vector<std::vector<double>> committed_path_;
   std::uint64_t path_version_{0};  // bumped on every setCommittedPath; guarded by path_mutex_
+  bool slope_bypass_warned_{false};  // search thread only: see the slope limit in searchLoop
 
   // What the trajectory being flown lacks, worked out by the monitor at the
   // start of every tick (see monitorLoop).

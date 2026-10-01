@@ -799,6 +799,44 @@ int main() {
     expect(holes == 0, "the shell has " + std::to_string(holes) + " holes");
   }
 
+  // 10. The slope limit in unknown space (setUnknownSlopeLimit): a goal 2 m up
+  //     and 3 m along (34 deg). With everything never observed, no edge of the
+  //     path may be steeper than 20 deg; with everything observed the limit
+  //     must not bite (a steep edge is fine); and isPathValid must reject a
+  //     steep edge through unknown space.
+  {
+    const auto slopeDeg = [](const std::vector<double>& a, const std::vector<double>& b) {
+      const double h = std::hypot(b[0] - a[0], b[1] - a[1]);
+      return std::atan2(std::abs(b[2] - a[2]), h) * 180.0 / M_PI;
+    };
+    const auto allUnknown = [](double, double, double) { return true; };
+    const auto allKnown = [](double, double, double) { return false; };
+    {
+      GeometricPlanner planner(empty, /*planning_time=*/1.0);
+      planner.setPlannerType(PlannerType::ABITstar);  // EIT*/AIT* check edges themselves and bypass the rule
+      planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+      planner.setUnknownSlopeLimit(allUnknown, 20.0);
+      std::vector<std::vector<double>> path;
+      const bool ok = planner.planPath({0, 0, 1}, {3, 0, 3}, path);
+      expect(ok && path.size() >= 2, "slope limit: no path to a goal reachable with a gentler climb");
+      double worst = 0.0;
+      for (std::size_t i = 0; i + 1 < path.size(); ++i) worst = std::max(worst, slopeDeg(path[i], path[i + 1]));
+      expect(worst <= 20.0 + 1e-6,
+             "slope limit: an edge through unknown space climbs at " + std::to_string(worst) + " deg");
+      expect(!planner.isPathValid({{0, 0, 1}, {3, 0, 3}}),
+             "slope limit: isPathValid accepted a 34 deg edge through unknown space");
+      expect(planner.isPathValid({{0, 0, 1}, {6, 0, 2}}),
+             "slope limit: isPathValid rejected a 9.5 deg edge");
+    }
+    {
+      GeometricPlanner planner(empty, /*planning_time=*/0.5);
+      planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+      planner.setUnknownSlopeLimit(allKnown, 20.0);
+      expect(planner.isPathValid({{0, 0, 1}, {3, 0, 3}}),
+             "slope limit: a steep edge through explored space was rejected");
+    }
+  }
+
   // 9. ConservativeGrid, the stamp-free replacement for 8: the same shell,
   //    ball and free classification as stampUnknownShell voxel for voxel, on
   //    the cube and on a ragged map with merged blocks, at any thread count;

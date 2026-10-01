@@ -196,6 +196,17 @@ public:
   // samples independently at its own resolution.
   void setUnknownPenalty(UnknownFn is_unknown, double weight);
 
+  // Forbid edges (the straight segments between waypoints) steeper than
+  // `max_slope_deg` from horizontal wherever they touch never-observed space
+  // (`is_unknown`, sampled every kSlopeCheckStep along a steep edge). The camera
+  // only looks forward and roughly level, so a path that climbs or dives steeply
+  // into unknown space goes where the drone cannot see; through explored space
+  // any slope is fine. Enforced in the motion validator, so it holds for the
+  // search, isPathValid and every shortcut alike, and only removes edges (no
+  // cost changes, so the informed planners' heuristics stay admissible). An
+  // empty function or max_slope_deg <= 0 disables it (the default).
+  void setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg);
+
   // Select which OMPL planner planPath builds. The per-planner parameters come
   // from the PlannerConfig defaults in this header. Default is RRT*.
   void setPlannerType(PlannerType type) { planner_type_ = type; }
@@ -447,6 +458,13 @@ private:
   // Null / zero => no surcharge, which is the historical behaviour.
   UnknownFn unknown_fn_;
   double unknown_weight_ = 0.0;
+
+  // Slope limit in never-observed space (see setUnknownSlopeLimit).
+  UnknownFn slope_unknown_fn_;
+  double max_slope_tan_ = 0.0;  // tan of the limit; <= 0 disables
+  static constexpr double kSlopeCheckStep = 0.05;  // [m]
+  // Whether the edge a -> b obeys the slope limit.
+  bool slopeOk(const ompl::base::State* a, const ompl::base::State* b) const;
 
   // Largest search (in sampled states) whose tree is copied out for the debug
   // viz; see planPath. Measured 2026-09-29: normal searches sample 500-2000

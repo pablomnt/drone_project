@@ -272,8 +272,8 @@ PointCloud2) — behind the single
 Foxglove. The same switch exposes `/planner/corridor`, which draws the corridor pipeline's
 intermediate products — the free polyhedra as translucent face outlines, the truncated committed prefix as a
 white line, and an orange sphere at the truncation endpoint, the intermediate goal in known-safe
-space. Where that white line stops short of the green geometric path is exactly where truncation
-refused to commit into the unknown. Any future debug/instrumentation should follow the same rule: one
+space; on ticks where truncation cut the path, the path as it went in is a thin magenta line, and
+where the white line stops short of it is exactly where truncation refused to commit. Any future debug/instrumentation should follow the same rule: one
 default-off switch, nothing computed or published when it is off, and never in the flight-critical
 path. When the planner *cannot* run it now says so — the worker logs the missing precondition (no
 goal, or no map) rather than going silent, and the node reports the resolved map topic and its
@@ -491,7 +491,7 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 |---|---|---|
 | `PLAN_TRAJECTORY` | bool, `true` | Master gate on trajectory generation from the **planner**. False stops the worker after the geometric search (path still published for viz) and control stays on `POS_SP`. Does **not** gate `PRESET_WAYPOINTS`. With it on, **do not have a goal live when you arm**: there is no airborne gate, so a staged trajectory can pre-empt the takeoff ramp (see `CLAUDE.md`). |
 | `PRESET_WAYPOINTS` | bool, `false` | **Momentary trigger, not a mode.** A `false→true` edge fires one preset trajectory through waypoints hardcoded in `firePresetSquare`, then the node resets it to false. Currently four waypoints in `map`: the drone's position, then +0.5 m in x at 1.3 m, +1.5 m x / +0.5 m y at 2.0 m, and +2.5 m x at 1.3 m. It does **not** end where it started: `POS_SP` is moved to the first waypoint on fire, so after completion the drone flies back there on `POS_SP`. Bypasses the geometric planner, solves the corridor QP once, holds it to completion, then returns control to `POS_SP`. Also clears any active goal (the only goal-cancel path there is). Needs a map; refuses a fire below 0.8 m while flying. |
-| `PLANNER_TYPE` | string, `"EITstar"` | Which OMPL planner to build: `RRTstar`, `BITstar`, `ABITstar`, `AITstar`, `EITstar`. Per-planner internals are **not** parameters — they live in `PlannerConfig` in `geometric_planner.hpp`. |
+| `PLANNER_TYPE` | string, `"ABITstar"` | Which OMPL planner to build: `RRTstar`, `BITstar`, `ABITstar`, `AITstar`, `EITstar`. Per-planner internals are **not** parameters — they live in `PlannerConfig` in `geometric_planner.hpp`. |
 | `RRT_MONITOR_PERIOD` | double, `1.0` s | How often the worker re-checks the committed path for collisions. |
 | `RRT_IMPROVE_PERIOD` | double, `10.0` s | How often it attempts an improvement search on an already-valid path. |
 | `RRT_SOLVE_TIME` | double, `1.0` s | Optimisation budget per solve. All the planners are anytime, so this is a direct quality/latency dial. |
@@ -510,9 +510,9 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 | Parameter | Type / default | What it does |
 |---|---|---|
 | `CLEARANCE_WEIGHT` | double, `1.0` | Weight on the obstacle-proximity penalty. Raising it pushes the search off mapped walls. Costs longer detours. |
-| `FRONTIER_WEIGHT` | double, `1.0` | Weight on the frontier-proximity penalty: what running near the edge of explored space costs beyond what the nearest mapped obstacle already charges (same shape and `CLEARANCE_THRESHOLD`). The main lever on how much of a path survives truncation. Used only with `TREAT_FRONTIER_AS_OBSTACLE` and `USE_CORRIDOR_QP`. |
+| `FRONTIER_WEIGHT` | double, `0.0` | Weight on the frontier-proximity penalty: what running near the edge of explored space costs beyond what the nearest mapped obstacle already charges (same shape and `CLEARANCE_THRESHOLD`). The main lever on how much of a path survives truncation. Used only with `TREAT_FRONTIER_AS_OBSTACLE` and `USE_CORRIDOR_QP`. |
 | `CLEARANCE_THRESHOLD` | double, `1.0` m | Distance at which the proximity penalty saturates; also the EDT's `maxdist`. |
-| `UNKNOWN_WEIGHT` | double, `0.5` | Flat extra cost per metre routed through never-observed space. Read as "how many metres of detour through mapped space is one metre through unmapped space worth". **Keep it low** — it defocuses the informed planners badly, because their sampling ellipse is built from straight-line estimates that cannot see this term. Ignored entirely when `TREAT_FRONTIER_AS_OBSTACLE` is false. |
+| `UNKNOWN_WEIGHT` | double, `0.0` | Flat extra cost per metre routed through never-observed space. Read as "how many metres of detour through mapped space is one metre through unmapped space worth". **Keep it low** — it defocuses the informed planners badly, because their sampling ellipse is built from straight-line estimates that cannot see this term. Ignored entirely when `TREAT_FRONTIER_AS_OBSTACLE` is false. |
 
 ### Corridor and limits
 
@@ -521,7 +521,9 @@ sensors died" from "the control loop did not get to run" — see the caveat in `
 | `USE_CORRIDOR_QP` | bool, `true` | Use the corridor-constrained QP instead of plain min-snap. False is the legacy, obstacle-blind path. |
 | `TREAT_FRONTIER_AS_OBSTACLE` | bool, `false` | **The single switch for "is unmapped space a hazard".** Gates the stamped frontier shell, `UNKNOWN_WEIGHT`'s surcharge, and truncation's stop at unobserved cells. On a fresh map almost everything is frontier, so with this on the drone is boxed in until it has scanned around itself — leave it off for bench and preset work, on for real exploration. |
 | `VMAX` / `AMAX` / `JMAX` | double, `1.0` / `1.5` / `3.0` | Per-axis velocity, acceleration and jerk limits enforced by the QP. Box bounds, so the true norm can reach √3× in the corner case. |
-| `FRONTIER_MARGIN` | double, `0.5` m | Clearance the committed *path prefix* keeps from unknown space during truncation. |
+| `FRONTIER_MARGIN` | double, `0.5` m | Clearance the committed *path prefix* keeps from mapped obstacles during truncation (and from unknown space when `UNKNOWN_MARGIN` is not smaller). |
+| `MAX_UNKNOWN_SLOPE` | double, `20` deg | Steepest edge the search may route through never-observed space (the camera only looks forward and roughly level). Any slope through explored space. Ignored by EIT* and AIT* (they bypass OMPL's motion validator), hence the `ABITstar` default. 0 disables. |
+| `UNKNOWN_MARGIN` | double, `0.25` m | Clearance from never-observed space for truncation, the corridor and the trajectory monitor, when smaller than their margin from mapped obstacles (`FRONTIER_MARGIN`, `CORRIDOR_MARGIN`). At or above those it changes nothing. |
 | `ESCAPE_RAMP_DIST` | double, `1.0` m | Distance over which truncation's clearance requirement ramps from zero at the drone up to the full margin, so a vehicle in a tight spot can still commit a path. Also where the corridor's first-region relaxation ends. Deliberately independent of the margin. `≤ 0` disables both. |
 | `CORRIDOR_MARGIN` | double, `0.4` m | Clearance the corridor *regions* keep from obstacles. A strictly harder test than the planner's own check — it must hold over a whole 3D volume, not just a centreline. **This is the clearance you actually fly with**, so weigh it against the airframe's half-width. First suspect when a decomposition fails. |
 | `MAX_SEGMENT_LEN` | double, `2.0` m | Corridor resample cap; one convex region per piece. Lowering it is the lever against convex over-conservatism, but costs QP size — and needs `CORRIDOR_BBOX` pinned or you lose in region width what you gain in length. |
@@ -732,7 +734,7 @@ either). **Standard set** — what `record_flight.sh` records:
 cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
   /debug/telemetry /okvis/cam0_matches/compressed /okvis/okvis_odometry /okvis/okvis_path \
   /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_attitude_setpoint_v1 \
-  /fmu/out/vehicle_status /smooth_trajectory /planner/geometric_path /planner/goal_marker \
+  /fmu/out/vehicle_status /smooth_trajectory /planner/goal_marker \
   /control/pos_ff /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
 ```
 
@@ -744,7 +746,7 @@ cd ~/flight_logs && ros2 bag record --storage mcap --max-bag-duration 120 \
   /debug/telemetry /okvis/cam0_matches/compressed /okvis/okvis_odometry /okvis/okvis_path \
   /fmu/out/sensor_combined /fmu/out/vehicle_odometry /fmu/out/vehicle_status_v1 \
   /fmu/in/offboard_control_mode /fmu/in/vehicle_command /fmu/in/vehicle_attitude_setpoint_v1 \
-  /fmu/out/vehicle_status /smooth_trajectory /planner/geometric_path /planner/goal_marker \
+  /fmu/out/vehicle_status /smooth_trajectory /planner/goal_marker \
   /control/pos_ff /rtabmap/octomap_binary /telemetry/cpu_usage_total /rosout /tf /tf_static
 ```
 

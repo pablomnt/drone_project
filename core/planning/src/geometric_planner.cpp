@@ -10,6 +10,7 @@
 #include <limits>
 #include <utility>
 
+#include <ompl/base/DiscreteMotionValidator.h>
 #include <ompl/base/PlannerData.h>
 #include <ompl/base/objectives/StateCostIntegralObjective.h>
 #include <ompl/base/samplers/informed/PathLengthDirectInfSampler.h>
@@ -118,6 +119,33 @@ private:
   double unknown_weight_;
 };
 
+// The usual sampled collision check along an edge, plus an extra edge test
+// (the slope limit in unknown space) run first, since it is free for the
+// common shallow edge.
+class EdgeRuleMotionValidator : public ompl::base::DiscreteMotionValidator {
+public:
+  using EdgeRule = std::function<bool(const ompl::base::State*, const ompl::base::State*)>;
+  EdgeRuleMotionValidator(const ompl::base::SpaceInformationPtr& si, EdgeRule rule)
+      : ompl::base::DiscreteMotionValidator(si), rule_(std::move(rule)) {}
+
+  bool checkMotion(const ompl::base::State* s1, const ompl::base::State* s2) const override {
+    return rule_(s1, s2) && ompl::base::DiscreteMotionValidator::checkMotion(s1, s2);
+  }
+  bool checkMotion(const ompl::base::State* s1, const ompl::base::State* s2,
+                   std::pair<ompl::base::State*, double>& last_valid) const override {
+    if (!rule_(s1, s2)) {
+      // The rule is about the edge as a whole: nothing past its start is usable.
+      if (last_valid.first) si_->copyState(last_valid.first, s1);
+      last_valid.second = 0.0;
+      return false;
+    }
+    return ompl::base::DiscreteMotionValidator::checkMotion(s1, s2, last_valid);
+  }
+
+private:
+  EdgeRule rule_;
+};
+
 }  // namespace
 
 GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time)
@@ -151,7 +179,36 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
   // truncatePath, which samples every 5 cm. Convert the step to that fraction so
   // the search checks the same points truncation will.
   si_->setStateValidityCheckingResolution(kValidityCheckStep / space_->getMaximumExtent());
+  si_->setMotionValidator(std::make_shared<EdgeRuleMotionValidator>(
+      si_, [this](const ompl::base::State* a, const ompl::base::State* b) { return slopeOk(a, b); }));
   si_->setup();
+}
+
+void GeometricPlanner::setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg) {
+  slope_unknown_fn_ = std::move(is_unknown);
+  max_slope_tan_ = max_slope_deg > 0.0 && max_slope_deg < 90.0
+                       ? std::tan(max_slope_deg * M_PI / 180.0)
+                       : 0.0;
+}
+
+bool GeometricPlanner::slopeOk(const ompl::base::State* a, const ompl::base::State* b) const {
+  if (!(max_slope_tan_ > 0.0) || !slope_unknown_fn_) return true;
+  const auto* pa = a->as<ompl::base::RealVectorStateSpace::StateType>();
+  const auto* pb = b->as<ompl::base::RealVectorStateSpace::StateType>();
+  const double dx = pb->values[0] - pa->values[0];
+  const double dy = pb->values[1] - pa->values[1];
+  const double dz = pb->values[2] - pa->values[2];
+  if (std::abs(dz) <= max_slope_tan_ * std::hypot(dx, dy)) return true;
+  // Steep: allowed only if no part of it is in never-observed space.
+  const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+  const int n = std::max(1, static_cast<int>(std::ceil(len / kSlopeCheckStep)));
+  for (int i = 0; i <= n; ++i) {
+    const double t = static_cast<double>(i) / n;
+    if (slope_unknown_fn_(pa->values[0] + t * dx, pa->values[1] + t * dy, pa->values[2] + t * dz)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void GeometricPlanner::anchorStart(double x, double y, double z) const {

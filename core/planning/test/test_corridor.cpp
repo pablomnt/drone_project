@@ -611,6 +611,91 @@ int main() {
     }
   }
 
+  // A smaller margin from never-observed space (unknown_margin): a mapped wall
+  // at x = +1.2 and a wall of unknown points at x = -1.2. Regions must keep the
+  // full margin from the mapped wall and unknown_margin from the unknown one —
+  // and actually use the extra room on the unknown side. Then mapped points
+  // just BEHIND the unknown wall (x = -1.3): the faces through unknown points
+  // must still keep the full margin from them.
+  {
+    const auto mapped = wallPoints(1.2, 0, -1.0, 4.0, 0.5, 1.5);
+    const auto unknown = wallPoints(-1.2, 0, -1.0, 4.0, 0.5, 1.5);
+    const std::vector<Eigen::Vector3d> path = {{0, 0, 1}, {0, 3, 1}};
+    CorridorParams up = params;
+    up.unknown_margin = 0.25;
+    // Third case: a mapped floor (z = 0.3) running out under the unknown wall,
+    // as in a real room: the floor face keeps it away, so the unknown wall's
+    // faces must still get the smaller margin.
+    for (const int variant : {0, 1, 2}) {
+      const bool behind = variant == 1, floor = variant == 2;
+      std::vector<Eigen::Vector3d> obs = mapped;
+      std::vector<Eigen::Vector3d> mapped_all = mapped;
+      if (floor) {
+        std::vector<Eigen::Vector3d> f;
+        for (double x = -2.0; x <= 1.2 + 1e-9; x += 0.05)
+          for (double y = -1.0; y <= 4.0 + 1e-9; y += 0.05) f.emplace_back(x, y, 0.3);
+        obs.insert(obs.end(), f.begin(), f.end());
+        mapped_all.insert(mapped_all.end(), f.begin(), f.end());
+      }
+      if (behind) {
+        const auto b = wallPoints(-1.3, 0, -1.0, 4.0, 0.5, 1.5);
+        obs.insert(obs.end(), b.begin(), b.end());
+        mapped_all.insert(mapped_all.end(), b.begin(), b.end());
+      }
+      up.first_unknown = obs.size();
+      obs.insert(obs.end(), unknown.begin(), unknown.end());
+      std::vector<Eigen::Vector3d> resampled;
+      std::vector<ConvexRegion> corridor;
+      std::string why;
+      const char* label = behind ? "unknown margin, mapped behind"
+                          : floor ? "unknown margin, mapped floor" : "unknown margin";
+      if (!drone_core::planning::buildCorridor(obs, path, up, resampled, corridor, &why)) {
+        std::cerr << "FAIL(" << label << "): no corridor (" << why << ")\n";
+        ++failures;
+        continue;
+      }
+      failures += checkRegionClearance(corridor, mapped_all, {-1.5, -0.5, 0.5}, {1.5, 3.5, 1.5},
+                                       up.margin, label);
+      failures += checkRegionClearance(corridor, unknown, {-1.5, -0.5, 0.5}, {1.5, 3.5, 1.5},
+                                       up.unknown_margin, label);
+      // The grid check above samples every 0.1 m, too coarse to see a few cm
+      // lost here: sample the gap between the walls every 1 cm.
+      double worst_mapped = std::numeric_limits<double>::infinity();
+      double worst_unknown = std::numeric_limits<double>::infinity();
+      for (double x = -1.2; x <= 1.2; x += 0.01)
+        for (double y = 0.5; y <= 2.5; y += 0.25)
+          for (double z = 0.8; z <= 1.21; z += 0.2)
+            for (const auto& r : corridor) {
+              const Eigen::Vector3d q(x, y, z);
+              if (!r.contains(q)) continue;
+              worst_mapped = std::min(worst_mapped, nearestObstacle(q, mapped_all));
+              worst_unknown = std::min(worst_unknown, nearestObstacle(q, unknown));
+            }
+      if (worst_mapped < up.margin - 1e-3 || worst_unknown < up.unknown_margin - 1e-3) {
+        std::cerr << "FAIL(" << label << "): fine check: " << worst_mapped
+                  << " m from mapped (needs " << up.margin << "), " << worst_unknown
+                  << " m from unknown (needs " << up.unknown_margin << ")\n";
+        ++failures;
+      }
+      // How close the regions come to the unknown wall: ~0.25 m with nothing
+      // behind it. With the mapped wall 0.1 m behind, anything from 0.3 m up to
+      // the full 0.4 m: DecompUtil's faces are slightly tilted, and a face that
+      // passes close to a mapped point somewhere along the wall keeps the full
+      // margin over its whole plane (the safety checks above are what matter).
+      double closest = std::numeric_limits<double>::infinity();
+      for (double x = -1.5; x <= 1.5; x += 0.02)
+        for (double y = 0.5; y <= 2.5; y += 0.25)
+          for (const auto& r : corridor)
+            if (r.contains(Eigen::Vector3d(x, y, 1.0))) closest = std::min(closest, x + 1.2);
+      const double want = behind ? 0.4 : 0.25;
+      if (!(closest < want + 0.06)) {
+        std::cerr << "FAIL(" << label << "): regions stop " << closest
+                  << " m from the unknown wall, expected about " << want << " m\n";
+        ++failures;
+      }
+    }
+  }
+
   // A corridor between two parallel walls: regions must clear both by the
   // margin, cover every segment, and overlap enough at the junctions for the QP
   // to have a feasible C0 handover.

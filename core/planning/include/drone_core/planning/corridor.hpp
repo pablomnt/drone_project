@@ -37,6 +37,10 @@ using CorridorUnknownFn = std::function<bool(double x, double y, double z)>;
 struct ConvexRegion {
   Eigen::Matrix<double, Eigen::Dynamic, 3> A;
   Eigen::VectorXd b;
+  // buildCorridor only, on the unshrunk regions it grows: the most each face
+  // may be pulled in by the margin shrink (see CorridorParams::unknown_margin).
+  // Empty = no per-face limit.
+  Eigen::VectorXd shrink_cap;
 
   bool contains(const Eigen::Vector3d& p, double tol = 0.0) const {
     return A.rows() == 0 || ((A * p - b).array() <= tol).all();
@@ -47,6 +51,15 @@ struct ConvexRegion {
 struct CorridorParams {
   double max_segment_len = 2.0;  // resample cap: no segment longer than this [m]
   double margin = 0.5;           // clearance every region keeps from obstacle points [m]
+  // Clearance from never-observed space when it differs from `margin` [m]:
+  // obstacle points from index `first_unknown` on (the conservative grid's
+  // shell cells) are held to this instead (< 0: `margin` for every point, and
+  // only values below `margin` take effect). A face DecompUtil put through such
+  // a point is pulled in by the most that still keeps every obstacle point
+  // beyond it at its own clearance (mapped ones at `margin`), so a wall just
+  // behind the frontier keeps the full margin.
+  double unknown_margin = -1.0;
+  std::size_t first_unknown = std::numeric_limits<std::size_t>::max();
   // Minimum USABLE half-extents of the region-growth window, in the
   // SEGMENT-ALIGNED frame — component 0 is slack along the segment beyond its
   // endpoints, 1 and 2 are lateral — not world axes. Treated as a floor, not a

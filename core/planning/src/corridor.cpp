@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -474,6 +476,70 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
                              std::max(p.local_bbox.z(), seg_max));
   const Eigen::Vector3d bbox = want.array() + pull_in;
 
+  // Per-face pull-in for a smaller clearance from never-observed space (see
+  // CorridorParams::unknown_margin). DecompUtil puts every obstacle face
+  // through an obstacle point (copied exactly), so a face's point says which
+  // kind of hazard it is; window faces go through no obstacle point and keep
+  // the full pull-in.
+  const bool split_margin = p.unknown_margin >= 0.0 && p.unknown_margin < p.margin &&
+                            p.first_unknown < obstacles.size();
+  struct PointHash {
+    std::size_t operator()(const Eigen::Vector3d& v) const {
+      std::size_t h = 0;
+      for (int i = 0; i < 3; ++i) {
+        std::uint64_t bits;
+        const double d = v(i);
+        std::memcpy(&bits, &d, sizeof bits);
+        h ^= std::hash<std::uint64_t>()(bits) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+      }
+      return h;
+    }
+  };
+  std::unordered_set<Eigen::Vector3d, PointHash> unknown_points;
+  if (split_margin) {
+    unknown_points.insert(obstacles.begin() + static_cast<std::ptrdiff_t>(p.first_unknown),
+                          obstacles.end());
+  }
+  // Pull-in of each face of one region, given which faces go through unknown
+  // points. Those start at unknown_margin (+ half-diagonal); every other face
+  // keeps the full pull_in. Then every MAPPED point must still end up at least
+  // pull_in from the region. The region lies inside every shrunk half-space, so
+  // its distance from a point is at least max_r(n_r.q - (b_r - shrink_r)); a
+  // mapped point that the full-pull-in faces already keep pull_in away (the
+  // floor under the frontier, behind the region's floor face) needs nothing
+  // more. Any other one raises the pull-in of each unknown face it lies beyond,
+  // by s, to pull_in - s. Unknown points need nothing: beyond a face by s >= 0
+  // they end up at least s + unknown_margin away.
+  const auto faceCaps = [&](const std::vector<Eigen::Vector3d>& normals,
+                            const std::vector<double>& offsets, const std::vector<char>& unknown_face) {
+    const std::size_t rows = normals.size();
+    std::vector<double> caps(rows, pull_in);
+    bool any = false;
+    for (std::size_t r = 0; r < rows; ++r) {
+      if (unknown_face[r]) {
+        caps[r] = p.unknown_margin + p.voxel_half_diagonal;
+        any = true;
+      }
+    }
+    if (!any) return caps;
+    for (std::size_t i = 0; i < p.first_unknown; ++i) {
+      const Eigen::Vector3d& q = obstacles[i];
+      double kept = -std::numeric_limits<double>::infinity();
+      for (std::size_t r = 0; r < rows && kept < pull_in; ++r) {
+        if (!unknown_face[r]) kept = std::max(kept, normals[r].dot(q) - offsets[r] + pull_in);
+      }
+      if (kept >= pull_in) continue;
+      for (std::size_t r = 0; r < rows; ++r) {
+        if (!unknown_face[r]) continue;
+        const double s = normals[r].dot(q) - offsets[r];
+        if (s < -1e-9) continue;
+        caps[r] = std::max(caps[r], pull_in - s);
+      }
+    }
+    for (auto& cap : caps) cap = std::min(cap, pull_in);
+    return caps;
+  };
+
   // Grow the UNSHRUNK region around one segment, as plain A/b rows oriented
   // "inside satisfies A p <= b" using the segment midpoint (which the
   // decomposition guarantees is inside). DecompUtil grows each segment of a
@@ -490,22 +556,31 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
     const auto polys = decomp.get_polyhedrons();
     if (polys.size() != 1) return false;
     const Eigen::Vector3d mid = 0.5 * (a + b);
-    LinearConstraint3D lc(Vec3f(mid.x(), mid.y(), mid.z()), polys[0].hyperplanes());
+    const auto& planes = polys[0].hyperplanes();
+    LinearConstraint3D lc(Vec3f(mid.x(), mid.y(), mid.z()), planes);
     std::vector<Eigen::Vector3d> normals;
     std::vector<double> offsets;
+    std::vector<char> unknown_face;
     for (int r = 0; r < lc.A().rows(); ++r) {
       const Eigen::Vector3d n = lc.A().row(r).transpose();
       const double norm = n.norm();
       if (norm < 1e-9) continue;  // degenerate face; drop rather than divide
       normals.push_back(n / norm);
       offsets.push_back(lc.b()(r) / norm);
+      const Eigen::Vector3d pt(planes[r].p_(0), planes[r].p_(1), planes[r].p_(2));
+      unknown_face.push_back(split_margin && unknown_points.count(pt) ? 1 : 0);
     }
+    const std::vector<double> caps =
+        split_margin ? faceCaps(normals, offsets, unknown_face) : std::vector<double>{};
     const int rows = static_cast<int>(normals.size());
     raw.A.resize(rows, 3);
     raw.b.resize(rows);
+    raw.shrink_cap.resize(0);
+    if (split_margin) raw.shrink_cap.resize(rows);
     for (int r = 0; r < rows; ++r) {
       raw.A.row(r) = normals[r];
       raw.b(r) = offsets[r];
+      if (split_margin) raw.shrink_cap(r) = caps[r];
     }
     return true;
   };
@@ -540,9 +615,16 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
   // diagonal): DecompUtil's faces touch the obstacle *points*, which are voxel
   // centres, so the extra pull-in makes the margin hold against the voxel's
   // worst-case corner, not just its centre.
+  // Faces with a shrink_cap (through never-observed space, see
+  // CorridorParams::unknown_margin) are pulled in by no more than it.
   const auto shrunkBy = [](const ConvexRegion& raw, double shrink) {
     ConvexRegion region = raw;
-    region.b.array() -= shrink;
+    if (raw.shrink_cap.size() == raw.b.size()) {
+      region.b.array() -= raw.shrink_cap.array().min(shrink);
+    } else {
+      region.b.array() -= shrink;
+    }
+    region.shrink_cap.resize(0);
     return region;
   };
 
@@ -619,8 +701,12 @@ bool buildCorridor(const std::vector<Eigen::Vector3d>& obstacles,
       if (s == 0 && p.start_relax_dist > 0.0) {
         constexpr double kBoundarySlack = 1e-3;  // keep the QP off an exact face
         double slack = std::numeric_limits<double>::infinity();
+        const bool capped = raw.shrink_cap.size() == raw.b.size();
         for (int r = 0; r < raw.A.rows(); ++r) {
-          slack = std::min(slack, raw.b(r) - raw.A.row(r).dot(resampled_out.front()));
+          const double sl = raw.b(r) - raw.A.row(r).dot(resampled_out.front());
+          // A capped face only limits the shrink if its cap would cross the drone.
+          if (capped && raw.shrink_cap(r) <= sl - kBoundarySlack) continue;
+          slack = std::min(slack, sl);
         }
         shrink = std::min(pull_in, slack - kBoundarySlack);
         if (shrink < p.voxel_half_diagonal) shrink = p.voxel_half_diagonal;

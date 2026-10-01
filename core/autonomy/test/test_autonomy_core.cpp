@@ -480,7 +480,7 @@ int main() {
     core.startPlanner();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(800));
-    check(core.geometricPath().empty(), "worker idles while the config requires a transform");
+    check(!core.hasCommittedPath(), "worker idles while the config requires a transform");
 
     autonomy::AutonomyCore::Config relaxed = cfg;
     relaxed.require_map_to_world = false;
@@ -488,7 +488,7 @@ int main() {
     bool planned = false;
     for (int i = 0; i < 40 && !planned; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      planned = !core.geometricPath().empty();
+      planned = core.hasCommittedPath();
     }
     core.stopPlanner();
     check(planned, "worker picks up a config change without any stepControl");

@@ -157,8 +157,7 @@ running into something newly mapped is cut short of it rather than flown. It als
 2.04–2.08 s gap between staged trajectories (trajgen no longer waits for a monitor tick).
 What crosses the two threads, and how:
 - **committed path** — `committedPath()` / `setCommittedPath()` under `path_mutex_`, copied per tick,
-  never held across a solve. Distinct from `last_geometric_path_`, which is viz-only and is written by
-  presets too.
+  never held across a solve.
 - **distance fields** — `clearanceField` / `conservativeField` take `edt_mutex_` and now take their
   `maxdist` as an argument (each thread owns its own Config). `sampleClearanceField` picks the field up
   under the lock and samples outside it.
@@ -1037,8 +1036,7 @@ also straddling PX4's own 500 ms offboard-loss threshold. After the split, repla
 - **Adding a callback:** decide its group first. Anything that can block longer than one 20 ms tick
   belongs in `cb_slow_`. If it then touches fast-group state, either guard that state or move the
   work — do not quietly promote `cross_mutex_` into a lock the control tick waits on.
-- **Known residual coupling:** the viz getters (`clearanceSamples()`, `geometricPath()`,
-  `corridorSnapshot()`) each take `traj_mutex_` to return a copy, and `stepControl`
+- **Known residual coupling:** the viz getters (`clearanceSamples()`, `corridorSnapshot()`) each take `traj_mutex_` to return a copy, and `stepControl`
   takes the same mutex. So heavy viz converts a direct block into lock contention on the control
   tick — far smaller (a vector memcpy, not an octree rebuild), but non-zero. `DEBUG_PLANNER_VIZ`
   off makes it disappear entirely.
@@ -1145,8 +1143,8 @@ produced when armed+offboard; every tick reaching it is a healthy tick (the watc
 so the state it reads is always populated.
 
 **Visualization publishers (at 2 Hz via `viz_timer_`):**
-- `/planner/geometric_path` (`visualization_msgs/MarkerArray`) — raw RRT* waypoints as a green
-  LINE_STRIP + blue SPHERE_LIST, frame `map`. Populated even when `PLAN_TRAJECTORY=false`.
+- `/planner/geometric_path` was **removed 2026-10-01** (redundant with `/planner/corridor`'s magenta
+  untruncated path + white prefix). `AutonomyCore::hasCommittedPath()` replaces its getter in tests.
 - `/planner/goal_marker` (`visualization_msgs/Marker`) — red sphere at the active goal position.
   Published every viz tick so late-joining RViz sessions see it immediately.
 - `/smooth_trajectory` (`nav_msgs/Path`) — sampled trajectory as handed to the tracker, frame
@@ -1181,8 +1179,8 @@ publish nothing and cost nothing when the flag is off:
 
   Reading it: grey present but nothing coloured ⇒ the margin collapsed the regions, so there is less
   room than `CORRIDOR_MARGIN` demands. Red ⇒ regions survived the shrink but failed validation (the
-  `[trajgen]` line names which check). Where the white line stops short of the green
-  `/planner/geometric_path` is where truncation refused to commit into unknown space. Needs
+  `[trajgen]` line names which check). Where the white line stops short of the magenta one is where
+  truncation refused to commit. Needs
   `PLAN_TRAJECTORY` + `USE_CORRIDOR_QP` + `DEBUG_PLANNER_VIZ`.
 
 **Planning-related node parameters** (all live-reconfigurable via `onParameterChange`):
@@ -1323,10 +1321,42 @@ publish nothing and cost nothing when the flag is off:
 - `VMAX` / `AMAX` / `JMAX` (double, defaults `1.0` / `1.5` / `3.0`) — per-axis velocity /
   acceleration / jerk limits enforced by the corridor QP (conservative box bounds; the true norm can
   reach √3× in the corner case).
-- `FRONTIER_MARGIN` (double, default `0.5` m) — clearance the committed *path prefix* keeps from
-  unknown space (the truncation margin against the conservative EDT). Enforced exactly as set; a
-  committed point must still have strictly positive clearance whatever the value, so the prefix can
-  never reach into an occupied or unknown voxel.
+- `FRONTIER_MARGIN` (double, default `0.5` m) — truncation's margin: the clearance the committed
+  *path prefix* keeps from mapped obstacles, and from unknown space unless `UNKNOWN_MARGIN` is
+  smaller. Enforced exactly as set; a committed point must still have strictly positive clearance
+  whatever the value, so the prefix can never reach into an occupied or unknown voxel.
+- `MAX_UNKNOWN_SLOPE` (double, default `20` deg, 2026-10-01, NOT yet benched) — steepest edge the
+  search may route through never-observed space (`GeometricPlanner::setUnknownSlopeLimit`, read from
+  the conservative grid so the keep-out counts as seen). The camera looks forward and roughly level
+  (D435 depth about ±29° vertically), so the optimistic path should only go where the drone will be
+  looking when it gets there; through explored space any slope is fine. Enforced in a custom
+  `MotionValidator` (`EdgeRuleMotionValidator`), so the search, `isPathValid` and the shortcuts all
+  obey it, and it only removes edges (heuristics stay admissible). **EIT\* and AIT\* bypass it**:
+  they check edges with their own point-by-point test and never call the motion validator, and OMPL
+  offers no hook, so the node's default `PLANNER_TYPE` became `ABITstar` and the search logs a
+  `WARNING` when the limit is on with either. Goes with `UNKNOWN_WEIGHT` = `FRONTIER_WEIGHT` = 0 (node
+  defaults since the same day): the idea is to take the genuinely shortest optimistic route and let
+  truncation advance as the camera confirms it, rather than steer away from unknown space.
+  `ctest -R unknown_cost` test 10 (mutation-checked). **Open: an intermittent segfault inside OMPL's
+  BIT\*/ABIT\*** (`BITstar::bestPathFromGoalToStart` → `Vertex::state`, while publishing a
+  solution), seen in that test about 1 run in 5, and in a scratch reproducer 1 in 25-60 solves with
+  ABIT\* + the slope rule and once in 60 with BIT\* + the rule; not yet seen without the rule, but too
+  few runs to say. It would kill the node, so resolve it before flying with ABIT\*/BIT\*.
+- `UNKNOWN_MARGIN` (double, default `0.25` m, 2026-10-01, NOT yet benched) — clearance from
+  never-observed space for truncation, the corridor and the trajectory monitor, when smaller than
+  their margins from mapped obstacles (`FRONTIER_MARGIN` for truncation, `CORRIDOR_MARGIN` for the
+  corridor and the monitor). Truncation and the monitor test `min(d_raw, d_cons + margin −
+  UNKNOWN_MARGIN)` against their margin (`makeSplitClearanceFn`), i.e. exactly `d_raw ≥ margin` and
+  `d_cons ≥ UNKNOWN_MARGIN`. The corridor gets the shell cells at the end of its obstacle list
+  (`CorridorParams::first_unknown`): a DecompUtil face through a shell point is pulled in by
+  `UNKNOWN_MARGIN` (+ half-diagonal), raised only as far as needed for every mapped point beyond its
+  plane that the region's other (full-pull-in) faces do not already keep `CORRIDOR_MARGIN` away
+  (`shrink_cap`) — so a mapped wall just behind the frontier still gets the full margin, while the
+  floor running out under the frontier (kept away by the floor face) does not cancel the relief. The
+  first version counted every mapped point beyond the plane, and on the bench (2026-10-01) that put
+  every unknown face back at the full margin. `ctest -R corridor` checks the walls at 1 cm (with a
+  wall behind and with a floor underneath), mutation-checked both ways. The search
+  itself is unchanged (its collision check never saw unknown space).
 - `TRAJ_SOLVE_BUDGET` (double, default `0.8` s) — wall-clock budget for the corridor QP's
   time-allocation search, counted from the start of `optimizeTrajectory` and shared by growth,
   bisection and the group cuts. When it runs out the last accepted allocation is used — feasible by
