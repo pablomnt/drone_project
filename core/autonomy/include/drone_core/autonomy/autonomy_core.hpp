@@ -139,8 +139,25 @@ public:
     // cost unknown_slope_weight per vertical metre beyond it. Through explored
     // space any slope is allowed. Only with treat_unknown_as_hazard; <= 0
     // disables both.
-    double max_unknown_slope{20.0};
+    double max_unknown_slope{0.0};
     double unknown_slope_weight{5.0};
+
+    // Goal-directed exploration (see explorationTick). With it on, and
+    // treat_unknown_as_hazard + use_corridor_qp and a conservative grid, the
+    // search plans only on the conservative map: toward the reachable known
+    // point nearest the goal (ADVANCE), and when there is none closer, to a
+    // viewpoint looking at where an optimistic path to the goal leaves explored
+    // space (UNCOVER), until the goal is within goal_reached_dist (DONE) or no
+    // route remains even through unknown space (NO EXITS). Off by default in
+    // the core (the tests drive the classic search); the node turns it on.
+    bool use_exploration{false};
+    double goal_reached_dist{1.0};     // the goal counts as reached within this [m]
+    double retarget_period{3.0};       // how often ADVANCE looks for a closer known point [s]
+    double retarget_min_gain{0.3};     // a new known point must be this much closer to the goal [m]
+    double view_distance{3.0};         // ideal viewpoint distance from the exit point [m]
+    double arrive_dist{0.3};           // the drone has reached its target within this [m]
+    double view_dwell{1.5};            // wait at a viewpoint for the map to catch up [s]
+    double exit_exclusion_radius{1.0}; // exit points looked at are avoided by this much [m]
     // Trajectory monitor (see monitorLoop). The trajectory being flown is kept
     // until there is a reason to replace it; the monitor looks for one this many
     // times a second.
@@ -183,7 +200,7 @@ public:
     // trajectory monitor [m], when smaller than their margin from mapped
     // obstacles (frontier_margin for truncation, corridor_margin for the other
     // two); a value at or above those leaves them as they were.
-    double unknown_margin{0.2};
+    double unknown_margin{0.25};
     // Clearance the corridor boxes must have from obstacles AND unknown space
     // [m]. This is a strictly harder test than the planner's collision margin:
     // the search only checks its centreline (and exempts a sphere at the
@@ -377,6 +394,19 @@ public:
   // generation, so it works with plan_trajectory false.
   bool hasCommittedPath() const { return !committedPath().empty(); }
 
+  // The exploration's current state, for logs and visualisation (map frame).
+  enum class MissionMode { kIdle, kAdvance, kUncover, kDone, kNoExits };
+  struct MissionView {
+    MissionMode mode = MissionMode::kIdle;
+    bool has_target = false;
+    Eigen::Vector3d target = Eigen::Vector3d::Zero();  // where the drone is heading
+    double target_yaw = std::numeric_limits<double>::quiet_NaN();  // heading to arrive with
+    bool has_exit = false;
+    Eigen::Vector3d exit = Eigen::Vector3d::Zero();    // the exit point being looked at (UNCOVER)
+  };
+  MissionView missionView() const;
+  static const char* toString(MissionMode m);
+
   // Coarse samples of the cached clearance (EDT) field as {x, y, z, distance}
   // (distance clamped at clearance_threshold), for debug visualisation. Empty
   // unless cfg.debug_planner_viz is set. Thread-safe copy.
@@ -485,7 +515,20 @@ private:
   // The committed path, shared between the two threads: written by the search
   // loop when it adopts, read (by copy, never held across a solve) by trajgen.
   std::vector<std::vector<double>> committedPath(std::uint64_t* version = nullptr) const;
-  void setCommittedPath(std::vector<std::vector<double>> path);
+  // `end_yaw` (map frame, NaN for none): the heading to end the path facing,
+  // carried into the trajectory built on it (Trajectory::end_yaw).
+  void setCommittedPath(std::vector<std::vector<double>> path,
+                        double end_yaw = std::numeric_limits<double>::quiet_NaN());
+  double committedEndYaw() const;
+
+  // Goal-directed exploration (see Config::use_exploration).
+  bool explorationActive(const ConsGridHandle& cons) const;
+  // One search tick of it: `start` is where to plan from (the predicted splice
+  // point, as for the classic search), `drone` the measured position, both map
+  // frame.
+  void explorationTick(const planning::MapHandle& map, const ConsGridHandle& cons,
+                       const Eigen::Vector3d& goal, const Eigen::Vector3d& start,
+                       const Eigen::Vector3d& drone, double t);
 
   // Which map the debug clearance samples were taken from. Guarded by
   // edt_mutex_ with the fields it belongs to, since clearanceField clears it on
@@ -687,6 +730,27 @@ private:
   // The committed path (see committedPath/setCommittedPath).
   mutable std::mutex path_mutex_;
   std::vector<std::vector<double>> committed_path_;
+  double committed_end_yaw_{std::numeric_limits<double>::quiet_NaN()};  // guarded by path_mutex_
+
+  // Exploration state, search thread only (missionView copies it under traj_mutex_).
+  struct Mission {
+    MissionMode mode = MissionMode::kIdle;
+    bool has_target = false;
+    Eigen::Vector3d target = Eigen::Vector3d::Zero();
+    double target_yaw = std::numeric_limits<double>::quiet_NaN();
+    double best_gap = std::numeric_limits<double>::infinity();  // nearest the goal a known target got
+    bool need_retarget = true;
+    bool need_viewpoint = false;
+    double last_retarget = -1.0e9;
+    double last_improve = -1.0e9;
+    double arrived_at = std::numeric_limits<double>::quiet_NaN();
+    bool has_exit = false;
+    Eigen::Vector3d exit = Eigen::Vector3d::Zero();
+    std::vector<Eigen::Vector3d> tried_exits;
+    int failed_exits = 0;
+    double last_status = -1.0e9;
+  } mission_;
+  MissionView mission_view_;  // guarded by traj_mutex_
   std::uint64_t path_version_{0};  // bumped on every setCommittedPath; guarded by path_mutex_
 
   // What the trajectory being flown lacks, worked out by the monitor at the

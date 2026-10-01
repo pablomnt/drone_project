@@ -212,6 +212,34 @@ public:
   // max_slope_deg <= 0 disables both (the default).
   void setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg, double steep_weight);
 
+  // Plan on the CONSERVATIVE map: a point is valid only if it is in observed
+  // space (`is_unknown` false) and at least `unknown_margin` from never-observed
+  // space (`conservative`: distance to the nearest occupied-or-unknown voxel),
+  // on top of the usual margin from mapped obstacles. The unknown margin ramps
+  // up from the start's own clearance over the escape ramp, like the obstacle
+  // margin. The start itself is exempt from the "observed" test (a drone may sit
+  // in a cell the map has not seen).
+  //
+  // A goal in never-observed space would be invalid, which OMPL refuses
+  // outright. So when the goal fails the check, planPath plans to it unchanged
+  // with only that exact point exempt: nothing can connect to it through the
+  // unknown space around it, and best effort (setBestEffort) returns the path
+  // to the reachable point nearest the goal — the best-effort known-space goal.
+  // Empty functions disable it (the default: optimistic, unknown reads as free).
+  void setConservative(UnknownFn is_unknown, ClearanceFn conservative, double unknown_margin);
+
+  // Points within `radius` of any of `centres` are invalid (the exit points
+  // the exploration has already looked at, so the optimistic search routes
+  // through a different one). Empty disables it (the default).
+  void setExclusions(std::vector<Eigen::Vector3d> centres, double radius) {
+    exclusions_ = std::move(centres);
+    exclusion_radius_ = radius;
+  }
+
+  // The validity check the search uses, for one point, with the escape ramp
+  // centred where the last planPath / isPathValid anchored it.
+  bool isValidPoint(double x, double y, double z) const { return positionValid(x, y, z); }
+
   // Select which OMPL planner planPath builds. The per-planner parameters come
   // from the PlannerConfig defaults in this header. Default is RRT*.
   void setPlannerType(PlannerType type) { planner_type_ = type; }
@@ -478,6 +506,21 @@ private:
   double steep_weight_ = 0.0;
   bool slopeActive() const { return max_slope_tan_ > 0.0 && static_cast<bool>(slope_unknown_fn_); }
 
+  std::vector<Eigen::Vector3d> exclusions_;  // see setExclusions
+  double exclusion_radius_ = 0.0;
+
+  // Conservative mode (see setConservative).
+  UnknownFn cons_unknown_fn_;
+  ClearanceFn cons_clearance_fn_;
+  double cons_unknown_margin_ = 0.0;
+  mutable double start_floor_unknown_ = 0.0;  // like start_floor_, for the unknown margin
+  // The one point exempt from validity this planPath (a goal in unknown space).
+  mutable bool exempt_goal_ = false;
+  mutable std::array<double, 3> exempt_goal_pos_{};
+  bool conservativeActive() const {
+    return static_cast<bool>(cons_unknown_fn_) && static_cast<bool>(cons_clearance_fn_);
+  }
+
   // Largest search (in sampled states) whose tree is copied out for the debug
   // viz; see planPath. Measured 2026-09-29: normal searches sample 500-2000
   // states and copy quickly; an EIT* search with start 2 cm from goal sampled
@@ -503,7 +546,7 @@ private:
   // (FRONTIER_MARGIN 0.5 m, CORRIDOR_MARGIN 0.4 m) to give the drone any room
   // to move: a 0.5 m ball left only its centre keeping the margins and cut
   // every plan to ~0.2 m. The price is treating that much unseen space as empty.
-  static constexpr double kFrontierKeepOutRadius = 0.6;
+  static constexpr double kFrontierKeepOutRadius = 0.8;
   static constexpr double kFrontierKeepOutForward = 1.2;
 
   // Largest straight bypass [m] the clearance-aware shortcut will create. Caps

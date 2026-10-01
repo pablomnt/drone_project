@@ -9,7 +9,8 @@ add_library(drone_core_planning
   src/corridor_trajectory.cpp
   src/unknown_shell.cpp
   src/distance_field.cpp
-  src/conservative_grid.cpp)
+  src/conservative_grid.cpp
+  src/exploration.cpp)
 add_library(drone_core::planning ALIAS drone_core_planning)
 
 target_include_directories(drone_core_planning PUBLIC
@@ -74,4 +75,9 @@ if(DRONE_CORE_BUILD_TESTS)
   add_executable(test_distance_field test/test_distance_field.cpp)
   target_link_libraries(test_distance_field PRIVATE drone_core_planning ${DYNAMICEDT3D_LIBRARY})
   add_test(NAME distance_field COMMAND test_distance_field)
+
+  # Exploration helpers (exit point, viewpoints) on analytic predicates. Instant.
+  add_executable(test_exploration test/test_exploration.cpp)
+  target_link_libraries(test_exploration PRIVATE drone_core_planning)
+  add_test(NAME exploration COMMAND test_exploration)
 endif()

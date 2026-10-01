@@ -3,6 +3,7 @@
 
 #include "drone_core/control/flatness_mapper.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 
@@ -73,6 +74,34 @@ int main() {
   held.reset(0.7);
   auto rs = held.sample(still, 0.5);
   expectNear(rs.yaw, 0.7, 1e-9, "yaw held at standstill");
+
+  // End heading: the same +x trajectory told to end facing +y (pi/2). Before
+  // the last 1.5 s yaw follows travel (0); after the end it turns at no more
+  // than 0.8 rad/s and settles exactly on pi/2; without an end heading the end
+  // holds the travel heading.
+  {
+    Trajectory e = traj;
+    e.end_yaw = M_PI / 2.0;
+    FlatnessMapper m;
+    m.reset(0.0);
+    expectNear(m.sample(e, 0.2).yaw, 0.0, 1e-9, "end yaw: follows travel early on");
+    double prev = m.sample(e, 0.4).yaw;
+    double max_rate = 0.0;
+    for (double t = 0.42; t <= 6.0; t += 0.02) {
+      const double y = m.sample(e, t).yaw;
+      max_rate = std::max(max_rate, std::abs(y - prev) / 0.02);
+      prev = y;
+    }
+    expectNear(prev, M_PI / 2.0, 1e-9, "end yaw: settles on the end heading");
+    if (max_rate > 0.8 + 1e-6) {
+      std::cerr << "FAIL: end yaw turned at " << max_rate << " rad/s, limit 0.8\n";
+      ++g_failures;
+    }
+    FlatnessMapper plain;
+    plain.reset(0.0);
+    for (double t = 0.0; t <= 6.0; t += 0.02) plain.sample(traj, t);
+    expectNear(plain.sample(traj, 6.0).yaw, 0.0, 1e-9, "no end yaw: the end holds the travel heading");
+  }
 
   if (g_failures == 0) {
     std::cout << "flatness_mapper: all checks passed\n";

@@ -882,6 +882,52 @@ int main() {
     expect(without > 0.8, "early stop: without it the search ended at " + std::to_string(without) + " s");
   }
 
+  // 12. Conservative mode (setConservative): explored space is x < 3 (unknown
+  //     beyond), the goal 5 m into the unknown. Best effort must stop at the
+  //     edge of explored space, unknown_margin inside it; a goal inside explored
+  //     space is reached exactly; isPathValid refuses a path into the unknown.
+  {
+    const auto unknownBeyond3 = [](double x, double, double) { return x >= 3.0; };
+    const auto consClearance = [](double x, double, double) { return std::max(0.0, 3.0 - x); };
+    // Best effort toward a goal in unknown space: RRT* (EIT* returns nothing here,
+    // its reverse search from a walled-off goal finds no edge at all).
+    {
+      GeometricPlanner planner(empty, /*planning_time=*/0.5);
+      planner.setPlannerType(PlannerType::RRTstar);
+      planner.setBestEffort(true);
+      planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+      planner.setConservative(unknownBeyond3, consClearance, 0.3);
+      std::vector<std::vector<double>> path;
+      const bool ok = planner.planPath({0, 0, 1}, {8, 0, 1}, path);
+      expect(ok && path.size() >= 2, "conservative: no best-effort path toward a goal in unknown space");
+      if (ok && !path.empty()) {
+        double max_x = -1e9;
+        for (const auto& w : path) max_x = std::max(max_x, w[0]);
+        expect(max_x < 2.7 + 1e-6, "conservative: the path enters the unknown margin (x " +
+                                       std::to_string(max_x) + ")");
+        expect(path.back()[0] > 1.5, "conservative: best effort stopped far from the edge (x " +
+                                         std::to_string(path.back()[0]) + ")");
+      }
+    }
+    // A goal in explored space: reached exactly, by both.
+    for (const PlannerType type : {PlannerType::EITstar, PlannerType::RRTstar}) {
+      GeometricPlanner planner(empty, /*planning_time=*/0.5);
+      planner.setPlannerType(type);
+      planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+      planner.setConservative(unknownBeyond3, consClearance, 0.3);
+      std::vector<std::vector<double>> p2;
+      expect(planner.planPath({0, 0, 1}, {2, 1, 1}, p2) && planner.lastGoalGap() < 0.3,
+             std::string(toString(type)) + " conservative: a goal in explored space was not reached");
+    }
+    GeometricPlanner planner(empty, /*planning_time=*/0.5);
+    planner.setClearance(wideOpen, /*weight=*/1.0, /*threshold=*/1.0);
+    planner.setConservative(unknownBeyond3, consClearance, 0.3);
+    expect(!planner.isPathValid({{0, 0, 1}, {5, 0, 1}}),
+           "conservative: isPathValid accepted a path into unknown space");
+    expect(planner.isPathValid({{0, 0, 1}, {2.5, 0, 1}}),
+           "conservative: isPathValid refused a path inside explored space");
+  }
+
   // 9. ConservativeGrid, the stamp-free replacement for 8: the same shell,
   //    ball and free classification as stampUnknownShell voxel for voxel, on
   //    the cube and on a ragged map with merged blocks, at any thread count;

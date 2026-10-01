@@ -110,6 +110,16 @@ int main() {
   check(sz.thrust_accel == s.thrust_accel && sz.stamp == s.stamp,
         "thrust_accel and stamp pass through");
 
+  // The end heading turns with a rotation about z, and an unset one stays unset.
+  {
+    Trajectory e;
+    e.end_yaw = 3.0;
+    const Trajectory te = transformTrajectory(Tz, e);
+    check(std::abs(std::remainder(te.end_yaw - (3.0 + 0.5), 2.0 * M_PI)) < 1e-12,
+          "end yaw turns with the rotation about z");
+    check(std::isnan(transformTrajectory(Tz, Trajectory{}).end_yaw), "an unset end yaw stays unset");
+  }
+
   if (g_failures == 0) std::cout << "rigid_transform: all checks passed\n";
   return g_failures == 0 ? 0 : 1;
 }

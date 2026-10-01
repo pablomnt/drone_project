@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <vector>
 #include <Eigen/Dense>
 
@@ -88,6 +89,11 @@ struct Trajectory {
   std::vector<Eigen::VectorXd> coeffs_z;
   double total_duration{0.0};
   double t0{0.0};                           // world-clock anchor [s]
+  // Heading to turn to as the trajectory ends [rad], or NaN for none (yaw then
+  // follows the direction of travel throughout). Set when the drone should
+  // arrive looking at something (the exploration viewpoints). Same frame as the
+  // coefficients.
+  double end_yaw{std::numeric_limits<double>::quiet_NaN()};
 
   bool empty() const { return segment_times.empty(); }
 };

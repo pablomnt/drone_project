@@ -182,6 +182,13 @@ GeometricPlanner::GeometricPlanner(const MapHandle& octree, double planning_time
   si_->setup();
 }
 
+void GeometricPlanner::setConservative(UnknownFn is_unknown, ClearanceFn conservative,
+                                       double unknown_margin) {
+  cons_unknown_fn_ = std::move(is_unknown);
+  cons_clearance_fn_ = std::move(conservative);
+  cons_unknown_margin_ = std::max(0.0, unknown_margin);
+}
+
 void GeometricPlanner::setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg,
                                             double steep_weight) {
   slope_unknown_fn_ = std::move(is_unknown);
@@ -193,6 +200,11 @@ void GeometricPlanner::setUnknownSlopeLimit(UnknownFn is_unknown, double max_slo
 
 void GeometricPlanner::anchorStart(double x, double y, double z) const {
   start_pos_ = {x, y, z};
+  start_floor_unknown_ =
+      conservativeActive()
+          ? std::max(0.0, cons_clearance_fn_(x, y, z) -
+                              0.5 * (octree_ptr_ ? octree_ptr_->getResolution() : 0.0))
+          : 0.0;
   // The start's clearance less half a voxel: the EDT reports cell-to-cell
   // distances, so sliding along a wall that is not axis-aligned reads a few
   // centimetres of jitter that is quantisation, not approach. Deliberately
@@ -239,6 +251,30 @@ bool GeometricPlanner::positionValid(double x, double y, double z) const {
   if (slopeActive() && std::abs(ez) > max_slope_tan_ * std::hypot(ex, ey) &&
       slope_unknown_fn_(x, y, z)) {
     return false;
+  }
+
+  for (const auto& e : exclusions_) {
+    const double dx = x - e.x(), dy = y - e.y(), dz = z - e.z();
+    if (dx * dx + dy * dy + dz * dz < exclusion_radius_ * exclusion_radius_ && from_start > 1e-9) {
+      return false;
+    }
+  }
+
+  if (conservativeActive()) {
+    // The one exempt point: a goal in unknown space (see setConservative).
+    if (exempt_goal_ && x == exempt_goal_pos_[0] && y == exempt_goal_pos_[1] &&
+        z == exempt_goal_pos_[2]) {
+      return true;
+    }
+    const bool is_start = from_start < 1e-9;
+    if (!is_start && cons_unknown_fn_(x, y, z)) return false;
+    const double need_unknown =
+        escape_ramp_ > 0.0
+            ? std::min(cons_unknown_margin_,
+                       std::max(start_floor_unknown_,
+                                cons_unknown_margin_ * std::min(1.0, from_start / escape_ramp_)))
+            : cons_unknown_margin_;
+    if (!is_start && !(cons_clearance_fn_(x, y, z) > need_unknown)) return false;
   }
 
   const double margin =
@@ -384,6 +420,7 @@ double GeometricPlanner::minClearance(const std::vector<std::vector<double>>& pa
 
 bool GeometricPlanner::isPathValid(const std::vector<std::vector<double>>& path) const {
   if (path.size() < 2) return false;
+  exempt_goal_ = false;  // only planPath's own goal is ever exempt
 
   // Anchor the start-state exemption at the path's first waypoint so a committed
   // path that begins on the floor (the takeoff pose) does not fail this periodic
@@ -589,7 +626,26 @@ bool GeometricPlanner::planPath(const std::vector<double>& start_vec,
   // path that stops at the margin. Projecting is what turns "invalid goal" back
   // into the ordinary "goal we approach as closely as the margin allows" case.
   std::array<double, 3> planning_goal{};
-  if (!projectGoal(goal_vec, planning_goal)) {
+  exempt_goal_ = false;
+  // The exemption lives for this search only, whichever way it returns.
+  struct ExemptReset {
+    bool& flag;
+    ~ExemptReset() { flag = false; }
+  } exempt_reset{exempt_goal_};
+  if (conservativeActive() && best_effort_ && !positionValid(goal_vec[0], goal_vec[1], goal_vec[2])) {
+    // A goal the conservative check refuses (in or next to unknown space, or
+    // near an obstacle): keep it where it is, exempt only that point, and let
+    // best effort return the reachable point nearest it (see setConservative).
+    // Projection would look for a valid point within kGoalProjectRadius, which
+    // in unknown space there usually is not.
+    const auto& bounds = space_->as<ompl::base::RealVectorStateSpace>()->getBounds();
+    constexpr double kInset = 1e-3;  // [m], as projectGoal
+    for (int i = 0; i < 3; ++i) {
+      planning_goal[i] = std::clamp(goal_vec[i], bounds.low[i] + kInset, bounds.high[i] - kInset);
+    }
+    exempt_goal_ = true;
+    exempt_goal_pos_ = planning_goal;
+  } else if (!projectGoal(goal_vec, planning_goal)) {
     last_goal_projection_ = std::numeric_limits<double>::infinity();
     last_goal_gap_ = std::numeric_limits<double>::infinity();
     t_project = lap(mark);

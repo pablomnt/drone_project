@@ -18,6 +18,7 @@
 #include "drone_core/control/flatness_mapper.hpp"
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/corridor_trajectory.hpp"
+#include "drone_core/planning/exploration.hpp"
 
 namespace drone_core::autonomy {
 
@@ -559,10 +560,32 @@ std::vector<std::vector<double>> AutonomyCore::committedPath(std::uint64_t* vers
   return committed_path_;
 }
 
-void AutonomyCore::setCommittedPath(std::vector<std::vector<double>> path) {
+void AutonomyCore::setCommittedPath(std::vector<std::vector<double>> path, double end_yaw) {
   std::lock_guard<std::mutex> lock(path_mutex_);
   committed_path_ = std::move(path);
+  committed_end_yaw_ = end_yaw;
   ++path_version_;  // a new plan: the monitor treats the trajectory built on the old one as invalid
+}
+
+double AutonomyCore::committedEndYaw() const {
+  std::lock_guard<std::mutex> lock(path_mutex_);
+  return committed_end_yaw_;
+}
+
+AutonomyCore::MissionView AutonomyCore::missionView() const {
+  std::lock_guard<std::mutex> lock(traj_mutex_);
+  return mission_view_;
+}
+
+const char* AutonomyCore::toString(MissionMode m) {
+  switch (m) {
+    case MissionMode::kIdle: return "IDLE";
+    case MissionMode::kAdvance: return "ADVANCE";
+    case MissionMode::kUncover: return "UNCOVER";
+    case MissionMode::kDone: return "DONE";
+    case MissionMode::kNoExits: return "NO EXITS";
+  }
+  return "?";
 }
 
 planning::MapHandle AutonomyCore::vizSampledMap() const {
@@ -1067,6 +1090,16 @@ bool AutonomyCore::runTrajgen(const std::vector<std::vector<double>>& path, doub
       trajgen_qp_time_ = now() - t_qp;
       if (solved) {
         traj.t0 = t0;
+        // The committed path's end heading (exploration viewpoints), when this
+        // trajectory ends where that path does: not after a truncation cut.
+        {
+          const double end_yaw = committedEndYaw();
+          const auto cp = committedPath();
+          if (std::isfinite(end_yaw) && !cp.empty() && (committed.back() - epath.back()).norm() < 1e-6 &&
+              (Eigen::Vector3d(cp.back()[0], cp.back()[1], cp.back()[2]) - epath.back()).norm() < 1e-6) {
+            traj.end_yaw = end_yaw;
+          }
+        }
         if (info) {
           info->corridor = true;
           info->start_margin = start_margin;
@@ -1454,6 +1487,286 @@ bool AutonomyCore::applyClearanceObjective(planning::GeometricPlanner& planner,
   return true;
 }
 
+bool AutonomyCore::explorationActive(const ConsGridHandle& cons) const {
+  return search_cfg_.use_exploration && search_cfg_.treat_unknown_as_hazard &&
+         search_cfg_.use_corridor_qp && cons && !cons->empty();
+}
+
+// Goal-directed exploration, one search tick. The flown path always comes from
+// a search on the CONSERVATIVE map (unknown space and a margin around it are
+// off limits), so it is safe by construction and the corridor can be built on
+// it. Two phases take turns, with the monitor/improve below serving whichever
+// is on:
+//  - ADVANCE: head for the reachable known point nearest the goal (a
+//    best-effort RRT* search, since EIT* returns nothing when the goal is walled
+//    off by unknown space), and look for a closer one every retarget_period. On
+//    arriving with nothing closer found, switch to UNCOVER.
+//  - UNCOVER: plan OPTIMISTICALLY (unknown = free, EIT*) from here to the goal,
+//    take the point where that path first leaves explored space (the exit
+//    point), and fly to a viewpoint about view_distance from it that can see it,
+//    ending facing it. After view_dwell there, a closer known point means
+//    ADVANCE again; otherwise the next exit (the ones looked at are excluded).
+// DONE within goal_reached_dist of the goal; NO EXITS when the optimistic
+// search finds no route at all, or no exit point gets a reachable viewpoint.
+// The drone then holds where it is.
+void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGridHandle& cons,
+                                   const Eigen::Vector3d& goal, const Eigen::Vector3d& start,
+                                   const Eigen::Vector3d& drone, double t) {
+  using V = Eigen::Vector3d;
+  using Path = std::vector<std::vector<double>>;
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  const Config& c = search_cfg_;
+  Mission& m = mission_;
+
+  const auto publishView = [this, &m]() {
+    MissionView v;
+    v.mode = m.mode;
+    v.has_target = m.has_target;
+    v.target = m.target;
+    v.target_yaw = m.target_yaw;
+    v.has_exit = m.has_exit && m.mode == MissionMode::kUncover;
+    v.exit = m.exit;
+    std::lock_guard<std::mutex> lock(traj_mutex_);
+    mission_view_ = v;
+  };
+  const auto fmt = [](const V& v) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(2) << "(" << v.x() << ", " << v.y() << ", " << v.z() << ")";
+    return os.str();
+  };
+  const auto sv = [](const V& v) { return std::vector<double>{v.x(), v.y(), v.z()}; };
+  const auto toV = [](const std::vector<double>& w) { return V(w[0], w[1], w[2]); };
+
+  if (m.mode == MissionMode::kDone || m.mode == MissionMode::kNoExits) return;
+  if (m.mode == MissionMode::kIdle) {
+    m.mode = MissionMode::kAdvance;
+    m.need_retarget = true;
+    DRONE_LOG_INFO("[mission] new goal " << fmt(goal) << ": ADVANCE");
+  }
+  if ((drone - goal).norm() <= c.goal_reached_dist ||
+      (m.has_target && (drone - m.target).norm() <= c.arrive_dist && m.best_gap <= c.goal_reached_dist)) {
+    m.mode = MissionMode::kDone;
+    DRONE_LOG_INFO("[mission] DONE: within " << (drone - goal).norm() << " m of the goal");
+    publishView();
+    return;
+  }
+
+  // A status line every 5 s, so a quiet mission is visibly alive.
+  if (t - m.last_status >= 5.0) {
+    m.last_status = t;
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(2) << "[mission] " << toString(m.mode) << ": drone "
+       << (drone - goal).norm() << " m from the goal";
+    if (m.has_target) os << ", target " << fmt(m.target) << " " << (drone - m.target).norm() << " m away";
+    if (m.mode == MissionMode::kUncover && m.has_exit) os << ", looking at exit " << fmt(m.exit);
+    DRONE_LOG_INFO(os.str());
+  }
+
+  // The fields and predicates every planner below shares.
+  const double cons_md = std::max(c.clearance_threshold, c.frontier_margin);
+  const auto cons_edt = conservativeField(map, cons, cons_md);
+  if (!cons_edt) return;
+  const auto opt_edt = clearanceField(map, c.clearance_threshold);
+  const double res = cons->resolution();
+  // The corridor keeps UNKNOWN_MARGIN plus a voxel half-diagonal from unknown
+  // voxel centres. The distance field reads a point's clearance at its voxel's
+  // centre, up to another half-diagonal off, so the search adds both (and 1 cm):
+  // its paths then always fit the corridor.
+  const double unknown_margin = c.unknown_margin + res * std::sqrt(3.0) + 0.01;
+  const auto unknown_fn = makeUnknownFn(map, cons);
+  const auto cons_fn = makeClearanceFn(cons_edt, cons_md);
+  const auto opt_fn = opt_edt ? makeClearanceFn(opt_edt, c.clearance_threshold)
+                              : planning::CorridorClearanceFn(
+                                    [md = c.clearance_threshold](double, double, double) { return md; });
+  const auto configure = [&](planning::GeometricPlanner& p, planning::PlannerType type,
+                             bool conservative) {
+    p.setPlannerType(type);
+    p.setEscapeRamp(c.escape_ramp_dist);
+    applyClearanceObjective(p, map, cons);
+    if (conservative) p.setConservative(unknown_fn, cons_fn, unknown_margin);
+  };
+
+  // The monitor/improve planner: conservative, EIT* (PLANNER_TYPE), to the target.
+  planning::GeometricPlanner strict(map, c.rrt_solve_time);
+  configure(strict, c.planner_type, /*conservative=*/true);
+  const auto planTo = [&](const V& target, Path& out) {
+    out.clear();
+    strict.setBestEffort(false);
+    strict.setPlanningTime(c.rrt_solve_time);
+    strict.setEarlyStop(c.rrt_replan_solve_time);
+    return strict.planPath(sv(start), sv(target), out) && out.size() >= 2;
+  };
+  // The advance planner: conservative, RRT*, best effort toward the goal.
+  const auto bestKnown = [&](Path& out, double& gap) {
+    out.clear();
+    planning::GeometricPlanner be(map, c.rrt_solve_time);
+    configure(be, planning::PlannerType::RRTstar, /*conservative=*/true);
+    be.setBestEffort(true);
+    if (!be.planPath(sv(start), sv(goal), out) || out.size() < 2) return false;
+    gap = (toV(out.back()) - goal).norm();
+    return true;
+  };
+  const auto commit = [&](const Path& p, double end_yaw) {
+    setCommittedPath(p, end_yaw);
+    m.has_target = true;
+    m.target = toV(p.back());
+    m.target_yaw = end_yaw;
+    m.arrived_at = kNaN;
+  };
+
+  // ---- Monitor: is the path to the target still safe on the current map? ----
+  const Path committed = committedPath();
+  if (m.has_target) {
+    const Path rem = remainingCommittedSuffix(committed, sv(start));
+    if (committed.empty() || (rem.size() >= 2 && !strict.isPathValid(rem))) {
+      Path p;
+      if (strict.isValidPoint(m.target.x(), m.target.y(), m.target.z()) && planTo(m.target, p)) {
+        commit(p, m.target_yaw);
+        DRONE_LOG_INFO("[mission] " << toString(m.mode) << ": path to " << fmt(m.target)
+                                    << (committed.empty() ? " was dropped" : " is blocked")
+                                    << ", replanned (" << p.size() << " wp)");
+      } else {
+        DRONE_LOG_INFO("[mission] " << toString(m.mode) << ": the target " << fmt(m.target)
+                                    << " is no longer reachable: choosing a new one");
+        setCommittedPath({});
+        m.has_target = false;
+        m.need_retarget = m.mode == MissionMode::kAdvance;
+        m.need_viewpoint = m.mode == MissionMode::kUncover;
+      }
+    }
+  }
+  const bool arrived = m.has_target && (drone - m.target).norm() <= c.arrive_dist;
+
+  // ---- Improve: a cheaper path to the same target. ----
+  const auto improve = [&]() {
+    if (!m.has_target || arrived || t - m.last_improve < c.rrt_improve_period) return;
+    m.last_improve = t;
+    const Path rem = remainingCommittedSuffix(committedPath(), sv(start));
+    if (rem.size() < 2) return;
+    const double current = strict.pathCost(rem);
+    Path p;
+    strict.setEarlyStop(0.0);
+    if (!strict.planPath(sv(start), sv(m.target), p) || p.size() < 2) return;
+    const double cand = strict.pathCost(p);
+    if (cand <= c.replan_improve_ratio * current) {
+      commit(p, m.target_yaw);
+      DRONE_LOG_INFO("[mission] " << toString(m.mode) << ": improved the path to " << fmt(m.target)
+                                  << " (cost " << current << " -> " << cand << ")");
+    }
+  };
+
+  if (m.mode == MissionMode::kAdvance) {
+    if (m.need_retarget || arrived || t - m.last_retarget >= c.retarget_period) {
+      m.need_retarget = false;
+      m.last_retarget = t;
+      Path p;
+      double gap = std::numeric_limits<double>::infinity();
+      if (bestKnown(p, gap) && gap < m.best_gap - c.retarget_min_gain) {
+        commit(p, kNaN);
+        DRONE_LOG_INFO("[mission] ADVANCE: heading for " << fmt(m.target) << ", " << gap
+                                                          << " m from the goal (was "
+                                                          << m.best_gap << " m)");
+        m.best_gap = gap;
+      } else if (arrived || !m.has_target) {
+        m.mode = MissionMode::kUncover;
+        m.need_viewpoint = true;
+        m.has_target = false;
+        DRONE_LOG_INFO("[mission] ADVANCE: no known point closer to the goal than "
+                       << m.best_gap << " m: UNCOVER");
+      }
+    }
+    if (m.mode == MissionMode::kAdvance) improve();
+    publishView();
+    return;
+  }
+
+  // ---- UNCOVER ----
+  if (m.need_viewpoint) {
+    m.need_viewpoint = false;
+    planning::GeometricPlanner opt(map, c.rrt_solve_time);
+    configure(opt, c.planner_type, /*conservative=*/false);
+    opt.setBestEffort(true);
+    opt.setExclusions(m.tried_exits, c.exit_exclusion_radius);
+    Path p;
+    if (!opt.planPath(sv(start), sv(goal), p) || p.size() < 2) {
+      m.mode = MissionMode::kNoExits;
+      DRONE_LOG_INFO("[mission] NO EXITS: no route to the goal even through unknown space ("
+                     << m.tried_exits.size() << " exit point(s) looked at); holding");
+      publishView();
+      return;
+    }
+    std::vector<V> ep;
+    for (const auto& w : p) ep.push_back(toV(w));
+    const auto exit = planning::findExitPoint(
+        ep, [&](const V& q) { return unknown_fn(q.x(), q.y(), q.z()); });
+    if (!exit) {
+      // The optimistic route never leaves explored space: the conservative
+      // search should reach along it, so look again from here.
+      m.mode = MissionMode::kAdvance;
+      m.need_retarget = true;
+      m.best_gap = std::numeric_limits<double>::infinity();
+      DRONE_LOG_INFO("[mission] UNCOVER: the route to the goal stays in explored space: ADVANCE");
+      publishView();
+      return;
+    }
+    m.tried_exits.push_back(*exit);
+    m.has_exit = true;
+    m.exit = *exit;
+    planning::ViewpointParams vp;
+    vp.distance = c.view_distance;
+    const auto candidates = planning::viewpointCandidates(
+        *exit, drone, [&](const V& q) { return strict.isValidPoint(q.x(), q.y(), q.z()); },
+        [&](const V& q) { return opt_fn(q.x(), q.y(), q.z()) > 0.5 * res; }, vp);
+    constexpr std::size_t kTries = 4;
+    for (std::size_t i = 0; i < std::min(kTries, candidates.size()); ++i) {
+      Path vpath;
+      if (planTo(candidates[i].pos, vpath)) {
+        commit(vpath, candidates[i].yaw);
+        m.failed_exits = 0;
+        DRONE_LOG_INFO("[mission] UNCOVER: exit point " << fmt(*exit) << ", viewpoint "
+                                                        << fmt(candidates[i].pos) << " "
+                                                        << (candidates[i].pos - *exit).norm()
+                                                        << " m from it, facing it");
+        publishView();
+        return;
+      }
+    }
+    DRONE_LOG_INFO("[mission] UNCOVER: no reachable viewpoint for exit point "
+                   << fmt(*exit) << " (" << candidates.size() << " candidates): trying another");
+    m.need_viewpoint = true;
+    if (++m.failed_exits > 5) {
+      m.mode = MissionMode::kNoExits;
+      DRONE_LOG_INFO("[mission] NO EXITS: no reachable viewpoint for 6 exit points in a row; holding");
+    }
+    publishView();
+    return;
+  }
+  if (arrived) {
+    if (!std::isfinite(m.arrived_at)) m.arrived_at = t;
+    if (t - m.arrived_at >= c.view_dwell) {
+      Path p;
+      double gap = std::numeric_limits<double>::infinity();
+      if (bestKnown(p, gap) && gap < m.best_gap - c.retarget_min_gain) {
+        m.mode = MissionMode::kAdvance;
+        commit(p, kNaN);
+        DRONE_LOG_INFO("[mission] UNCOVER uncovered a way on: ADVANCE to " << fmt(m.target) << ", "
+                                                                          << gap << " m from the goal (was "
+                                                                          << m.best_gap << " m)");
+        m.best_gap = gap;
+        m.last_retarget = t;
+      } else {
+        m.need_viewpoint = true;
+        m.has_target = false;
+        DRONE_LOG_INFO("[mission] UNCOVER: nothing closer than " << m.best_gap
+                                                                 << " m after looking: next exit point");
+      }
+    }
+  } else {
+    improve();
+  }
+  publishView();
+}
+
 void AutonomyCore::searchLoop() {
   std::uint64_t run = 0;  // search ticks taken (advanced only while a goal and map exist)
 
@@ -1506,7 +1819,12 @@ void AutonomyCore::searchLoop() {
     // the path still targets the current goal). Drop it here on this thread so
     // the tick below replans from the drone's current position toward the new
     // goal.
-    if (new_goal) setCommittedPath({});
+    if (new_goal) {
+      setCommittedPath({});
+      mission_ = Mission{};
+      std::lock_guard<std::mutex> lock(traj_mutex_);
+      mission_view_ = MissionView{};
+    }
 
     // The tracker abandoned the trajectory (the vehicle got too far from its
     // reference) and is holding position. Same treatment as a new goal: drop the
@@ -1573,211 +1891,218 @@ void AutonomyCore::searchLoop() {
         setCommittedPath(p);
       };
 
-      // Which map view the geometric search (and the committed-path monitor)
-      // runs on. Corridor mode searches the OPTIMISTIC view — unknown reads as
-      // free, so the informed planners (BIT*/AIT*/EIT*) accept a goal beyond
-      // the mapped frontier instead of refusing it ("no goal states
-      // available"); safety against unknown space is enforced downstream by
-      // truncation + corridor, not by the search. Without corridor mode the
-      // legacy single-map behavior is preserved: the conservative field, when
-      // there is one, is the one obstacle model (applyClearanceObjective).
-      const planning::MapHandle search_map = map;
+      // Goal-directed exploration replaces the classic search below when on
+      // (see explorationTick).
+      if (explorationActive(conservative)) {
+        explorationTick(map, conservative, goal.pos, pos_map, world_from_map.inverse() * state.pos, t);
+      } else {
 
-      // One planner per tick. Set the clearance fields FIRST, so the
-      // committed-path re-check below sees the same obstacle model the search
-      // would. The search map's field is the obstacle model for the collision
-      // check; the conservative field, when it is a distinct view, additionally
-      // scores the cost so the search is repelled by the frontier it would
-      // otherwise skim (see applyClearanceObjective). Both are cached and
-      // rebuilt only on a map change, so this is cheap on the common
-      // still-valid tick.
-      planning::GeometricPlanner planner(search_map, search_cfg_.rrt_solve_time);
-      planner.setPlannerType(search_cfg_.planner_type);
-      planner.setBestEffort(search_cfg_.best_effort_goal);
-      planner.setEscapeRamp(search_cfg_.escape_ramp_dist);
-      applyClearanceObjective(planner, search_map, conservative);
-      // Never-observed space here is the grid's view when there is one (the
-      // keep-out around the drone counts as seen, so it can still climb off the
-      // bench), else the raw map's.
-      if (search_cfg_.treat_unknown_as_hazard) {
-        planner.setUnknownSlopeLimit(makeUnknownFn(search_map, conservative),
-                                     search_cfg_.max_unknown_slope,
-                                     search_cfg_.unknown_slope_weight);
-      }
+        // Which map view the geometric search (and the committed-path monitor)
+        // runs on. Corridor mode searches the OPTIMISTIC view — unknown reads as
+        // free, so the informed planners (BIT*/AIT*/EIT*) accept a goal beyond
+        // the mapped frontier instead of refusing it ("no goal states
+        // available"); safety against unknown space is enforced downstream by
+        // truncation + corridor, not by the search. Without corridor mode the
+        // legacy single-map behavior is preserved: the conservative field, when
+        // there is one, is the one obstacle model (applyClearanceObjective).
+        const planning::MapHandle search_map = map;
 
-      // Debug-only: re-sample the clearance field when the map changes (the EDT
-      // is now current for this tick). Gated so a regular flight never walks the
-      // grid. Sampling only on map change keeps even a debug run cheap on a
-      // static scene.
-      if (search_cfg_.debug_planner_viz && search_map != vizSampledMap()) {
-        auto samples = sampleClearanceField(search_cfg_.clearance_threshold);
-        {
-          std::lock_guard<std::mutex> lock(traj_mutex_);
-          last_clearance_samples_ = std::move(samples);
+        // One planner per tick. Set the clearance fields FIRST, so the
+        // committed-path re-check below sees the same obstacle model the search
+        // would. The search map's field is the obstacle model for the collision
+        // check; the conservative field, when it is a distinct view, additionally
+        // scores the cost so the search is repelled by the frontier it would
+        // otherwise skim (see applyClearanceObjective). Both are cached and
+        // rebuilt only on a map change, so this is cheap on the common
+        // still-valid tick.
+        planning::GeometricPlanner planner(search_map, search_cfg_.rrt_solve_time);
+        planner.setPlannerType(search_cfg_.planner_type);
+        planner.setBestEffort(search_cfg_.best_effort_goal);
+        planner.setEscapeRamp(search_cfg_.escape_ramp_dist);
+        applyClearanceObjective(planner, search_map, conservative);
+        // Never-observed space here is the grid's view when there is one (the
+        // keep-out around the drone counts as seen, so it can still climb off the
+        // bench), else the raw map's.
+        if (search_cfg_.treat_unknown_as_hazard) {
+          planner.setUnknownSlopeLimit(makeUnknownFn(search_map, conservative),
+                                       search_cfg_.max_unknown_slope,
+                                       search_cfg_.unknown_slope_weight);
         }
-        setVizSampledMap(search_map);
-      }
 
-      const bool had_path = !committed_path.empty();
-      const bool path_invalid = !had_path || !planner.isPathValid(committed_path);
+        // Debug-only: re-sample the clearance field when the map changes (the EDT
+        // is now current for this tick). Gated so a regular flight never walks the
+        // grid. Sampling only on map change keeps even a debug run cheap on a
+        // static scene.
+        if (search_cfg_.debug_planner_viz && search_map != vizSampledMap()) {
+          auto samples = sampleClearanceField(search_cfg_.clearance_threshold);
+          {
+            std::lock_guard<std::mutex> lock(traj_mutex_);
+            last_clearance_samples_ = std::move(samples);
+          }
+          setVizSampledMap(search_map);
+        }
 
-      // IMPROVE every Nth tick, N = improve period / monitor period (≈10 with the
-      // defaults), so the RRT_MONITOR_PERIOD / RRT_IMPROVE_PERIOD params still set
-      // both cadences. Skipped with no committed path or no obstacles mapped
-      // (clearance is then uniform, so there is nothing to improve — a blocked path
-      // still replans below regardless).
-      const long n = std::lround(search_cfg_.rrt_improve_period /
-                                 std::max(search_cfg_.rrt_monitor_period, 1.0e-3));
-      const std::uint64_t improve_interval = static_cast<std::uint64_t>(std::max<long>(1, n));
-      const bool improve_run = (run % improve_interval == 0) && had_path && map->size() > 0;
+        const bool had_path = !committed_path.empty();
+        const bool path_invalid = !had_path || !planner.isPathValid(committed_path);
 
-      // Diagnostics on the committed path (the field is already set). The cost is
-      // split into its length + clearance-penalty terms for the logs below;
-      // committed_clr is the tightest distance to a wall along the path.
-      const auto committed = planner.costBreakdown(committed_path);
-      const double committed_clr = planner.minClearance(committed_path);
+        // IMPROVE every Nth tick, N = improve period / monitor period (≈10 with the
+        // defaults), so the RRT_MONITOR_PERIOD / RRT_IMPROVE_PERIOD params still set
+        // both cadences. Skipped with no committed path or no obstacles mapped
+        // (clearance is then uniform, so there is nothing to improve — a blocked path
+        // still replans below regardless).
+        const long n = std::lround(search_cfg_.rrt_improve_period /
+                                   std::max(search_cfg_.rrt_monitor_period, 1.0e-3));
+        const std::uint64_t improve_interval = static_cast<std::uint64_t>(std::max<long>(1, n));
+        const bool improve_run = (run % improve_interval == 0) && had_path && map->size() > 0;
 
-      // Stream a cost as "T (len L N% + obst O N% + frontier F N% + unknown U
-      // N%)": the path's length, the proximity penalty near mapped obstacles,
-      // the same near the frontier (only when the cost is scored on the
-      // frontier-stamped field), and the unknown-space surcharge (only when it
-      // is configured), each with its share of the total, so a high score reads
-      // as long, wall-hugging, frontier-hugging or routed through unmapped
-      // space, which want different knobs (length: none; obst/frontier:
-      // CLEARANCE_WEIGHT / CLEARANCE_THRESHOLD; unknown: UNKNOWN_WEIGHT).
-      const bool show_unknown = search_cfg_.treat_unknown_as_hazard && search_cfg_.unknown_weight > 0.0;
-      auto fmtCost = [show_unknown](const planning::GeometricPlanner::CostBreakdown& cb) {
-        std::ostringstream os;
-        os << std::fixed << std::setprecision(2) << cb.total;
-        if (!std::isfinite(cb.total) || cb.total <= 0.0) return os.str();
-        const auto term = [&](const char* name, double v) {
-          os << name << v << " " << std::lround(100.0 * v / cb.total) << "%";
-        };
-        term(" (len ", cb.length);
-        term(cb.split ? " + obst " : " + clr ", cb.clearance - cb.frontier);
-        if (cb.split) term(" + frontier ", cb.frontier);
-        if (show_unknown || cb.unknown > 0.0) term(" + unknown ", cb.unknown);
-        if (cb.steep > 0.0) term(" + steep ", cb.steep);
-        os << ")";
-        return os.str();
-      };
+        // Diagnostics on the committed path (the field is already set). The cost is
+        // split into its length + clearance-penalty terms for the logs below;
+        // committed_clr is the tightest distance to a wall along the path.
+        const auto committed = planner.costBreakdown(committed_path);
+        const double committed_clr = planner.minClearance(committed_path);
 
-      // Straight-line distance from a path's endpoint to the goal. In best-effort
-      // mode a path may deliberately stop short (at the frontier edge), so this is
-      // how much of the goal still remains; the committed and a candidate path are
-      // compared on it to see which reaches closer.
-      auto gapToGoal = [&goal_vec](const std::vector<std::vector<double>>& p) {
-        if (p.empty()) return std::numeric_limits<double>::infinity();
-        const auto& e = p.back();
-        const double dx = e[0] - goal_vec[0], dy = e[1] - goal_vec[1], dz = e[2] - goal_vec[2];
-        return std::sqrt(dx * dx + dy * dy + dz * dz);
-      };
-
-      if (path_invalid || improve_run) {
-        std::vector<std::vector<double>> candidate;
-        // A path is needed now: a short budget. Improving one can take the full one.
-        // A path is needed now: stop at RRT_REPLAN_SOLVE_TIME if one reaching the
-        // goal has been found by then, else keep going to RRT_SOLVE_TIME. An
-        // improve gets the full RRT_SOLVE_TIME.
-        planner.setPlanningTime(search_cfg_.rrt_solve_time);
-        planner.setEarlyStop(path_invalid ? search_cfg_.rrt_replan_solve_time : 0.0);
-        const double t_search = now();
-        search_running_.store(true);
-        const bool solved = planner.planPath(start, goal_vec, candidate);
-        search_running_.store(false);
-        last_search_time_.store(now() - t_search);
-
-        // A goal the collision check rejects is planned to at the nearest valid
-        // point instead (see GeometricPlanner::projectGoal), so the drone will
-        // deliberately stop short of what was commanded. Carried as a suffix on
-        // this tick's plan line rather than a line of its own: it is a property of
-        // the solve, and the searches are already rate-limited to the monitor /
-        // improve cadences. Silent in the common case where the goal was valid.
-        std::string goal_note;
-        if (std::isinf(planner.lastGoalProjection())) {
-          goal_note = " [goal (" + std::to_string(goal_vec[0]) + ", " +
-                      std::to_string(goal_vec[1]) + ", " + std::to_string(goal_vec[2]) +
-                      ") is inside an obstacle: no point clearing " +
-                      std::to_string(planner.collisionMargin()) + "m nearby]";
-        } else if (planner.lastGoalProjection() > 0.0) {
-          const auto& pg = planner.lastPlanningGoal();
+        // Stream a cost as "T (len L N% + obst O N% + frontier F N% + unknown U
+        // N%)": the path's length, the proximity penalty near mapped obstacles,
+        // the same near the frontier (only when the cost is scored on the
+        // frontier-stamped field), and the unknown-space surcharge (only when it
+        // is configured), each with its share of the total, so a high score reads
+        // as long, wall-hugging, frontier-hugging or routed through unmapped
+        // space, which want different knobs (length: none; obst/frontier:
+        // CLEARANCE_WEIGHT / CLEARANCE_THRESHOLD; unknown: UNKNOWN_WEIGHT).
+        const bool show_unknown = search_cfg_.treat_unknown_as_hazard && search_cfg_.unknown_weight > 0.0;
+        auto fmtCost = [show_unknown](const planning::GeometricPlanner::CostBreakdown& cb) {
           std::ostringstream os;
-          os << " [goal projected " << planner.lastGoalProjection() << "m to clear "
-             << planner.collisionMargin() << "m -> (" << pg[0] << ", " << pg[1] << ", "
-             << pg[2] << ")]";
-          goal_note = os.str();
-        }
+          os << std::fixed << std::setprecision(2) << cb.total;
+          if (!std::isfinite(cb.total) || cb.total <= 0.0) return os.str();
+          const auto term = [&](const char* name, double v) {
+            os << name << v << " " << std::lround(100.0 * v / cb.total) << "%";
+          };
+          term(" (len ", cb.length);
+          term(cb.split ? " + obst " : " + clr ", cb.clearance - cb.frontier);
+          if (cb.split) term(" + frontier ", cb.frontier);
+          if (show_unknown || cb.unknown > 0.0) term(" + unknown ", cb.unknown);
+          if (cb.steep > 0.0) term(" + steep ", cb.steep);
+          os << ")";
+          return os.str();
+        };
 
-        if (path_invalid) {
-          // Forced replan — adopt unconditionally (safety outranks optimality).
-          if (solved) {
-            const auto cand = planner.costBreakdown(candidate);
-            adopt(candidate);
-            if (had_path)
-              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed BLOCKED (clr="
-                             << committed_clr << "m < " << planner.collisionMargin()
-                             << "m) -> REPLAN cost=" << fmtCost(cand) << " clr="
-                             << planner.minClearance(candidate) << "m" << goal_note);
-            else
-              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR no committed path -> PLAN cost="
-                             << fmtCost(cand) << " clr="
-                             << planner.minClearance(candidate) << "m" << goal_note);
+        // Straight-line distance from a path's endpoint to the goal. In best-effort
+        // mode a path may deliberately stop short (at the frontier edge), so this is
+        // how much of the goal still remains; the committed and a candidate path are
+        // compared on it to see which reaches closer.
+        auto gapToGoal = [&goal_vec](const std::vector<std::vector<double>>& p) {
+          if (p.empty()) return std::numeric_limits<double>::infinity();
+          const auto& e = p.back();
+          const double dx = e[0] - goal_vec[0], dy = e[1] - goal_vec[1], dz = e[2] - goal_vec[2];
+          return std::sqrt(dx * dx + dy * dy + dz * dz);
+        };
+
+        if (path_invalid || improve_run) {
+          std::vector<std::vector<double>> candidate;
+          // A path is needed now: a short budget. Improving one can take the full one.
+          // A path is needed now: stop at RRT_REPLAN_SOLVE_TIME if one reaching the
+          // goal has been found by then, else keep going to RRT_SOLVE_TIME. An
+          // improve gets the full RRT_SOLVE_TIME.
+          planner.setPlanningTime(search_cfg_.rrt_solve_time);
+          planner.setEarlyStop(path_invalid ? search_cfg_.rrt_replan_solve_time : 0.0);
+          const double t_search = now();
+          search_running_.store(true);
+          const bool solved = planner.planPath(start, goal_vec, candidate);
+          search_running_.store(false);
+          last_search_time_.store(now() - t_search);
+
+          // A goal the collision check rejects is planned to at the nearest valid
+          // point instead (see GeometricPlanner::projectGoal), so the drone will
+          // deliberately stop short of what was commanded. Carried as a suffix on
+          // this tick's plan line rather than a line of its own: it is a property of
+          // the solve, and the searches are already rate-limited to the monitor /
+          // improve cadences. Silent in the common case where the goal was valid.
+          std::string goal_note;
+          if (std::isinf(planner.lastGoalProjection())) {
+            goal_note = " [goal (" + std::to_string(goal_vec[0]) + ", " +
+                        std::to_string(goal_vec[1]) + ", " + std::to_string(goal_vec[2]) +
+                        ") is inside an obstacle: no point clearing " +
+                        std::to_string(planner.collisionMargin()) + "m nearby]";
+          } else if (planner.lastGoalProjection() > 0.0) {
+            const auto& pg = planner.lastPlanningGoal();
+            std::ostringstream os;
+            os << " [goal projected " << planner.lastGoalProjection() << "m to clear "
+               << planner.collisionMargin() << "m -> (" << pg[0] << ", " << pg[1] << ", "
+               << pg[2] << ")]";
+            goal_note = os.str();
+          }
+
+          if (path_invalid) {
+            // Forced replan — adopt unconditionally (safety outranks optimality).
+            if (solved) {
+              const auto cand = planner.costBreakdown(candidate);
+              adopt(candidate);
+              if (had_path)
+                DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed BLOCKED (clr="
+                               << committed_clr << "m < " << planner.collisionMargin()
+                               << "m) -> REPLAN cost=" << fmtCost(cand) << " clr="
+                               << planner.minClearance(candidate) << "m" << goal_note);
+              else
+                DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR no committed path -> PLAN cost="
+                               << fmtCost(cand) << " clr="
+                               << planner.minClearance(candidate) << "m" << goal_note);
+            } else {
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed "
+                             << (had_path ? "BLOCKED" : "absent")
+                             << " -> REPLAN FAILED (no path to goal), holding" << goal_note);
+            }
           } else {
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed "
-                           << (had_path ? "BLOCKED" : "absent")
-                           << " -> REPLAN FAILED (no path to goal), holding" << goal_note);
+            // Improve — switch only past the hysteresis margin. RRT* is randomised,
+            // so without the margin a near-identical re-solve would chatter.
+            //
+            // Two things can make a candidate better. (1) Reach: in best-effort mode a
+            // fresh solve may end closer to the goal than the committed path — new
+            // space was mapped, so the frontier, and the reachable point nearest the
+            // goal, moved forward. A candidate that closes the goal gap by more than
+            // kGoalProgress is adopted outright: advancing toward the goal outranks
+            // path cost, and its necessarily-longer route would otherwise lose the
+            // cost test below precisely because it reaches further. (2) Cost, at
+            // comparable reach: score the candidate against the committed path's
+            // *remaining* cost from the drone's current position, not its full
+            // original cost. Both are rooted at the drone (`start`), so the margin is
+            // a fair like-for-like test; billing the full committed cost would let a
+            // candidate win merely because the drone advanced (its root creeps toward
+            // the goal while the committed cost still charges the traversed prefix).
+            constexpr double kGoalProgress = 0.25;  // min gap reduction [m] to count as advancing
+            const double committed_gap = gapToGoal(committed_path);
+            const double cand_gap =
+                solved ? planner.lastGoalGap() : std::numeric_limits<double>::infinity();
+            const auto remaining = remainingCommittedSuffix(committed_path, start);
+            const auto remaining_cb = planner.costBreakdown(remaining);
+            const double remaining_cost = remaining_cb.total;
+            const double threshold = search_cfg_.replan_improve_ratio * remaining_cost;
+            const auto cand = planner.costBreakdown(candidate);
+            if (solved && cand_gap < committed_gap - kGoalProgress) {
+              adopt(candidate);
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE best-effort ADVANCE gap "
+                             << committed_gap << "m -> " << cand_gap << "m (goal) cost=" << fmtCost(cand) << " clr="
+                             << planner.minClearance(candidate) << "m" << goal_note);
+            } else if (solved && cand_gap <= committed_gap + kGoalProgress && cand.total <= threshold) {
+              adopt(candidate);
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << fmtCost(remaining_cb)
+                             << " (committed=" << fmtCost(committed) << ") -> ADOPT cost=" << fmtCost(cand) << " clr="
+                             << planner.minClearance(candidate) << "m" << goal_note);
+            } else {
+              DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << fmtCost(remaining_cb)
+                             << " clr=" << committed_clr << "m gap=" << committed_gap << "m candidate cost="
+                             << (solved ? fmtCost(cand) : std::string("inf")) << " gap="
+                             << (solved ? std::to_string(cand_gap) : std::string("inf"))
+                             << "m -> keep" << goal_note);
+            }
           }
         } else {
-          // Improve — switch only past the hysteresis margin. RRT* is randomised,
-          // so without the margin a near-identical re-solve would chatter.
-          //
-          // Two things can make a candidate better. (1) Reach: in best-effort mode a
-          // fresh solve may end closer to the goal than the committed path — new
-          // space was mapped, so the frontier, and the reachable point nearest the
-          // goal, moved forward. A candidate that closes the goal gap by more than
-          // kGoalProgress is adopted outright: advancing toward the goal outranks
-          // path cost, and its necessarily-longer route would otherwise lose the
-          // cost test below precisely because it reaches further. (2) Cost, at
-          // comparable reach: score the candidate against the committed path's
-          // *remaining* cost from the drone's current position, not its full
-          // original cost. Both are rooted at the drone (`start`), so the margin is
-          // a fair like-for-like test; billing the full committed cost would let a
-          // candidate win merely because the drone advanced (its root creeps toward
-          // the goal while the committed cost still charges the traversed prefix).
-          constexpr double kGoalProgress = 0.25;  // min gap reduction [m] to count as advancing
-          const double committed_gap = gapToGoal(committed_path);
-          const double cand_gap =
-              solved ? planner.lastGoalGap() : std::numeric_limits<double>::infinity();
-          const auto remaining = remainingCommittedSuffix(committed_path, start);
-          const auto remaining_cb = planner.costBreakdown(remaining);
-          const double remaining_cost = remaining_cb.total;
-          const double threshold = search_cfg_.replan_improve_ratio * remaining_cost;
-          const auto cand = planner.costBreakdown(candidate);
-          if (solved && cand_gap < committed_gap - kGoalProgress) {
-            adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE best-effort ADVANCE gap "
-                           << committed_gap << "m -> " << cand_gap << "m (goal) cost=" << fmtCost(cand) << " clr="
-                           << planner.minClearance(candidate) << "m" << goal_note);
-          } else if (solved && cand_gap <= committed_gap + kGoalProgress && cand.total <= threshold) {
-            adopt(candidate);
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << fmtCost(remaining_cb)
-                           << " (committed=" << fmtCost(committed) << ") -> ADOPT cost=" << fmtCost(cand) << " clr="
-                           << planner.minClearance(candidate) << "m" << goal_note);
-          } else {
-            DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" IMPROVE remaining cost=" << fmtCost(remaining_cb)
-                           << " clr=" << committed_clr << "m gap=" << committed_gap << "m candidate cost="
-                           << (solved ? fmtCost(cand) : std::string("inf")) << " gap="
-                           << (solved ? std::to_string(cand_gap) : std::string("inf"))
-                           << "m -> keep" << goal_note);
-          }
+          // Monitor only: committed path still clear of obstacles. gap is how far the
+          // committed path's end still is from the goal — ~0 once the goal is reached,
+          // or the best-effort closest-approach distance while the drone is ratcheting
+          // toward a goal beyond the mapped frontier.
+          DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed cost=" << fmtCost(committed)
+                         << " clr=" << committed_clr << "m gap=" << gapToGoal(committed_path) << "m -> OK");
         }
-      } else {
-        // Monitor only: committed path still clear of obstacles. gap is how far the
-        // committed path's end still is from the goal — ~0 once the goal is reached,
-        // or the best-effort closest-approach distance while the drone is ratcheting
-        // toward a goal beyond the mapped frontier.
-        DRONE_LOG_INFO("[plan] #" << run << " " << planning::toString(search_cfg_.planner_type) <<" MONITOR committed cost=" << fmtCost(committed)
-                       << " clr=" << committed_clr << "m gap=" << gapToGoal(committed_path) << "m -> OK");
       }
 
     } else if (!preset_active_.load()) {

@@ -105,7 +105,8 @@ DBoW2, opengv, googletest); see `ros2/third_party/okvis2/README` for its CMake o
   cmake --build build/core
   ctest --test-dir build/core --timeout 30 --output-on-failure -R corridor   # NOT the whole suite
   ```
-  Tests (plain CTest, no gtest): `frames`, `position_control`, `feedforward` (proves feed-forward
+  Tests (plain CTest, no gtest): `exploration` and `exploration_mission` (goal-directed exploration,
+  see the search loop), `frames`, `position_control`, `feedforward` (proves feed-forward
   OFF ≡ baseline), `flatness_mapper`, `planner`, `corridor` (fast, map-free corridor-QP checks
   against analytic oracles — run it with `ctest -R corridor` on every planning edit),
   `rigid_transform` (the `map`↔`world` trajectory/state conversion, instant), `goal_projection` (invalid-goal → nearest-valid-state projection; analytic clearance fields and
@@ -314,6 +315,39 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   tracker holds, since a heartbeat sent just before the timeout arrived just after it and revived the
   abandoned trajectory for a tick (0.5 m step). Perfect-follower simulation, reversal toward a wall:
   no reference step above 0.026 m over 9 completed runs (one run was cut short by my own mistake).
+- **Goal-directed exploration (`EXPLORATION`, node default on; 2026-10-01, NOT yet benched)** —
+  replaces the classic search below whenever it is on with `TREAT_FRONTIER_AS_OBSTACLE` +
+  `USE_CORRIDOR_QP` and a conservative grid (`AutonomyCore::explorationTick`). The flown path is
+  always planned on the **conservative** map (`GeometricPlanner::setConservative`: a point must be
+  observed and `UNKNOWN_MARGIN` + one voxel diagonal + 1 cm from unknown space — the diagonal covers
+  the corridor's half-diagonal pull-in and the field's voxel-centre rounding, so its paths always fit
+  the corridor — on top of the 0.5 m from mapped obstacles), so truncation should almost never cut.
+  Phases (logged as `[mission] …`, plus a status line every 5 s; drawn on `/planner/mission`: green
+  sphere = target, yellow = exit point, green arrow = heading to arrive with):
+  - **ADVANCE** — head for the reachable known point nearest the goal: a conservative **RRT\*** best-
+    effort search to the goal, with the goal point itself exempt so nothing can connect to it through
+    unknown space and the approximate solution ends at the nearest reachable point. RRT\* because
+    **EIT\* returns nothing at all** there (its reverse search from a walled-off goal finds no edge);
+    the result is random-ish, which the re-check every `RETARGET_PERIOD` (3 s) absorbs: a new
+    target is taken only if `retarget_min_gain` (0.3 m) closer to the goal.
+  - On arriving (`arrive_dist` 0.3 m, measured position) with nothing closer: **UNCOVER** — an
+    **optimistic** EIT\* search to the goal, the first point of it in unknown space is the exit point
+    (`planning::findExitPoint`), and `planning::viewpointCandidates` picks spots `VIEW_DISTANCE`
+    (3 m, 1.5–4 m) from it, conservative-valid, with a clear line of sight (no mapped obstacle) and
+    within 20° of level; the first of the best four the strict search reaches is flown to, ending
+    **facing the exit point** (`Trajectory::end_yaw`, see the flatness mapper). After `view_dwell`
+    (1.5 s) there, a closer known point means ADVANCE again; otherwise the next exit, the ones already
+    looked at excluded from the optimistic search (`setExclusions`, 1 m).
+  - **DONE** within `GOAL_REACHED_DIST` (1 m) of the goal; **NO EXITS** when the optimistic search
+    finds no route at all or six exit points in a row get no reachable viewpoint. Both hold.
+  - The monitor/improve serve whichever phase is on: every tick the remaining committed path is
+    re-checked on the current map (EIT\*, conservative) and replanned to the same target if blocked
+    (or a new target chosen if the target itself became unreachable); every `RRT_IMPROVE_PERIOD` a
+    cheaper path to the same target is adopted by `REPLAN_IMPROVE_RATIO`.
+  **On the bench, arrival is the measured position**, so a drone that does not move never leaves
+  its first ADVANCE target. Covered by `ctest -R exploration` (exit point / viewpoints) and
+  `ctest -R exploration_mission` (threaded end to end on synthetic rooms: ADVANCE to the edge,
+  UNCOVER facing the exit, ADVANCE to the goal once revealed, DONE; ~3 s; mutation-checked).
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
 Module roles:
@@ -659,7 +693,10 @@ requires it; validate any change in `USE_SIM_MODE`/SITL first. Notable behavior:
 
 `flatness_mapper` samples the trajectory for pos/vel/acc and derives **yaw from the velocity
 heading** (camera leads the motion), holding the last yaw only when slow *and* the heading is
-spinning. The polynomial evaluation itself lives in `common/trajectory_eval` (`evalTrajectory` /
+spinning. **A trajectory with an end heading** (`Trajectory::end_yaw`, set only for exploration
+viewpoints; NaN otherwise, which leaves all of this unchanged) turns to it over its last
+`end_yaw_lead` (1.5 s) and holds it after, at no more than `end_yaw_rate` (0.8 rad/s);
+`transformTrajectory` rotates it with the frame (2026-10-01, NOT yet flown). The polynomial evaluation itself lives in `common/trajectory_eval` (`evalTrajectory` /
 `sampleMotion`), not in the mapper, because planning needs it too — a replan samples the trajectory
 it is about to replace. `trajectory_tracker` composes the mapper + controller and runs the
 **watchdog state machine**: `kDirect` (explicit setpoint — takeoff/manual hover), `kTracking`
@@ -1329,7 +1366,7 @@ publish nothing and cost nothing when the flag is off:
   *path prefix* keeps from mapped obstacles, and from unknown space unless `UNKNOWN_MARGIN` is
   smaller. Enforced exactly as set; a committed point must still have strictly positive clearance
   whatever the value, so the prefix can never reach into an occupied or unknown voxel.
-- `MAX_UNKNOWN_SLOPE` (double, default `20` deg) / `UNKNOWN_SLOPE_WEIGHT` (default `5`)
+- `MAX_UNKNOWN_SLOPE` (double, default `0` = off since exploration, was `20` deg) / `UNKNOWN_SLOPE_WEIGHT` (default `5`)
   (2026-10-01, NOT yet benched) — keep the search's path where the camera can see it: it looks
   forward and roughly level (D435 depth about ±29° vertically), so the optimistic path should only
   go where the drone will be looking (`GeometricPlanner::setUnknownSlopeLimit`, unknown read from the
@@ -1349,7 +1386,7 @@ publish nothing and cost nothing when the flag is off:
   shortest optimistic route, let truncation advance as the camera confirms). Expect more replans: the
   cone's apex moves with the drone, so points further along a committed path can leave it and the
   monitor calls the path blocked. `ctest -R unknown_cost` test 10 (ABIT\* and EIT\*).
-- `UNKNOWN_MARGIN` (double, default `0.2` m (0.25 until later on 2026-10-01), NOT yet benched) — clearance from
+- `UNKNOWN_MARGIN` (double, default `0.25` m, NOT yet benched) — clearance from
   never-observed space for truncation, the corridor and the trajectory monitor, when smaller than
   their margins from mapped obstacles (`FRONTIER_MARGIN` for truncation, `CORRIDOR_MARGIN` for the
   corridor and the monitor). Truncation and the monitor test `min(d_raw, d_cons + margin −

@@ -50,6 +50,11 @@ Trajectory transformTrajectory(const Eigen::Isometry3d& b_from_a, const Trajecto
       out.coeffs_z[s][k] = v.z();
     }
   }
+  // The end heading turns with the frame: rotate its direction, read it back.
+  if (std::isfinite(traj.end_yaw)) {
+    const Eigen::Vector3d d = R * Eigen::Vector3d(std::cos(traj.end_yaw), std::sin(traj.end_yaw), 0.0);
+    out.end_yaw = std::atan2(d.y(), d.x());
+  }
   return out;
 }
 

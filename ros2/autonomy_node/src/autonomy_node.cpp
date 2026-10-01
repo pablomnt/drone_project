@@ -196,6 +196,7 @@ public:
     pub_debug_ = create_publisher<drone_interfaces::msg::ControllerDebug>("/debug/telemetry", 10);
     pub_path_ = create_publisher<nav_msgs::msg::Path>("/smooth_trajectory", 10);
     pub_goal_marker_ = create_publisher<visualization_msgs::msg::Marker>("/planner/goal_marker", 10);
+    pub_mission_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/mission", 10);
     pub_clearance_field_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/clearance_field", 10);
     pub_occupancy_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/planner/occupancy_map", 10);
     pub_corridor_ = create_publisher<visualization_msgs::msg::MarkerArray>("/planner/corridor", 10);
@@ -295,7 +296,7 @@ private:
     // UNKNOWN_SLOPE_WEIGHT per vertical metre beyond it (the `steep` term of
     // the [plan] cost). Any slope through explored space. Needs
     // TREAT_FRONTIER_AS_OBSTACLE; MAX_UNKNOWN_SLOPE 0 disables both.
-    declare_parameter("MAX_UNKNOWN_SLOPE", 20.0);
+    declare_parameter("MAX_UNKNOWN_SLOPE", 0.0);  // off: exploration plans conservatively
     declare_parameter("UNKNOWN_SLOPE_WEIGHT", 5.0);
     // Flat extra cost per metre of path routed through never-observed space.
     // CLEARANCE_WEIGHT cannot do this job: the distance field saturates at
@@ -414,7 +415,19 @@ private:
     // the trajectory monitor, when smaller than their margins from mapped
     // obstacles (FRONTIER_MARGIN, CORRIDOR_MARGIN), which then apply to mapped
     // obstacles only. At or above them it changes nothing.
-    declare_parameter("UNKNOWN_MARGIN", 0.2);
+    declare_parameter("UNKNOWN_MARGIN", 0.25);
+    // Goal-directed exploration: the search plans only on the conservative map,
+    // toward the reachable known point nearest the goal (ADVANCE); when none is
+    // closer it plans optimistically to find where the way to the goal leaves
+    // explored space and flies to a viewpoint VIEW_DISTANCE from it, facing it
+    // (UNCOVER); DONE within GOAL_REACHED_DIST of the goal. RETARGET_PERIOD:
+    // how often ADVANCE looks for a closer known point. Needs
+    // TREAT_FRONTIER_AS_OBSTACLE and USE_CORRIDOR_QP. Logs `[mission]` lines;
+    // drawn on /planner/mission.
+    declare_parameter("EXPLORATION", true);
+    declare_parameter("GOAL_REACHED_DIST", 1.0);
+    declare_parameter("VIEW_DISTANCE", 3.0);
+    declare_parameter("RETARGET_PERIOD", 3.0);
     // Clearance the corridor boxes keep from obstacles and unknown space [m].
     // A strictly harder test than the planner's 0.5 m collision margin: the
     // search only validates its centreline (and exempts a sphere at the start),
@@ -567,6 +580,10 @@ private:
     cfg.jmax = param("JMAX").as_double();
     cfg.frontier_margin = param("FRONTIER_MARGIN").as_double();
     cfg.unknown_margin = param("UNKNOWN_MARGIN").as_double();
+    cfg.use_exploration = param("EXPLORATION").as_bool();
+    cfg.goal_reached_dist = param("GOAL_REACHED_DIST").as_double();
+    cfg.view_distance = param("VIEW_DISTANCE").as_double();
+    cfg.retarget_period = param("RETARGET_PERIOD").as_double();
     cfg.corridor_margin = param("CORRIDOR_MARGIN").as_double();
     cfg.escape_ramp_dist = param("ESCAPE_RAMP_DIST").as_double();
     cfg.traj_solve_budget = param("TRAJ_SOLVE_BUDGET").as_double();
@@ -1366,9 +1383,57 @@ private:
     }
   }
 
+  // Exploration (EXPLORATION): the current target as a green sphere and, while
+  // uncovering, the exit point being looked at as a yellow sphere with an arrow
+  // from the viewpoint along the heading it will arrive with.
+  void publishMission() {
+    const auto v = core_->missionView();
+    visualization_msgs::msg::MarkerArray arr;
+    visualization_msgs::msg::Marker clear;
+    clear.header.frame_id = kMapFrame;
+    clear.header.stamp = now();
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+    const auto sphere = [&](const char* ns, const Eigen::Vector3d& p, float r, float g, float b) {
+      visualization_msgs::msg::Marker m;
+      m.header = clear.header;
+      m.ns = ns;
+      m.id = 0;
+      m.type = visualization_msgs::msg::Marker::SPHERE;
+      m.action = visualization_msgs::msg::Marker::ADD;
+      m.pose.position.x = p.x();
+      m.pose.position.y = p.y();
+      m.pose.position.z = p.z();
+      m.pose.orientation.w = 1.0;
+      m.scale.x = m.scale.y = m.scale.z = 0.25;
+      m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.9f;
+      arr.markers.push_back(m);
+    };
+    if (v.has_target) sphere("mission_target", v.target, 0.1f, 0.9f, 0.1f);
+    if (v.has_exit) sphere("mission_exit", v.exit, 1.0f, 0.9f, 0.0f);
+    if (v.has_target && std::isfinite(v.target_yaw)) {
+      visualization_msgs::msg::Marker a;
+      a.header = clear.header;
+      a.ns = "mission_heading";
+      a.id = 0;
+      a.type = visualization_msgs::msg::Marker::ARROW;
+      a.action = visualization_msgs::msg::Marker::ADD;
+      a.pose.position.x = v.target.x();
+      a.pose.position.y = v.target.y();
+      a.pose.position.z = v.target.z();
+      a.pose.orientation.z = std::sin(0.5 * v.target_yaw);
+      a.pose.orientation.w = std::cos(0.5 * v.target_yaw);
+      a.scale.x = 0.6; a.scale.y = 0.06; a.scale.z = 0.06;
+      a.color.r = 0.1f; a.color.g = 0.9f; a.color.b = 0.1f; a.color.a = 0.9f;
+      arr.markers.push_back(a);
+    }
+    pub_mission_->publish(arr);
+  }
+
   void publishViz() {
     warnIfNoMap();
     publishGoalMarker();
+    publishMission();
     publishPlannedPath();
     publishClearanceField();
     publishCorridor();
@@ -1730,6 +1795,7 @@ private:
   rclcpp::Publisher<drone_interfaces::msg::ControllerDebug>::SharedPtr pub_debug_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_goal_marker_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_mission_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_clearance_field_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_occupancy_map_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_corridor_;
