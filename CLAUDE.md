@@ -344,7 +344,7 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
     run from a viewpoint across the room it found the frontier around that viewpoint, and the drone
     wandered away from the goal), the first point of it in unknown space is the exit point
     (`planning::findExitPoint`), and `planning::viewpointCandidates` picks spots about
-    `VIEW_DISTANCE` (2.5 m, 1.5–4 m) from it, conservative-valid like any path point (15 cm extra
+    `VIEW_DISTANCE` (2.5 m, 1–4 m) from it, conservative-valid like any path point (15 cm extra
     clearance was tried 2026-10-02 and dropped: in a cramped spot it left no candidates at all), with a
     clear line of sight (no
     mapped obstacle) and within 20° of level, scored `|d − 2.5| + 0.5 × distance from the best-effort

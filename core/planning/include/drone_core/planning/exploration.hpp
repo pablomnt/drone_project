@@ -21,7 +21,7 @@ std::optional<Eigen::Vector3d> findExitPoint(const std::vector<Eigen::Vector3d>&
 
 struct ViewpointParams {
   double distance = 2.5;           // ideal distance from the exit point [m]
-  double min_distance = 1.5;       // [m]
+  double min_distance = 1.0;       // [m] closer than ideal, but better than no viewpoint
   double max_distance = 4.0;       // [m]
   // The camera looks forward and roughly level: the exit point may sit at most
   // this far above or below the viewpoint's horizontal [deg].

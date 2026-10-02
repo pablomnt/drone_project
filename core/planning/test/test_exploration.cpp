@@ -44,7 +44,7 @@ int main() {
     for (const auto& v : vps) {
       expect(valid(v.pos), "a viewpoint fails the validity test");
       const double d = (exit - v.pos).norm();
-      expect(d >= 1.5 - 1e-9 && d <= 4.0 + 1e-9, "a viewpoint outside the distance band");
+      expect(d >= 1.0 - 1e-9 && d <= 4.0 + 1e-9, "a viewpoint outside the distance band");
       const double elev = std::atan2(std::abs(exit.z() - v.pos.z()),
                                      std::hypot(exit.x() - v.pos.x(), exit.y() - v.pos.y()));
       expect(elev <= 20.0 * M_PI / 180.0 + 1e-9, "a viewpoint looks too steeply at the exit");
