@@ -786,6 +786,7 @@ private:
     Eigen::Vector3d exit = Eigen::Vector3d::Zero();
     std::vector<Eigen::Vector3d> tried_exits;
     int failed_exits = 0;
+    int failed_searches = 0;  // optimistic searches in a row that found no route (NO EXITS at 3)
     // Targets given up because no trajectory could be built along the path to
     // them; the ADVANCE search avoids them (setExclusions, 0.5 m).
     std::vector<Eigen::Vector3d> failed_targets;

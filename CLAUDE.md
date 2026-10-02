@@ -344,15 +344,21 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
     run from a viewpoint across the room it found the frontier around that viewpoint, and the drone
     wandered away from the goal), the first point of it in unknown space is the exit point
     (`planning::findExitPoint`), and `planning::viewpointCandidates` picks spots about
-    `VIEW_DISTANCE` (2.5 m, 1.5–4 m) from it, conservative-valid, with a clear line of sight (no
+    `VIEW_DISTANCE` (2.5 m, 1.5–4 m) from it, conservative-valid like any path point (15 cm extra
+    clearance was tried 2026-10-02 and dropped: in a cramped spot it left no candidates at all), with a
+    clear line of sight (no
     mapped obstacle) and within 20° of level, scored `|d − 2.5| + 0.5 × distance from the best-effort
     known point` (it used to prefer exactly 3 m first, and flew 3 m back across the room for it); the
     first of the best four the strict search reaches is flown to, ending
     **facing the exit point** (`Trajectory::end_yaw`, see the flatness mapper). After `view_dwell`
     (1.5 s) there, a closer known point means ADVANCE again; otherwise the next exit, the ones already
     looked at excluded from the optimistic search (`setExclusions`, 1 m).
-  - **DONE** within `GOAL_REACHED_DIST` (1 m) of the goal; **NO EXITS** when the optimistic search
-    finds no route at all or six exit points in a row get no reachable viewpoint. Both hold.
+  - **DONE** within `GOAL_REACHED_DIST` (1 m) of the goal; **NO EXITS** after three strikes in a row
+    of the optimistic search, or six exit points in a row with no reachable viewpoint. Both hold. A
+    strike is a search that finds no route (EIT\* returns nothing when its time runs out, so one
+    failure proved little and used to end the mission), or a route found only by the retry without
+    the exclusion balls: those can plug the only way on (an exit in a doorway), so a failed search
+    is retried without them, and the drone may look at an old exit again, at most twice.
   - The monitor/improve serve whichever phase is on: every tick the remaining committed path is
     re-checked on the current map (EIT\*, conservative) and replanned to the same target if blocked
     (or a new target chosen if the target itself became unreachable); every `RRT_IMPROVE_PERIOD` a
@@ -1352,11 +1358,17 @@ publish nothing and cost nothing when the flag is off:
   it was `false` for the early corridor bench tests) — build a `planning::ConservativeGrid` (`core/planning/src/conservative_grid.cpp`) from each
   incoming octomap: one byte per voxel (free / occupied / shell / never observed) over the map's box,
   cropped to the search box grown by the fields' saturation distance (`AutonomyCore::mapCrop`).
-  Never-observed voxels inside a keep-out around the drone are marked **free** — a 0.6 m ball behind
-  the camera and a 0.6 m-radius cylinder reaching 1.2 m ahead along the heading (level), so there
+  Never-observed voxels inside a keep-out around the drone are marked **free** — a 0.8 m ball behind
+  the camera and a 0.8 m-radius cylinder reaching 1.2 m ahead along the heading (level), so there
   is more room where it looks (`kFrontierKeepOutRadius` / `kFrontierKeepOutForward`,
   `ConservativeGrid::KeepOut`; a plain 0.5 m ball left only its centre keeping the 0.4-0.5 m
-  margins, so every plan was cut to ~0.2 m) — then every never-observed voxel touching a free one
+  margins, so every plan was cut to ~0.2 m). **It is only there for the start of a flight**
+  (2026-10-02): it follows the drone until the first goal, is then frozen where the drone was with
+  the cylinder pointing at that goal, and is removed once the drone (the simulated one under the
+  transfer tester) is 2 m from it, until the next reset (disarm, leaving offboard, the transfer
+  tester switching); `[keep-out]` lines log each step. After the first plan the drone flies in known
+  space, and a keep-out moving with it kept marking unseen space free and shifting the shell under
+  committed paths — then every never-observed voxel touching a free one
   (26-neighbourhood) is marked **shell**. Occupied
   + shell cells are the conservative obstacles, a closed shell around explored space wrapped around
   the ball too, so it answers every distance/corridor question exactly as if the whole unobserved

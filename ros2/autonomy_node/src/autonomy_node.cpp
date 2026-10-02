@@ -794,14 +794,30 @@ private:
       // rewritten underneath us mid-use.
       Eigen::Vector3d p;
       double yaw;
+      KeepOutPhase phase;
+      Eigen::Vector3d fwd;
       {
         std::lock_guard<std::mutex> lock(cross_mutex_);
         p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
         yaw = use_sim_mode_ ? yaw_px4_enu_ : yaw_vio_enu_;
+        // While following, the camera looks along the body heading and the
+        // cylinder points that way (level, whatever the tilt); frozen, it
+        // stays where the first goal found it (see keep_out_phase_).
+        fwd = Eigen::Vector3d(std::cos(yaw), std::sin(yaw), 0.0);
+        if (keep_out_phase_ == KeepOutPhase::kFrozen) {
+          const Eigen::Vector3d vehicle = bench_sim_pos_valid_ ? bench_sim_pos_ : p;
+          const double away = (vehicle - keep_out_center_w_).norm();
+          if (away > kKeepOutLeaveDist) {
+            keep_out_phase_ = KeepOutPhase::kGone;
+            RCLCPP_INFO(get_logger(), "[keep-out] drone %.2f m from it: removed until the next reset",
+                        away);
+          } else {
+            p = keep_out_center_w_;
+            fwd = keep_out_fwd_w_;
+          }
+        }
+        phase = keep_out_phase_;
       }
-      // The camera looks along the body heading; the keep-out's cylinder
-      // points that way (level, whatever the tilt).
-      Eigen::Vector3d fwd(std::cos(yaw), std::sin(yaw), 0.0);
       // The octree is map-frame and the drone position world-frame, so the ball
       // has to be centred on the drone expressed in map. Without a transform it
       // stays unconverted, but planning is paused then anyway (the core requires one).
@@ -813,7 +829,7 @@ private:
       using drone_core::planning::GeometricPlanner;
       drone_core::planning::ConservativeGrid::KeepOut keep_out;
       keep_out.center = octomap::point3d(p.x(), p.y(), p.z());
-      keep_out.radius = GeometricPlanner::frontierKeepOutRadius();
+      keep_out.radius = phase == KeepOutPhase::kGone ? 0.0 : GeometricPlanner::frontierKeepOutRadius();
       keep_out.forward = fwd.normalized();
       keep_out.forward_len = GeometricPlanner::frontierKeepOutForward();
       Eigen::Vector3d crop_lo, crop_hi;
@@ -888,6 +904,7 @@ private:
     drone_core::common::Goal goal;
     goal.pos = p;
     core_->setGoal(goal);
+    freezeKeepOut(goal.pos);
     {
       // Marker state only: written here and in firePresetSquare (fast group), read
       // by publishGoalMarker on the viz timer (slow group).
@@ -1156,6 +1173,11 @@ private:
     if (bench_transfer_active_) {
       bench_transfer_active_ = false;
       core_->reset();
+      {
+        std::lock_guard<std::mutex> lock(cross_mutex_);
+        bench_sim_pos_valid_ = false;
+      }
+      resetKeepOut();
       if (position_fresh) core_->setVehicleState(state);
       reissueGoal();  // its path was planned from the simulated vehicle
       RCLCPP_INFO(get_logger(), "BENCH_TEST_TRANSFER_TESTER off: tracker reset, back on the real "
@@ -1205,6 +1227,7 @@ private:
     if ((was_armed_ && !armed) || (was_offboard_ && !offboard)) {
       RCLCPP_INFO(get_logger(), "Interruption (disarmed or left offboard). Resetting controller.");
       core_->reset();
+      resetKeepOut();
       all_healthy_since_ = -1.0;
     }
     // Re-arm the sensor-liveness watchdog only once the vehicle has disarmed
@@ -1299,6 +1322,7 @@ private:
     if (!bench_transfer_active_) {
       bench_transfer_active_ = true;
       core_->reset();
+      resetKeepOut();
       // It starts where the real drone is, facing its way, and hovers there
       // until a trajectory takes it away (POS_SP only if no position is known).
       const auto pos_sp = get_parameter("POS_SP").as_double_array();
@@ -1328,6 +1352,11 @@ private:
     // Perfect tracking: next tick the vehicle is wherever the reference is now.
     const auto& c = core_->controller();
     bench_state_.pos = c.getPositionFeedforward();
+    {
+      std::lock_guard<std::mutex> lock(cross_mutex_);
+      bench_sim_pos_ = bench_state_.pos;
+      bench_sim_pos_valid_ = true;
+    }
     bench_state_.vel = c.getVelocityFeedforward();
     publishDebug(bench_state_);
   }
@@ -1343,6 +1372,35 @@ private:
       goal.pos = goal_pos_;
     }
     core_->setGoal(goal);
+    freezeKeepOut(goal.pos);
+  }
+
+  // The first goal since the last reset freezes the keep-out where the drone is
+  // now, its cylinder pointing at the goal (where the mission's TURN will face).
+  // `goal_map` is in the map frame.
+  void freezeKeepOut(const Eigen::Vector3d& goal_map) {
+    Eigen::Vector3d goal_w = goal_map;
+    Eigen::Isometry3d world_from_map;
+    if (lookupWorldFromMap(world_from_map)) goal_w = world_from_map * goal_map;
+    std::lock_guard<std::mutex> lock(cross_mutex_);
+    if (keep_out_phase_ != KeepOutPhase::kFollow) return;
+    const Eigen::Vector3d p = use_sim_mode_ ? px4_pos_enu_ : vio_pos_enu_;
+    const double yaw = use_sim_mode_ ? yaw_px4_enu_ : yaw_vio_enu_;
+    Eigen::Vector3d fwd(goal_w.x() - p.x(), goal_w.y() - p.y(), 0.0);
+    if (fwd.norm() < 1e-3) fwd = Eigen::Vector3d(std::cos(yaw), std::sin(yaw), 0.0);
+    keep_out_center_w_ = p;
+    keep_out_fwd_w_ = fwd.normalized();
+    keep_out_phase_ = KeepOutPhase::kFrozen;
+    RCLCPP_INFO(get_logger(), "[keep-out] frozen at (%.2f, %.2f, %.2f) world, facing the goal; "
+                "removed once the drone is %.1f m from it", p.x(), p.y(), p.z(), kKeepOutLeaveDist);
+  }
+
+  void resetKeepOut() {
+    std::lock_guard<std::mutex> lock(cross_mutex_);
+    if (keep_out_phase_ != KeepOutPhase::kFollow) {
+      RCLCPP_INFO(get_logger(), "[keep-out] reset: following the drone until the next first goal");
+    }
+    keep_out_phase_ = KeepOutPhase::kFollow;
   }
 
   void publishDebug(const drone_core::common::State& state) {
@@ -1809,6 +1867,23 @@ private:
   // everything else stays inside one group and needs no synchronisation. Never
   // held across anything slow, so it cannot delay the control tick.
   std::mutex cross_mutex_;
+
+  // The keep-out around the drone (see onOctomap). It follows the drone until
+  // the first goal of the flight, is then frozen where the drone was with its
+  // cylinder pointing at that goal, and is removed for good once the drone is
+  // kKeepOutLeaveDist from it — after the first plan the drone flies in known
+  // space, and a keep-out that moved with it kept marking unseen space free and
+  // moving the shell under committed paths. Back to following on the next
+  // reset (disarm, leaving offboard, the transfer tester switching). Guarded
+  // by cross_mutex_ (goals on the fast group, maps on the slow one).
+  enum class KeepOutPhase { kFollow, kFrozen, kGone };
+  static constexpr double kKeepOutLeaveDist = 2.0;  // [m]
+  KeepOutPhase keep_out_phase_{KeepOutPhase::kFollow};
+  Eigen::Vector3d keep_out_center_w_{Eigen::Vector3d::Zero()};  // world frame, while frozen
+  Eigen::Vector3d keep_out_fwd_w_{Eigen::Vector3d::UnitX()};    //   "
+  // With the transfer tester, the simulated vehicle is the one that leaves it.
+  bool bench_sim_pos_valid_{false};
+  Eigen::Vector3d bench_sim_pos_{Eigen::Vector3d::Zero()};
 
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_joy_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr sub_px4_odom_;

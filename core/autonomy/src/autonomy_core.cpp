@@ -1583,6 +1583,7 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     m.need_retarget = true;
     m.tried_exits.clear();
     m.failed_exits = 0;
+    m.failed_searches = 0;
     m.has_exit = false;
     DRONE_LOG_INFO("[mission] NO EXITS for " << kNoExitsRetry << " s: trying again from ADVANCE");
   }
@@ -1852,14 +1853,47 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     // frontier around that spot instead of the one nearest the goal.
     const V from = m.has_best_known ? m.best_known : start;
     Path p;
-    if (!opt.planPath(sv(from), sv(goal), p) || p.size() < 2) {
+    bool found = opt.planPath(sv(from), sv(goal), p) && p.size() >= 2;
+    // The balls around exits already looked at can plug the only way on (an
+    // exit in a doorway): try once more without them. A route found only that
+    // way still counts as a strike below, so the drone cannot keep going back to
+    // look at the same exit forever.
+    bool relook = false;
+    if (!found && !m.tried_exits.empty()) {
+      opt.setExclusions({}, 0.0);
+      p.clear();
+      found = opt.planPath(sv(from), sv(goal), p) && p.size() >= 2;
+      relook = found;
+    }
+    // One failed search is not proof (EIT* returns nothing at all when its time
+    // runs out first): NO EXITS only after three strikes in a row.
+    constexpr int kSearchTries = 3;
+    if (relook) {
+      if (++m.failed_searches < kSearchTries) {
+        DRONE_LOG_INFO("[mission] UNCOVER: the way on runs only past exit points already looked at "
+                       "(strike " << m.failed_searches << " of " << kSearchTries << "): looking again");
+      } else {
+        found = false;
+      }
+    }
+    if (!found) {
+      if (!relook && ++m.failed_searches < kSearchTries) {
+        m.need_viewpoint = true;
+        DRONE_LOG_INFO("[mission] UNCOVER: no route to the goal even through unknown space (try "
+                       << m.failed_searches << " of " << kSearchTries << "): searching again");
+        publishView();
+        return;
+      }
       m.mode = MissionMode::kNoExits;
       m.no_exits_at = t;
-      DRONE_LOG_INFO("[mission] NO EXITS: no route to the goal even through unknown space ("
-                     << m.tried_exits.size() << " exit point(s) looked at); holding");
+      DRONE_LOG_INFO("[mission] NO EXITS: " << kSearchTries
+                     << " searches in a row found no route to the goal even through unknown space, "
+                        "or only one past exit points already looked at ("
+                     << m.tried_exits.size() << " looked at); holding");
       publishView();
       return;
     }
+    if (!relook) m.failed_searches = 0;
     std::vector<V> ep;
     for (const auto& w : p) ep.push_back(toV(w));
     m.optimistic_path = ep;
