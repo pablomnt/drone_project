@@ -691,6 +691,9 @@ ssh dron@172.20.10.3
 ros2 launch autonomy_node autonomy_vision_launch.py              # with RViz
 ros2 launch autonomy_node autonomy_vision_launch.py rviz:=false  # headless (no RViz)
 ```
+RViz opens `ros2/autonomy_node/rviz/planning_drone.rviz` from the source tree, so saving the view in
+RViz updates the file in git. `replay_rosbag.rviz` next to it is the view for bag replays
+(`rviz2 -d ~/ws_paramio/src/ros2/autonomy_node/rviz/replay_rosbag.rviz`).
 
 **Set the takeoff / hover setpoint** (`POS_SP`, ENU metres). Pre-takeoff / no-goal only — a live goal
 overrides it and it is unreachable while any trajectory is installed (see *Control modes*):
