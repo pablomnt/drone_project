@@ -415,6 +415,7 @@ void AutonomyCore::reset() {
   // waiting against the old ones is thrown away (splice_epoch_).
   splice_epoch_.fetch_add(1);
   turn_hold_active_.store(false);
+  flight_spin_done_.store(false);
   std::lock_guard<std::mutex> lock(traj_mutex_);
   has_pending_ = false;
   has_last_planned_ = false;
@@ -591,6 +592,7 @@ const char* AutonomyCore::toString(MissionMode m) {
     case MissionMode::kTurn: return "TURN";
     case MissionMode::kAdvance: return "ADVANCE";
     case MissionMode::kUncover: return "UNCOVER";
+    case MissionMode::kSpin: return "SPIN";
     case MissionMode::kDone: return "DONE";
     case MissionMode::kNoExits: return "NO EXITS";
   }
@@ -1573,59 +1575,112 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
 
   if (turn_hold_active_.load()) turn_fresh_until_.store(t + 1.0);
   if (m.mode == MissionMode::kDone) return;
-  // NO EXITS may be temporary: the map keeps growing (and on the bench, the
-  // camera may be carried somewhere new). Start over from ADVANCE every 10 s,
-  // with the tried exits forgotten.
-  constexpr double kNoExitsRetry = 10.0;  // [s]
-  if (m.mode == MissionMode::kNoExits) {
-    if (t - m.no_exits_at < kNoExitsRetry) return;
+
+  const Eigen::Isometry3d world_from_map = map_from_world.inverse();
+  const V drone_w = world_from_map * drone;
+  // Whether a trajectory is being flown (not run out, not abandoned).
+  const auto flying = [&]() {
+    std::lock_guard<std::mutex> lock(traj_mutex_);
+    return has_last_planned_ && !last_planned_.empty() &&
+           t < last_planned_.t0 + last_planned_.total_duration && !tracker_holding_.load();
+  };
+  // Hold the drone where it is (world frame) for `duration`, turning to
+  // `end_yaw` (the flatness mapper's end heading) or spinning at `spin_rate`.
+  // The monitor knows nothing of it, hence turn_hold_active_.
+  const auto stageHold = [&](double end_yaw, double spin_rate, double duration) {
+    common::Trajectory hold;
+    hold.segment_times = {duration};
+    hold.total_duration = duration;
+    for (int k = 0; k < 3; ++k) {
+      Eigen::VectorXd coeffs = Eigen::VectorXd::Zero(8);
+      coeffs(0) = drone_w(k);
+      (k == 0 ? hold.coeffs_x : k == 1 ? hold.coeffs_y : hold.coeffs_z).push_back(coeffs);
+    }
+    hold.end_yaw = end_yaw;
+    hold.spin_rate = spin_rate;
+    hold.t0 = now() + kLeadMin;
+    stagePending(hold);
+    turn_hold_active_.store(true);
+    turn_fresh_until_.store(t + 1.0);
+  };
+  constexpr double kSpinTime = 5.0;  // [s] one full 360 deg look around
+  // Turn to face the goal horizontally and wait a second, so the camera has
+  // mapped what lies that way before anything is planned.
+  const auto startTurn = [&](const char* why) {
+    constexpr double kTurnDwell = 1.0;  // [s] wait after the turn
+    const V to_goal = world_from_map * goal - drone_w;
+    const double bearing = std::atan2(to_goal.y(), to_goal.x());
+    const double turn = std::abs(std::remainder(bearing - drone_yaw, 2.0 * M_PI));
+    stageHold(bearing, 0.0, 0.1);
+    m.mode = MissionMode::kTurn;
+    m.turn_until = t + turn / control::FlatnessMapper::Params{}.end_yaw_rate + kTurnDwell;
+    DRONE_LOG_INFO("[mission] " << why << ": TURN " << std::fixed << std::setprecision(0)
+                   << turn * 180.0 / M_PI << " deg to face the goal, then wait " << kTurnDwell << " s");
+  };
+
+  // NO EXITS. The first time for a goal: once at rest, a slow 360 deg on the
+  // spot (the camera only sees ahead, so the sides and back may hold a way
+  // on), a second for the map, then everything is tried again from ADVANCE.
+  // The second time: fly to the best known point and stay there (below, once
+  // the planners exist); nothing more until a new goal.
+  if (m.mode == MissionMode::kNoExits && m.settled) return;
+  // Without trajectories (the tests) there is nothing to spin with: straight to parking.
+  if (m.mode == MissionMode::kNoExits && !m.spun && !c.plan_trajectory) m.spun = true;
+  if (m.mode == MissionMode::kNoExits && !m.spun) {
+    if (flying()) return;
+    constexpr double kSpinDwell = 1.0;  // [s] wait after it
+    setCommittedPath({});
+    m.has_target = false;
+    stageHold(std::numeric_limits<double>::quiet_NaN(), 2.0 * M_PI / kSpinTime, kSpinTime);
+    m.mode = MissionMode::kSpin;
+    m.spun = true;
+    m.turn_until = t + kSpinTime + kSpinDwell;
+    DRONE_LOG_INFO("[mission] NO EXITS: SPIN 360 deg on the spot (" << kSpinTime
+                   << " s) to look around, then search again");
+    publishView();
+    return;
+  }
+  if (m.mode == MissionMode::kSpin) {
+    if (t < m.turn_until) {
+      publishView();
+      return;
+    }
+    if (m.spin_then_turn) {
+      m.spin_then_turn = false;
+      startTurn("looked around");
+      publishView();
+      return;
+    }
     m.mode = MissionMode::kAdvance;
     m.need_retarget = true;
     m.tried_exits.clear();
     m.failed_exits = 0;
     m.failed_searches = 0;
     m.has_exit = false;
-    DRONE_LOG_INFO("[mission] NO EXITS for " << kNoExitsRetry << " s: trying again from ADVANCE");
+    DRONE_LOG_INFO("[mission] looked around: searching again from ADVANCE");
   }
   // A new goal from a standstill: first turn to face it (horizontally) and wait
   // a second, so the camera has mapped what lies that way before anything is
   // planned. A hold-in-place trajectory with an end heading does the turn: the
   // flatness mapper turns to it at end_yaw_rate and holds it after the end.
   // Mid-flight (a goal change) there is no turn; the splice carries on.
+  // The first goal of a flight looks all around first (a 5 s 360 deg on the
+  // spot: the camera has only seen ahead since takeoff), then turns.
   if (m.mode == MissionMode::kIdle) {
-    bool flying = false;
-    {
-      std::lock_guard<std::mutex> lock(traj_mutex_);
-      flying = has_last_planned_ && !last_planned_.empty() &&
-               t < last_planned_.t0 + last_planned_.total_duration && !tracker_holding_.load();
-    }
-    const Eigen::Isometry3d world_from_map = map_from_world.inverse();
-    const V goal_w = world_from_map * goal;
-    const V drone_w = world_from_map * drone;
-    const V to_goal = goal_w - drone_w;
-    if (c.plan_trajectory && !flying && (drone - goal).norm() > c.goal_reached_dist &&
+    const V to_goal = world_from_map * goal - drone_w;
+    if (c.plan_trajectory && !flying() && (drone - goal).norm() > c.goal_reached_dist &&
         to_goal.head<2>().norm() > 1e-3) {
-      constexpr double kTurnDwell = 1.0;  // [s] wait after the turn
-      const double bearing = std::atan2(to_goal.y(), to_goal.x());
-      const double turn = std::abs(std::remainder(bearing - drone_yaw, 2.0 * M_PI));
-      common::Trajectory hold;
-      hold.segment_times = {0.1};
-      hold.total_duration = 0.1;
-      for (int k = 0; k < 3; ++k) {
-        Eigen::VectorXd coeffs = Eigen::VectorXd::Zero(8);
-        coeffs(0) = drone_w(k);
-        (k == 0 ? hold.coeffs_x : k == 1 ? hold.coeffs_y : hold.coeffs_z).push_back(coeffs);
+      if (!flight_spin_done_.exchange(true)) {
+        stageHold(std::numeric_limits<double>::quiet_NaN(), 2.0 * M_PI / kSpinTime, kSpinTime);
+        m.mode = MissionMode::kSpin;
+        m.spin_then_turn = true;
+        m.turn_until = t + kSpinTime;
+        DRONE_LOG_INFO("[mission] new goal " << fmt(goal) << ", the first of the flight: SPIN 360 deg ("
+                       << kSpinTime << " s) to look around, then TURN to face it");
+      } else {
+        DRONE_LOG_INFO("[mission] new goal " << fmt(goal));
+        startTurn("new goal");
       }
-      hold.end_yaw = bearing;
-      hold.t0 = now() + kLeadMin;
-      stagePending(hold);
-      turn_hold_active_.store(true);
-      turn_fresh_until_.store(t + 1.0);
-      m.mode = MissionMode::kTurn;
-      m.turn_until = t + turn / control::FlatnessMapper::Params{}.end_yaw_rate + kTurnDwell;
-      DRONE_LOG_INFO("[mission] new goal " << fmt(goal) << ": TURN " << std::fixed
-                     << std::setprecision(0) << turn * 180.0 / M_PI << " deg to face it, then wait "
-                     << kTurnDwell << " s");
     } else {
       m.mode = MissionMode::kAdvance;
       m.need_retarget = true;
@@ -1712,6 +1767,23 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     m.target_yaw = end_yaw;
     m.arrived_at = kNaN;
   };
+
+  // NO EXITS again after the look around: park at the best known point and
+  // stay (see the top of this function).
+  if (m.mode == MissionMode::kNoExits) {
+    m.settled = true;
+    Path p;
+    if (m.has_best_known && (drone - m.best_known).norm() > c.arrive_dist && planTo(m.best_known, p)) {
+      commit(p, kNaN);
+      DRONE_LOG_INFO("[mission] NO EXITS after looking around: going to the best known point "
+                     << fmt(m.best_known) << " and staying there");
+    } else {
+      DRONE_LOG_INFO("[mission] NO EXITS after looking around: staying here"
+                     << (m.has_best_known ? " (at or unable to reach the best known point)" : ""));
+    }
+    publishView();
+    return;
+  }
 
   // ---- Monitor: is the path to the target still safe on the current map? ----
   const Path committed = committedPath();
@@ -1889,7 +1961,7 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
       DRONE_LOG_INFO("[mission] NO EXITS: " << kSearchTries
                      << " searches in a row found no route to the goal even through unknown space, "
                         "or only one past exit points already looked at ("
-                     << m.tried_exits.size() << " looked at); holding");
+                     << m.tried_exits.size() << " looked at)");
       publishView();
       return;
     }
@@ -1939,7 +2011,7 @@ void AutonomyCore::explorationTick(const planning::MapHandle& map, const ConsGri
     if (++m.failed_exits > 5) {
       m.mode = MissionMode::kNoExits;
       m.no_exits_at = t;
-      DRONE_LOG_INFO("[mission] NO EXITS: no reachable viewpoint for 6 exit points in a row; holding");
+      DRONE_LOG_INFO("[mission] NO EXITS: no reachable viewpoint for 6 exit points in a row");
     }
     publishView();
     return;

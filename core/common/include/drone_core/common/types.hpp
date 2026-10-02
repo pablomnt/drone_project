@@ -94,6 +94,11 @@ struct Trajectory {
   // arrive looking at something (the exploration viewpoints). Same frame as the
   // coefficients.
   double end_yaw{std::numeric_limits<double>::quiet_NaN()};
+  // Turn at this rate [rad/s, + = counter-clockwise] for the whole trajectory
+  // and hold the heading reached after it, instead of following the direction
+  // of travel; 0 for none. Used for the exploration's 360 deg look around on
+  // the spot (a hold-in-place trajectory). Frame-independent.
+  double spin_rate{0.0};
 
   bool empty() const { return segment_times.empty(); }
 };

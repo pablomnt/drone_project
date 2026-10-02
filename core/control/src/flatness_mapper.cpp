@@ -26,6 +26,16 @@ common::Reference FlatnessMapper::sample(const common::Trajectory& traj, double 
   ref.vel_ff = m.vel;
   ref.acc_ff = m.acc;
 
+  // A spin (Trajectory::spin_rate): turn at that rate while the trajectory
+  // runs, hold the heading reached after.
+  if (traj.spin_rate != 0.0) {
+    if (now >= traj.t0 && now <= traj.t0 + traj.total_duration) {
+      last_yaw_ = std::remainder(last_yaw_ + traj.spin_rate * dt, 2.0 * M_PI);
+    }
+    ref.yaw = last_yaw_;
+    return ref;
+  }
+
   // Yaw follows the direction of travel so the forward camera leads the motion.
   // The heading turn rate is available analytically from velocity and
   // acceleration, so the "spinning while slow" guard needs no stored history.

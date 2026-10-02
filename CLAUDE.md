@@ -324,6 +324,11 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   the corridor — on top of the 0.5 m from mapped obstacles), so truncation should almost never cut.
   Phases (logged as `[mission] …`, plus a status line every 5 s; drawn on `/planner/mission`: green
   sphere = target, yellow = exit point, green arrow = heading to arrive with):
+  - **SPIN** before the **first goal of a flight** (the first after `reset()`: disarm, leaving
+    offboard, the transfer tester switching — the same resets as the keep-out): a 5 s 360° on the
+    spot, since the camera has only seen ahead since takeoff, then the TURN below. A hold-in-place
+    trajectory with `Trajectory::spin_rate` (2π/5 rad/s) does it; the flatness mapper turns at that
+    rate while it runs and holds the heading after.
   - **TURN** (only for a goal received at a standstill, with `PLAN_TRAJECTORY` on) — turn to face the
     goal horizontally, then wait 1 s, before any planning, so the camera has mapped that way first. A
     0.1 s hold-in-place trajectory with `end_yaw` set does the turn (the flatness mapper turns at
@@ -358,7 +363,10 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
     strike is a search that finds no route (EIT\* returns nothing when its time runs out, so one
     failure proved little and used to end the mission), or a route found only by the retry without
     the exclusion balls: those can plug the only way on (an exit in a doorway), so a failed search
-    is retried without them, and the drone may look at an old exit again, at most twice.
+    is retried without them, and the drone may look at an old exit again, at most twice. The
+    **first** NO EXITS for a goal waits until the drone is at rest, does the same 5 s 360° SPIN plus
+    a 1 s wait, and starts again from ADVANCE with the exits forgotten; the **second** flies to the
+    best-effort known point and stays there, with no more searching until a new goal.
   - The monitor/improve serve whichever phase is on: every tick the remaining committed path is
     re-checked on the current map (EIT\*, conservative) and replanned to the same target if blocked
     (or a new target chosen if the target itself became unreachable); every `RRT_IMPROVE_PERIOD` a
@@ -380,11 +388,11 @@ almost always running) a trajectory must still get staged — `stagedTrajectoryC
   its first ADVANCE target. With `BENCH_TEST_TRANSFER_TESTER` the simulated vehicle is the one
   flown; since 2026-10-01 it starts where the real drone is (it used to start at `POS_SP`, in unknown
   space above the camera, and the mission went straight to NO EXITS). The keep-out stays on the real
-  drone, and the simulated one only sees what the real camera sees. NO EXITS retries from ADVANCE
-  every 10 s with the tried exits forgotten. Covered by `ctest -R exploration` (exit point / viewpoints) and
+  drone, and the simulated one only sees what the real camera sees. Covered by `ctest -R exploration` (exit point / viewpoints) and
   `ctest -R exploration_mission` (threaded end to end on synthetic rooms: ADVANCE to the edge,
-  UNCOVER facing the exit, ADVANCE to the goal once revealed, DONE, then a TURN before ADVANCE for a
-  goal off to the side; ~7 s; the first four steps mutation-checked).
+  UNCOVER facing the exit, ADVANCE to the goal once revealed, DONE, then for a fresh core's first goal
+  off to the side SPIN, TURN, ADVANCE; ~12 s; the first four steps mutation-checked). The NO EXITS
+  spin-then-park path has no unit test.
 - **Trajectory tracking + flatness mapping (50 Hz)** on whatever thread calls `stepControl()`.
 
 Module roles:
@@ -652,7 +660,7 @@ Module roles:
   inradius above 0.87 m and every joint overlap above 0.7 m — a soft cost cannot change the feasible
   set, so that can only have been convergence. These are distinct faults needing opposite fixes, hence distinct messages. A
   successful corridor's lines (`truncated to`, `start margin relaxed`, `end pulled back`, `repaired
-  thin joints`, `OK`) log only with `DEBUG_TRAJGEN` on (2026-09-30); failures and the `[trajgen]
+  thin joints`, `OK`) log only with `DEBUG_TRAJGEN` on (2026-09-30; default on since 2026-10-02); failures and the `[trajgen]
   solve for` summary always log.
 
   **The start relaxation — why the first region is special.** `truncatePath` ramps its requirement to
@@ -1392,7 +1400,7 @@ publish nothing and cost nothing when the flag is off:
   `UNKNOWN_WEIGHT`'s cost surcharge (reads the RAW octree), and the "never observed" stop in
   truncation, the monitor and the adoption check (read the grid, so the ball is free there and all
   three agree with the corridor). Turn it off and unknown reads as ordinary free space everywhere.
-- `DEBUG_MAP` (bool, default `false`; was `LOG_MAP_TIMING`, default true, until 2026-10-01) — one `[map]` line per octomap: time since the previous
+- `DEBUG_MAP` (bool, default `true` since 2026-10-02 for the thesis flight; `false` 2026-10-01; was `LOG_MAP_TIMING`, default true, before) — one `[map]` line per octomap: time since the previous
   one (and Hz), decode, shell (grid fill / ball / sweep times, grid size, shell cells, cells freed
   around the drone), distance fields, viz publish, total.
 - `BEST_EFFORT_GOAL` (bool, default `true`) — accept an approximate geometric solution that stops

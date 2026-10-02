@@ -139,9 +139,9 @@ int main() {
 
   core.stopPlanner();
 
-  // 5. A new goal from a standstill, 90 deg to the left, with trajectories on:
-  //    TURN first (a hold-in-place trajectory facing the goal), ADVANCE only
-  //    after the turn (pi/2 at 0.8 rad/s, ~2 s) plus the 1 s wait.
+  // 5. The flight's first goal, from a standstill, 90 deg to the left, with
+  //    trajectories on: SPIN 360 deg (5 s) first, then TURN to face it (pi/2 at
+  //    0.8 rad/s, ~2 s) and wait 1 s, and only then ADVANCE.
   {
     autonomy::AutonomyCore::Config tcfg = cfg;
     tcfg.plan_trajectory = true;
@@ -153,14 +153,17 @@ int main() {
     turner.setGoal(left);
     const auto t_goal = std::chrono::steady_clock::now();
     turner.startPlanner();
-    check(waitFor([&] { return turner.missionView().mode == Mode::kTurn; }, 1.0),
-          "no TURN for a goal off to the side");
-    check(turner.stagedTrajectoryCount() == 1, "TURN staged no hold trajectory");
+    check(waitFor([&] { return turner.missionView().mode == Mode::kSpin; }, 1.0),
+          "no SPIN for the flight's first goal");
+    check(turner.stagedTrajectoryCount() == 1, "SPIN staged no hold trajectory");
+    check(waitFor([&] { return turner.missionView().mode == Mode::kTurn; }, 6.0),
+          "no TURN after the SPIN");
+    check(turner.stagedTrajectoryCount() == 2, "TURN staged no hold trajectory");
     check(waitFor([&] { return turner.missionView().mode == Mode::kAdvance; }, 5.0),
           "no ADVANCE after the TURN");
     const double waited =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_goal).count();
-    check(waited > 2.8, "ADVANCE before the turn and the wait were over (" +
+    check(waited > 7.8, "ADVANCE before the spin, the turn and the wait were over (" +
                             std::to_string(waited) + " s)");
     turner.stopPlanner();
   }

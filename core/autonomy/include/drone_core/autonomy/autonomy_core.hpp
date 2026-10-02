@@ -407,7 +407,7 @@ public:
   bool hasCommittedPath() const { return !committedPath().empty(); }
 
   // The exploration's current state, for logs and visualisation (map frame).
-  enum class MissionMode { kIdle, kTurn, kAdvance, kUncover, kDone, kNoExits };
+  enum class MissionMode { kIdle, kTurn, kAdvance, kUncover, kSpin, kDone, kNoExits };
   struct MissionView {
     MissionMode mode = MissionMode::kIdle;
     bool has_target = false;
@@ -723,6 +723,10 @@ private:
   // ahead and stepControl keeps the trajectory fresh until then — so a dead
   // search thread still ends in the usual hover-hold.
   std::atomic<bool> turn_hold_active_{false};
+  // The first goal of a flight starts with a 360 deg look around (see
+  // explorationTick); reset() — disarm, leaving offboard, the transfer tester
+  // switching — makes the next goal the first again.
+  std::atomic<bool> flight_spin_done_{false};
   std::atomic<double> turn_fresh_until_{0.0};
   // Raised by stepControl when the tracker abandons a trajectory for divergence.
   // One flag per planner thread, because both have to react and each consumes
@@ -795,7 +799,10 @@ private:
     std::vector<Eigen::Vector3d> optimistic_path;
     double last_status = -1.0e9;
     double no_exits_at = 0.0;
-    double turn_until = 0.0;  // TURN: when the turn toward the goal and the wait after it end
+    double turn_until = 0.0;  // TURN / SPIN: when the turn and the wait after it end
+    bool spun = false;     // the 360 deg look around after the first NO EXITS is done
+    bool spin_then_turn = false;  // SPIN before the flight's first goal: TURN to it after
+    bool settled = false;  // NO EXITS after it: parked at the best known point for good
   } mission_;
   MissionView mission_view_;  // guarded by traj_mutex_
   std::uint64_t path_version_{0};  // bumped on every setCommittedPath; guarded by path_mutex_

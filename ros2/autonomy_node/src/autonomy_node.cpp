@@ -393,7 +393,7 @@ private:
     // One [map] line per octomap: time since the previous one, and how long
     // decoding, the unknown shell, the two distance fields, the occupancy-map
     // publish and the whole callback took.
-    declare_parameter("DEBUG_MAP", false);
+    declare_parameter("DEBUG_MAP", true);
     // Best-effort goal seeking. When true (default), a goal in unreachable or
     // still-unmapped space no longer produces "no path": the planner routes to the
     // reachable point closest to the goal (the frontier edge) and the worker keeps
@@ -473,7 +473,7 @@ private:
     // corridor lines of a solve that worked (truncated to, start margin relaxed,
     // end pulled back, repaired thin joints, corridor OK). Failures and the
     // `[trajgen] solve for` summary always log.
-    declare_parameter("DEBUG_TRAJGEN", false);
+    declare_parameter("DEBUG_TRAJGEN", true);
     // Corridor resample cap: one free box is grown per path piece of at most
     // this length [m].
     declare_parameter("MAX_SEGMENT_LEN", 2.0);

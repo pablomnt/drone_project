@@ -103,6 +103,30 @@ int main() {
     expectNear(plain.sample(traj, 6.0).yaw, 0.0, 1e-9, "no end yaw: the end holds the travel heading");
   }
 
+  // Spin: a 5 s hold-in-place trajectory at 2 pi / 5 rad/s turns one full
+  // circle, at that rate throughout, and holds the heading after.
+  {
+    Trajectory sp;
+    sp.segment_times = {5.0};
+    sp.total_duration = 5.0;
+    sp.coeffs_x = {poly(1.0, 0.0)};
+    sp.coeffs_y = {poly(2.0, 0.0)};
+    sp.coeffs_z = {poly(1.0, 0.0)};
+    sp.spin_rate = 2.0 * M_PI / 5.0;
+    FlatnessMapper m;
+    m.reset(0.3);
+    double prev = m.sample(sp, 0.0).yaw;
+    double turned = 0.0;
+    for (double t = 0.02; t <= 6.0 + 1e-9; t += 0.02) {
+      const double y = m.sample(sp, t).yaw;
+      turned += std::remainder(y - prev, 2.0 * M_PI);
+      prev = y;
+    }
+    expectNear(turned, 2.0 * M_PI, 0.03, "spin: one full turn");
+    expectNear(m.sample(sp, 7.0).yaw, prev, 1e-9, "spin: holds the heading after");
+    expectNear(m.sample(sp, 7.0).pos.x(), 1.0, 1e-9, "spin: stays in place");
+  }
+
   if (g_failures == 0) {
     std::cout << "flatness_mapper: all checks passed\n";
     return 0;
