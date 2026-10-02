@@ -2,6 +2,7 @@
 
 #include <array>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -10,7 +11,7 @@
 #include <ompl/base/OptimizationObjective.h>
 #include <ompl/base/Planner.h>
 #include <ompl/base/SpaceInformation.h>
-#include <ompl/base/spaces/SE3StateSpace.h>
+#include <ompl/base/spaces/RealVectorStateSpace.h>
 #include <octomap/octomap.h>
 
 namespace drone_core::planning {
@@ -94,7 +95,7 @@ struct PlannerConfig {
   } eitstar;
 };
 
-// Geometric global planner: searches an SE(3) state space with a selectable OMPL
+// Geometric global planner: searches a 3D position space with a selectable OMPL
 // optimal planner (see PlannerType) against an occupancy octree and returns a
 // collision-free, clearance-aware waypoint list.
 class GeometricPlanner {
@@ -140,9 +141,17 @@ public:
   //
   // Order-independent with setClearance: whichever is called last, the cost
   // uses this field when one is set and falls back to the validity field when
-  // it is not. Pass an empty function to clear it. weight and threshold stay
-  // where setClearance put them; this changes only which field is sampled.
-  void setCostClearance(ClearanceFn clearance);
+  // it is not. Pass an empty function to clear it. threshold stays where
+  // setClearance put it.
+  //
+  // With both fields set the proximity term is split in two, each with its own
+  // weight (c_v = validity field, c_c = this one, never farther than c_v):
+  //   clearance_weight * max(0, threshold - c_v)
+  //   + frontier_weight * ( max(0, threshold - c_c) - max(0, threshold - c_v) )
+  // i.e. mapped obstacles at clearance_weight and whatever extra the frontier
+  // adds at frontier_weight. Equal weights give exactly the single penalty on
+  // c_c.
+  void setCostClearance(ClearanceFn clearance, double frontier_weight);
 
   // Charge a FLAT extra cost per metre flown through space that has never been
   // observed. The path cost becomes
@@ -188,6 +197,50 @@ public:
   // samples independently at its own resolution.
   void setUnknownPenalty(UnknownFn is_unknown, double weight);
 
+  // Keep the path where the camera can see it: it only looks forward and
+  // roughly level, so climbing or diving steeply into never-observed space
+  // (`is_unknown`) goes where the drone cannot look. Two parts:
+  //  - HARD, per point: a point in unknown space is invalid when the slope of
+  //    the line from the start to it exceeds `max_slope_deg` (a cone around the
+  //    start, anchored where the escape ramp is). A point check, so every OMPL
+  //    planner obeys it (EIT*/AIT* never call the motion validator) and nothing
+  //    unusual reaches OMPL's pruning.
+  //  - SOFT, per edge: the cost gains steep_weight x the vertical metres an edge
+  //    climbs beyond that slope, times the fraction of it in unknown space —
+  //    which catches a steep stretch far from the start that the cone allows.
+  //    Never negative, so the planners' heuristics stay admissible.
+  // Through explored space any slope is fine. An empty function or
+  // max_slope_deg <= 0 disables both (the default).
+  void setUnknownSlopeLimit(UnknownFn is_unknown, double max_slope_deg, double steep_weight);
+
+  // Plan on the CONSERVATIVE map: a point is valid only if it is in observed
+  // space (`is_unknown` false) and at least `unknown_margin` from never-observed
+  // space (`conservative`: distance to the nearest occupied-or-unknown voxel),
+  // on top of the usual margin from mapped obstacles. The unknown margin ramps
+  // up from the start's own clearance over the escape ramp, like the obstacle
+  // margin. The start itself is exempt from the "observed" test (a drone may sit
+  // in a cell the map has not seen).
+  //
+  // A goal in never-observed space would be invalid, which OMPL refuses
+  // outright. So when the goal fails the check, planPath plans to it unchanged
+  // with only that exact point exempt: nothing can connect to it through the
+  // unknown space around it, and best effort (setBestEffort) returns the path
+  // to the reachable point nearest the goal — the best-effort known-space goal.
+  // Empty functions disable it (the default: optimistic, unknown reads as free).
+  void setConservative(UnknownFn is_unknown, ClearanceFn conservative, double unknown_margin);
+
+  // Points within `radius` of any of `centres` are invalid (the exit points
+  // the exploration has already looked at, so the optimistic search routes
+  // through a different one). Empty disables it (the default).
+  void setExclusions(std::vector<Eigen::Vector3d> centres, double radius) {
+    exclusions_ = std::move(centres);
+    exclusion_radius_ = radius;
+  }
+
+  // The validity check the search uses, for one point, with the escape ramp
+  // centred where the last planPath / isPathValid anchored it.
+  bool isValidPoint(double x, double y, double z) const { return positionValid(x, y, z); }
+
   // Select which OMPL planner planPath builds. The per-planner parameters come
   // from the PlannerConfig defaults in this header. Default is RRT*.
   void setPlannerType(PlannerType type) { planner_type_ = type; }
@@ -202,6 +255,29 @@ public:
   // possible" and advancing as the frontier recedes. lastGoalGap() reports how far
   // short the returned path stops.
   void setBestEffort(bool on) { best_effort_ = on; }
+
+  // Optimisation budget for the next planPath [s] (the constructor sets the first).
+  void setPlanningTime(double seconds) { planning_time_ = seconds; }
+  // Stop the next planPath early: once `seconds` have passed AND a path that
+  // reaches the goal has been found (else it runs the full planning time). For
+  // the searches that must produce a path now: quick when the path is easy,
+  // the full budget when it is not. <= 0 (the default) disables it.
+  void setEarlyStop(double seconds) { early_stop_ = seconds; }
+
+  // Distance [m] over which the validity margin ramps from 0 at the start to
+  // the full collision margin (see positionValid). The host passes the same
+  // ESCAPE_RAMP_DIST truncatePath uses, so the search and truncation agree on
+  // how much clearance a point near the drone needs. The ramp never drops below
+  // the start's own clearance (less half a voxel), so a path from a drone that
+  // is already too close can move it away but never closer. <= 0 disables the
+  // ramp (full margin everywhere, so a drone within the margin of an obstacle
+  // cannot root a path at all).
+  void setEscapeRamp(double dist) { escape_ramp_ = dist; }
+
+  // Lowest height [m, search frame] a point may have, or -inf (the default) for
+  // none beyond the search box. Relaxed to the start's own height when that is
+  // lower, so a drone sitting on the ground can still climb out above it.
+  void setFloor(double z) { floor_z_ = z; }
 
   // Straight-line distance [m] from the endpoint of the most recent planPath
   // solution to the goal it was asked for: 0 for an exact solution, positive for
@@ -271,32 +347,40 @@ public:
   // replan log show whether a path scores high because it is long, because it
   // hugs obstacles, or because it routes through unmapped space — three problems
   // with three different fixes. `unknown` is 0 when no surcharge is configured.
+  // When the cost is scored on a separate field (setCostClearance, the
+  // frontier-stamped view), `frontier` is the frontier weight's term of
+  // `clearance` — the price of running near the frontier rather than near a
+  // mapped obstacle — and `split` is true; otherwise it is 0.
   // Same +infinity convention as pathCost for <2-point paths.
   struct CostBreakdown {
     double length;     // arc-length term [m] (== pathCost with no penalties)
-    double clearance;  // obstacle-proximity penalty term
+    double clearance;  // proximity penalty term, obstacles and frontier together
     double unknown;    // unknown-space surcharge term (see setUnknownPenalty)
     double total;      // length + clearance + unknown (== pathCost(path))
+    double frontier = 0.0;  // the frontier's share of `clearance` (see above)
+    bool split = false;     // `frontier` was computed (two distinct fields)
+    double steep = 0.0;     // steep-into-unknown term (setUnknownSlopeLimit), in total
   };
   CostBreakdown costBreakdown(const std::vector<std::vector<double>>& path) const;
 
   // Smallest clearance (distance to the nearest obstacle, metres) along the path,
   // sampled finely, considering only the points the validity check enforces —
-  // i.e. those outside the start escape sphere (points within kStartEscapeRadius
-  // of the first waypoint are exempt and skipped, mirroring isStateValid). So
+  // i.e. those held to the full margin (points within the escape ramp of the
+  // first waypoint have a reduced margin and are skipped, mirroring isStateValid). So
   // this reports the lowest clearance that could actually flag the path, not the
   // absolute minimum. Requires a clearance field (see setClearance); returns
   // +infinity when none is set, the path has fewer than two points, or every
-  // sampled point falls inside the escape sphere. Purely a diagnostic.
+  // sampled point falls inside the escape ramp. Purely a diagnostic.
   double minClearance(const std::vector<std::vector<double>>& path) const;
 
   // The hard clearance the validity check enforces away from the start [m].
   double collisionMargin() const { return kCollisionMargin; }
 
-  // Radius [m] the host should leave frontier-free around the drone when stamping
-  // frontier as occupied (see kFrontierKeepOutRadius). Static so the ROS wrapper
-  // can read it without a planner instance.
+  // The keep-out the host marks free around the drone before building the
+  // unknown shell (see kFrontierKeepOutRadius). Static so the ROS wrapper can
+  // read them without a planner instance.
   static constexpr double frontierKeepOutRadius() { return kFrontierKeepOutRadius; }
+  static constexpr double frontierKeepOutForward() { return kFrontierKeepOutForward; }
 
   // Snapshot of the search tree from the most recent planPath, for debug
   // visualisation. `nodes` are the tree vertices in world XYZ; `edges` index
@@ -321,8 +405,8 @@ private:
   bool isStateValid(const ompl::base::State* state);
 
   // The whole collision model in one place, in world coordinates: true when
-  // (x, y, z) clears the margin that applies there (see kCollisionMargin /
-  // kStartMargin). isStateValid is a thin adapter over this, and projectGoal
+  // (x, y, z) clears the margin that applies there (kCollisionMargin, ramped
+  // near the start; see setEscapeRamp). isStateValid is a thin adapter over this, and projectGoal
   // uses it directly so "valid goal" cannot drift from "valid state".
   bool positionValid(double x, double y, double z) const;
 
@@ -340,10 +424,13 @@ private:
   // side of a thin wall. Anchor start_pos_ before calling (planPath does).
   bool projectGoal(const std::vector<double>& goal, std::array<double, 3>& out) const;
 
-  // Build the optimisation objective. include_unknown=false omits the
-  // unknown-space surcharge, which costBreakdown uses to separate that term
-  // from the obstacle-proximity one.
-  ompl::base::OptimizationObjectivePtr makeObjective(bool include_unknown = true) const;
+  // Build the optimisation objective. The include_* switches drop the
+  // unknown-space surcharge, the obstacle penalty or the frontier penalty;
+  // costBreakdown uses them to separate the terms.
+  ompl::base::OptimizationObjectivePtr makeObjective(bool include_unknown = true,
+                                                     bool include_obstacles = true,
+                                                     bool include_frontier = true,
+                                                     bool include_steep = true) const;
 
   // Construct and configure the OMPL planner selected by planner_type_, applying
   // the matching PlannerConfig sub-struct. Called once per planPath.
@@ -387,14 +474,22 @@ private:
   ompl::base::SpaceInformationPtr si_;
 
   double planning_time_;  // optimisation budget per solve [s]
+  double early_stop_ = 0.0;  // see setEarlyStop [s]
   PlannerType planner_type_ = PlannerType::RRTstar;  // which OMPL planner to build
   PlannerConfig params_{};                           // per-planner tunables (header defaults)
 
-  // Centre of the start-state collision exemption (see isStateValid): the start
+  // Centre of the start-state escape ramp (see positionValid): the start
   // passed to planPath, or the first waypoint in isPathValid. Set transiently
   // before each validity sweep, hence mutable so the const isPathValid can
   // anchor it.
   mutable std::array<double, 3> start_pos_{};
+  double floor_z_ = -std::numeric_limits<double>::infinity();  // see setFloor
+  // Floor under the escape ramp [m]: the start's clearance less half a voxel,
+  // so a path may not approach an obstacle more closely than the start already
+  // does (see positionValid). Cached with start_pos_ since positionValid is hot.
+  mutable double start_floor_ = 0.0;
+  // Set start_pos_ and start_floor_ together. Needs the clearance field set first.
+  void anchorStart(double x, double y, double z) const;
 
   // The validity field: what isStateValid tests against the margin, and what
   // minClearance reports. Null => optimise pure path length with the fallback
@@ -404,6 +499,7 @@ private:
   // the cost samples clearance_fn_, which is the single-field behaviour.
   ClearanceFn cost_clearance_fn_;
   double clearance_weight_ = 1.0;       // obstacle-proximity penalty weight
+  double frontier_weight_ = 1.0;        // frontier-proximity weight (setCostClearance)
   double clearance_threshold_ = 1.0;    // clearance saturation distance [m]
 
   // Flat per-metre surcharge for unobserved space (see setUnknownPenalty).
@@ -411,21 +507,54 @@ private:
   UnknownFn unknown_fn_;
   double unknown_weight_ = 0.0;
 
-  // Validity margins [m]. A state is free when its clearance exceeds the margin:
-  // kCollisionMargin in general, the reduced kStartMargin within kStartEscapeRadius
-  // of the start so a parked/lifting drone can root the search (see isStateValid).
-  static constexpr double kCollisionMargin = 0.5;
-  static constexpr double kStartMargin = 0.0;
-  static constexpr double kStartEscapeRadius = 0.5;
+  // Slope limit in never-observed space (see setUnknownSlopeLimit).
+  UnknownFn slope_unknown_fn_;
+  double max_slope_tan_ = 0.0;  // tan of the limit; <= 0 disables
+  double steep_weight_ = 0.0;
+  bool slopeActive() const { return max_slope_tan_ > 0.0 && static_cast<bool>(slope_unknown_fn_); }
 
-  // Radius [m] around the drone the host leaves frontier-free when burning
-  // frontier into the occupancy map (consumed by the ROS wrapper's frontier
-  // stamping, not the planner itself). Kept here beside kStartEscapeRadius since
-  // it serves the same "let a drone boxed in by unknown space still root the
-  // search" purpose. Must stay well below kStartEscapeRadius/kCollisionMargin so
-  // the surrounding frontier's margin reseals the gap — otherwise the planner
-  // could route out through the hole into (free-reading) unknown space.
-  static constexpr double kFrontierKeepOutRadius = 0.5;
+  std::vector<Eigen::Vector3d> exclusions_;  // see setExclusions
+  double exclusion_radius_ = 0.0;
+
+  // Conservative mode (see setConservative).
+  UnknownFn cons_unknown_fn_;
+  ClearanceFn cons_clearance_fn_;
+  double cons_unknown_margin_ = 0.0;
+  mutable double start_floor_unknown_ = 0.0;  // like start_floor_, for the unknown margin
+  // The one point exempt from validity this planPath (a goal in unknown space).
+  mutable bool exempt_goal_ = false;
+  mutable std::array<double, 3> exempt_goal_pos_{};
+  bool conservativeActive() const {
+    return static_cast<bool>(cons_unknown_fn_) && static_cast<bool>(cons_clearance_fn_);
+  }
+
+  // Largest search (in sampled states) whose tree is copied out for the debug
+  // viz; see planPath. Measured 2026-09-29: normal searches sample 500-2000
+  // states and copy quickly; an EIT* search with start 2 cm from goal sampled
+  // ~9700 densely packed ones and the copy took 8.4 s (its edges, not its
+  // vertices, dominate).
+  static constexpr std::size_t kMaxTreeCaptureStates = 2500;
+  // Validity margin [m]. A state is free when its clearance exceeds the margin:
+  // kCollisionMargin in general, ramped down to 0 within escape_ramp_ of the
+  // start so a parked/lifting drone can root the search (see positionValid).
+  static constexpr double kCollisionMargin = 0.5;
+  // Spacing [m] at which motions are validity-checked. Matches truncatePath's
+  // sample_step, so the search approves exactly the points truncation re-checks.
+  static constexpr double kValidityCheckStep = 0.05;
+  double escape_ramp_ = 1.0;  // [m], see setEscapeRamp
+
+  // The volume around the drone whose never-observed voxels the host marks free
+  // before building the unknown shell (consumed by the ROS wrapper's
+  // ConservativeGrid, not the planner itself): a ball of kFrontierKeepOutRadius
+  // behind the camera and a cylinder of that radius reaching
+  // kFrontierKeepOutForward ahead along its heading, so there is more room
+  // where it looks. The shell wraps around it, so the planner cannot route out
+  // through it into unknown space. It must be well above the clearance margins
+  // (FRONTIER_MARGIN 0.5 m, CORRIDOR_MARGIN 0.4 m) to give the drone any room
+  // to move: a 0.5 m ball left only its centre keeping the margins and cut
+  // every plan to ~0.2 m. The price is treating that much unseen space as empty.
+  static constexpr double kFrontierKeepOutRadius = 0.8;
+  static constexpr double kFrontierKeepOutForward = 1.2;
 
   // Largest straight bypass [m] the clearance-aware shortcut will create. Caps
   // how much waypoint density it removes so the downstream min-snap optimiser
@@ -451,6 +580,18 @@ private:
   // that to a quasi-random lattice would cost up to half a lattice spacing of
   // extra displacement on the most common geometry there is.
   static constexpr double kGoalProjectRadius = 2.0;
+public:
+  // The box the search is confined to: x and y +-30 m, z from -1.5 (above the
+  // floor of the office test environment) to 5 m (raised from +-15 / 2.5 on
+  // 2026-09-30). The distance fields and the conservative grid are cropped to
+  // it (grown by their saturation distance), so map beyond it costs nothing. The
+  // trajectory stage clips its corridor to the same box (CorridorParams::bounds_*),
+  // so a trajectory cannot leave the space the search can plan in — a vehicle that
+  // did (bench 2026-09-29, z = -1.62) had a start outside the bounds, every search
+  // was refused, and it could never plan again.
+  static constexpr std::array<double, 3> kSearchLow{-30.0, -30.0, -1.5};
+  static constexpr std::array<double, 3> kSearchHigh{30.0, 30.0, 5.0};
+private:
   static constexpr double kGoalProjectStep = 0.05;
   static constexpr int kGoalProjectDirections = 128;
 

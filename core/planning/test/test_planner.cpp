@@ -36,6 +36,38 @@ int main() {
     }
   }
 
+  // setFloor: nothing below the floor, except down to the start's own height
+  // when the start is lower (a drone on the ground climbs out).
+  {
+    GeometricPlanner planner(octree, /*planning_time=*/0.5);
+    planner.setPlannerType(PlannerType::RRTstar);
+    planner.setFloor(0.1);
+    std::vector<std::vector<double>> path;
+    const bool ok = planner.planPath({0.0, 0.0, 0.0}, {2.0, 0.0, 0.6}, path) && !path.empty();
+    if (!ok) {
+      std::cerr << "FAIL: no path climbing from a start below the floor\n";
+      ++failures;
+    }
+    for (const auto& w : path) {
+      if (w[2] < -1e-9) {
+        std::cerr << "FAIL: path point below the start under the floor (z " << w[2] << ")\n";
+        ++failures;
+      }
+    }
+    // planPath anchored the start at z = 0.
+    if (planner.isValidPoint(1.0, 0.0, -0.2) || !planner.isValidPoint(1.0, 0.0, 0.05) ||
+        !planner.isValidPoint(1.0, 0.0, 0.5)) {
+      std::cerr << "FAIL: floor relaxed to a ground start's height wrongly\n";
+      ++failures;
+    }
+    path.clear();
+    planner.planPath({0.0, 0.0, 1.0}, {2.0, 0.0, 1.0}, path);
+    if (planner.isValidPoint(1.0, 0.0, 0.05) || !planner.isValidPoint(1.0, 0.0, 0.15)) {
+      std::cerr << "FAIL: floor not enforced for a start above it\n";
+      ++failures;
+    }
+  }
+
   // Best-effort vs strict goal handling on an unreachable goal. Model a solid block
   // straddling the goal with an analytic clearance field (distance to the box) —
   // the same obstacle-model interface the live system feeds from its EDT, so this

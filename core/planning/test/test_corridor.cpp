@@ -6,15 +6,21 @@
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/corridor_trajectory.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 using drone_core::common::Trajectory;
 using drone_core::planning::ConvexRegion;
 using drone_core::planning::CorridorLimits;
 using drone_core::planning::CorridorParams;
+using drone_core::planning::CorridorRepairs;
 using drone_core::planning::CorridorTrajectoryOptimizer;
 
 namespace {
@@ -56,6 +62,73 @@ ConvexRegion boxRegion(const Eigen::Vector3d& lo, const Eigen::Vector3d& hi) {
     r.b(2 * ax + 1) = -lo(ax);
   }
   return r;
+}
+
+// The path-following term, recomputed from scratch as the oracle for what
+// solveQP reports. Bernstein control points come from the tau-scaled monomial
+// coefficients by b_j = sum_{k<=j} (C(j,k)/C(n,k)) * ct_k, and each segment's
+// contribution is weighted by its chord length so the sum is a cost per metre of
+// path rather than per segment. Dropping that length factor is the mutation this
+// exists to catch.
+double expectedPathCost(const Trajectory& traj, const std::vector<Eigen::Vector3d>& path,
+                        double weight) {
+  const int n = 7;  // degree
+  const auto binom = [](int a, int b) {
+    double v = 1.0;
+    for (int i = 0; i < b; ++i) v = v * (a - i) / (i + 1);
+    return v;
+  };
+  double total = 0.0;
+  for (std::size_t sg = 0; sg < traj.segment_times.size(); ++sg) {
+    const double T = traj.segment_times[sg];
+    const double len = (path[sg + 1] - path[sg]).norm();
+    const std::array<const Eigen::VectorXd*, 3> c = {&traj.coeffs_x[sg], &traj.coeffs_y[sg],
+                                                     &traj.coeffs_z[sg]};
+    double seg = 0.0;
+    for (int j = 0; j <= n; ++j) {
+      const double u = static_cast<double>(j) / n;
+      for (int ax = 0; ax < 3; ++ax) {
+        double b = 0.0;
+        for (int k = 0; k <= j; ++k) {
+          // ct_k = c_k * T^k undoes the solver's time normalisation.
+          b += (binom(j, k) / binom(n, k)) * (*c[ax])(k) * std::pow(T, k);
+        }
+        const double target = path[sg](ax) + u * (path[sg + 1](ax) - path[sg](ax));
+        seg += (b - target) * (b - target);
+      }
+    }
+    total += (weight / (n + 1)) * len * seg;
+  }
+  return total;
+}
+
+// Largest distance from the solved curve to the planned polyline, sampled. This
+// is what "cuts the corner" means numerically: with the junctions free the QP is
+// scored on smoothness alone, so it leaves the polyline wherever the regions let
+// it. See CorridorTrajectoryOptimizer::setPathWeight.
+double maxDeviationFromPath(const Trajectory& traj, const std::vector<Eigen::Vector3d>& path) {
+  const auto pointToSegment = [](const Eigen::Vector3d& p, const Eigen::Vector3d& a,
+                                 const Eigen::Vector3d& b) {
+    const Eigen::Vector3d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    const double u = len2 > 0.0 ? std::clamp((p - a).dot(ab) / len2, 0.0, 1.0) : 0.0;
+    return (p - (a + u * ab)).norm();
+  };
+  double worst = 0.0;
+  for (std::size_t s = 0; s < traj.segment_times.size(); ++s) {
+    const double T = traj.segment_times[s];
+    for (int k = 0; k <= 50; ++k) {
+      const double t = T * static_cast<double>(k) / 50.0;
+      const Eigen::Vector3d p(evalDeriv(traj.coeffs_x[s], 0, t), evalDeriv(traj.coeffs_y[s], 0, t),
+                              evalDeriv(traj.coeffs_z[s], 0, t));
+      double best = std::numeric_limits<double>::infinity();
+      for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+        best = std::min(best, pointToSegment(p, path[i], path[i + 1]));
+      }
+      worst = std::max(worst, best);
+    }
+  }
+  return worst;
 }
 
 // Full validity audit of a solved corridor trajectory: boundary conditions,
@@ -242,7 +315,7 @@ int main() {
     }
   }
 
-  // Outer BOBYQA time search from the velocity-consistent seed.
+  // Outer time search (growth, bisection, group cuts) from the velocity-consistent seed.
   {
     Trajectory opt_traj;
     if (!opt.optimizeTrajectory({start, corner, goal}, regions, opt_traj)) {
@@ -263,11 +336,151 @@ int main() {
     }
   }
 
+  // A time budget that runs out immediately still yields a feasible trajectory:
+  // bisection and group cuts are skipped and the grown seed is used, which is
+  // slower than the unbudgeted result but never infeasible. On a zigzag rather
+  // than the L above: there the grown seed (7.5 s) is already within 1% of the
+  // optimum, so there is nothing for the search to find and nothing to compare.
+  {
+    std::vector<Eigen::Vector3d> zig = {{0, 0, 1}};
+    std::vector<ConvexRegion> zig_regions;
+    for (int i = 0; i < 6; ++i) {
+      const Eigen::Vector3d a = zig.back();
+      const Eigen::Vector3d b = a + (i % 2 == 0 ? Eigen::Vector3d(1.2, 0, 0)
+                                                : Eigen::Vector3d(0, 1.2, 0));
+      const Eigen::Vector3d pad(0.3, 0.3, 0.3);
+      zig_regions.push_back(boxRegion(a.cwiseMin(b) - pad, a.cwiseMax(b) + pad));
+      zig.push_back(b);
+    }
+    CorridorTrajectoryOptimizer budgeted(limits);
+    budgeted.setTimeBudget(1e-9);
+    Trajectory full, cut;
+    if (!opt.optimizeTrajectory(zig, zig_regions, full) ||
+        !budgeted.optimizeTrajectory(zig, zig_regions, cut)) {
+      std::cerr << "FAIL: exhausted time budget produced no trajectory\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(cut, restAt(zig.front()), zig.back(), zig_regions, limits,
+                                  "budget-exhausted");
+      // The grown seed is 22.95 s here and the search reaches ~21 s, so an equal
+      // duration means the budget was ignored.
+      if (cut.total_duration < full.total_duration + 0.5) {
+        std::cerr << "FAIL: budget-cut duration " << cut.total_duration
+                  << "s not slower than the full search's " << full.total_duration
+                  << "s — was the search actually stopped?\n";
+        ++failures;
+      }
+    }
+  }
+
+  // A region against ITSELF is its own inradius — the largest ball it holds.
+  // The QP-failure diagnostic in runTrajgen reports exactly this per region to
+  // tell a sliver region (which cannot hold a segment's eight control points)
+  // from a roomy one, so it must not be an accident of the LP.
+  {
+    const std::pair<ConvexRegion, double> cases[] = {
+        {boxRegion({-0.3, -0.3, 0.7}, {2.3, 0.3, 1.3}), 0.3},  // tightest half-extent
+        {boxRegion({0.0, 0.0, 0.0}, {2.0, 0.02, 2.0}), 0.01},  // a sliver
+    };
+    for (const auto& c : cases) {
+      const double r = drone_core::planning::regionOverlapDepth(c.first, c.first);
+      if (std::abs(r - c.second) > kTol) {
+        std::cerr << "FAIL: self-overlap inradius " << r << " m, wanted " << c.second << " m\n";
+        ++failures;
+      }
+    }
+  }
+
+  // The path-following weight trades smoothness for directness. At weight 0 the
+  // QP scores snap alone, so it rounds the L as widely as the two boxes allow;
+  // raising the weight has to pull the curve back toward the polyline WITHOUT
+  // touching the corridor, and without breaking containment, the dynamic limits
+  // or the boundary conditions.
+  {
+    const std::vector<Eigen::Vector3d> path = {start, corner, goal};
+    CorridorTrajectoryOptimizer direct(limits);
+    // Enough to pull the junction OFF the corner vertex of the two boxes'
+    // overlap, which is where pure snap parks it: a small weight leaves it stuck
+    // there and the deviation unchanged, which is a property of the vertex, not
+    // a broken term.
+    direct.setPathWeight(50.0);
+    Trajectory loose, tight;
+    double loose_snap = 0.0, tight_snap = 0.0, tight_path = 0.0;
+    const bool ok_loose =
+        opt.solveQP(restAt(start), goal, times, regions, loose, &loose_snap, nullptr, &path);
+    const bool ok_tight = direct.solveQP(restAt(start), goal, times, regions, tight, &tight_snap,
+                                         nullptr, &path, &tight_path);
+    if (!ok_loose || !ok_tight) {
+      std::cerr << "FAIL: path-weight QP infeasible (loose=" << ok_loose << " tight=" << ok_tight
+                << ")\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(tight, restAt(start), goal, regions, limits, "path-weighted");
+      const double dev_loose = maxDeviationFromPath(loose, path);
+      const double dev_tight = maxDeviationFromPath(tight, path);
+      // Mutation guard: if the term never reached P and q, these would be equal.
+      if (dev_tight > 0.75 * dev_loose) {
+        std::cerr << "FAIL: path weight did not pull the curve in (deviation " << dev_tight
+                  << " m weighted vs " << dev_loose << " m free)\n";
+        ++failures;
+      }
+      // Passing `path` with the weight at zero must change nothing: the planner
+      // relies on the default being exactly the old pure-snap problem.
+      Trajectory ignored;
+      double ignored_snap = 0.0;
+      if (!opt.solveQP(restAt(start), goal, times, regions, ignored, &ignored_snap, nullptr,
+                       &path) ||
+          std::abs(ignored_snap - loose_snap) > kTol) {
+        std::cerr << "FAIL: waypoints changed the zero-weight solve (" << ignored_snap << " vs "
+                  << loose_snap << ")\n";
+        ++failures;
+      }
+      // The reported path term must match an independent recomputation from the
+      // solved coefficients, chord-length weighting included. This is what pins
+      // the formula: without the length factor the two disagree by the segment
+      // lengths (2 m here, so by 2x).
+      const double want_path = expectedPathCost(tight, path, 50.0);
+      if (std::abs(tight_path - want_path) > 1e-6 * std::max(1.0, want_path)) {
+        std::cerr << "FAIL: reported path cost " << tight_path << " but the length-weighted "
+                  << "formula gives " << want_path << "\n";
+        ++failures;
+      }
+      // Directness is bought with smoothness, and the reported split has to show
+      // it: a weighted solve is less smooth and its path term is real.
+      if (tight_snap <= loose_snap || tight_path <= 0.0) {
+        std::cerr << "FAIL: path-weighted cost split wrong (snap " << tight_snap << " vs "
+                  << loose_snap << ", path " << tight_path << ")\n";
+        ++failures;
+      }
+      std::cerr << "note: corner deviation " << dev_loose << " m free -> " << dev_tight
+                << " m at path weight 50\n";
+    }
+    // The whole pipeline, time search included, must still converge with the
+    // term on — it changes the objective BOBYQA sees, not just the final solve.
+    Trajectory searched;
+    if (!direct.optimizeTrajectory(restAt(start), path, regions, searched)) {
+      std::cerr << "FAIL: path-weighted time search found no trajectory\n";
+      ++failures;
+    } else {
+      failures += checkTrajectory(searched, restAt(start), goal, regions, limits, "path-searched");
+    }
+  }
+
   // Infeasible by time: 2 m per segment at vmax = 1 m/s cannot fit in 0.5 s.
   {
+    // The reported status must be OSQP's own verdict, not just "it failed": the
+    // seed-growth failure message prints it so a corridor that genuinely admits
+    // no curve can be told apart from a solver that ran out of iterations on a
+    // hard one. Those want opposite responses and used to read identically.
     Trajectory t2;
-    if (opt.solveQP(start, goal, {0.5, 0.5}, regions, t2)) {
+    std::string status;
+    if (opt.solveQP(restAt(start), goal, {0.5, 0.5}, regions, t2, nullptr, nullptr, nullptr,
+                    nullptr, &status)) {
       std::cerr << "FAIL: too-short time allocation reported feasible\n";
+      ++failures;
+    } else if (status.find("infeasible") == std::string::npos) {
+      std::cerr << "FAIL: rejection status was \"" << status
+                << "\", wanted OSQP's infeasibility verdict\n";
       ++failures;
     }
   }
@@ -398,6 +611,91 @@ int main() {
     }
   }
 
+  // A smaller margin from never-observed space (unknown_margin): a mapped wall
+  // at x = +1.2 and a wall of unknown points at x = -1.2. Regions must keep the
+  // full margin from the mapped wall and unknown_margin from the unknown one —
+  // and actually use the extra room on the unknown side. Then mapped points
+  // just BEHIND the unknown wall (x = -1.3): the faces through unknown points
+  // must still keep the full margin from them.
+  {
+    const auto mapped = wallPoints(1.2, 0, -1.0, 4.0, 0.5, 1.5);
+    const auto unknown = wallPoints(-1.2, 0, -1.0, 4.0, 0.5, 1.5);
+    const std::vector<Eigen::Vector3d> path = {{0, 0, 1}, {0, 3, 1}};
+    CorridorParams up = params;
+    up.unknown_margin = 0.25;
+    // Third case: a mapped floor (z = 0.3) running out under the unknown wall,
+    // as in a real room: the floor face keeps it away, so the unknown wall's
+    // faces must still get the smaller margin.
+    for (const int variant : {0, 1, 2}) {
+      const bool behind = variant == 1, floor = variant == 2;
+      std::vector<Eigen::Vector3d> obs = mapped;
+      std::vector<Eigen::Vector3d> mapped_all = mapped;
+      if (floor) {
+        std::vector<Eigen::Vector3d> f;
+        for (double x = -2.0; x <= 1.2 + 1e-9; x += 0.05)
+          for (double y = -1.0; y <= 4.0 + 1e-9; y += 0.05) f.emplace_back(x, y, 0.3);
+        obs.insert(obs.end(), f.begin(), f.end());
+        mapped_all.insert(mapped_all.end(), f.begin(), f.end());
+      }
+      if (behind) {
+        const auto b = wallPoints(-1.3, 0, -1.0, 4.0, 0.5, 1.5);
+        obs.insert(obs.end(), b.begin(), b.end());
+        mapped_all.insert(mapped_all.end(), b.begin(), b.end());
+      }
+      up.first_unknown = obs.size();
+      obs.insert(obs.end(), unknown.begin(), unknown.end());
+      std::vector<Eigen::Vector3d> resampled;
+      std::vector<ConvexRegion> corridor;
+      std::string why;
+      const char* label = behind ? "unknown margin, mapped behind"
+                          : floor ? "unknown margin, mapped floor" : "unknown margin";
+      if (!drone_core::planning::buildCorridor(obs, path, up, resampled, corridor, &why)) {
+        std::cerr << "FAIL(" << label << "): no corridor (" << why << ")\n";
+        ++failures;
+        continue;
+      }
+      failures += checkRegionClearance(corridor, mapped_all, {-1.5, -0.5, 0.5}, {1.5, 3.5, 1.5},
+                                       up.margin, label);
+      failures += checkRegionClearance(corridor, unknown, {-1.5, -0.5, 0.5}, {1.5, 3.5, 1.5},
+                                       up.unknown_margin, label);
+      // The grid check above samples every 0.1 m, too coarse to see a few cm
+      // lost here: sample the gap between the walls every 1 cm.
+      double worst_mapped = std::numeric_limits<double>::infinity();
+      double worst_unknown = std::numeric_limits<double>::infinity();
+      for (double x = -1.2; x <= 1.2; x += 0.01)
+        for (double y = 0.5; y <= 2.5; y += 0.25)
+          for (double z = 0.8; z <= 1.21; z += 0.2)
+            for (const auto& r : corridor) {
+              const Eigen::Vector3d q(x, y, z);
+              if (!r.contains(q)) continue;
+              worst_mapped = std::min(worst_mapped, nearestObstacle(q, mapped_all));
+              worst_unknown = std::min(worst_unknown, nearestObstacle(q, unknown));
+            }
+      if (worst_mapped < up.margin - 1e-3 || worst_unknown < up.unknown_margin - 1e-3) {
+        std::cerr << "FAIL(" << label << "): fine check: " << worst_mapped
+                  << " m from mapped (needs " << up.margin << "), " << worst_unknown
+                  << " m from unknown (needs " << up.unknown_margin << ")\n";
+        ++failures;
+      }
+      // How close the regions come to the unknown wall: ~0.25 m with nothing
+      // behind it. With the mapped wall 0.1 m behind, anything from 0.3 m up to
+      // the full 0.4 m: DecompUtil's faces are slightly tilted, and a face that
+      // passes close to a mapped point somewhere along the wall keeps the full
+      // margin over its whole plane (the safety checks above are what matter).
+      double closest = std::numeric_limits<double>::infinity();
+      for (double x = -1.5; x <= 1.5; x += 0.02)
+        for (double y = 0.5; y <= 2.5; y += 0.25)
+          for (const auto& r : corridor)
+            if (r.contains(Eigen::Vector3d(x, y, 1.0))) closest = std::min(closest, x + 1.2);
+      const double want = behind ? 0.4 : 0.25;
+      if (!(closest < want + 0.06)) {
+        std::cerr << "FAIL(" << label << "): regions stop " << closest
+                  << " m from the unknown wall, expected about " << want << " m\n";
+        ++failures;
+      }
+    }
+  }
+
   // A corridor between two parallel walls: regions must clear both by the
   // margin, cover every segment, and overlap enough at the junctions for the QP
   // to have a feasible C0 handover.
@@ -409,8 +707,9 @@ int main() {
     const std::vector<Eigen::Vector3d> path = {{0, 0, 1}, {0, 3, 1}};
     std::vector<Eigen::Vector3d> resampled;
     std::vector<ConvexRegion> corridor;
-    if (!drone_core::planning::buildCorridor(obs, path, params, resampled, corridor)) {
-      std::cerr << "FAIL: straight corridor between walls produced no regions\n";
+    std::string why;
+    if (!drone_core::planning::buildCorridor(obs, path, params, resampled, corridor, &why)) {
+      std::cerr << "FAIL: straight corridor between walls produced no regions (" << why << ")\n";
       ++failures;
     } else {
       if (corridor.size() != resampled.size() - 1) {
@@ -581,16 +880,251 @@ int main() {
     }
   }
 
-  // A path driven straight into a wall must fail cleanly (both outputs cleared)
-  // so the caller falls back rather than flying a half-built corridor.
+
+  // ------------------------------------------------------- end pull-back ---
+  // An end sitting close to something is walked back along the path until the
+  // shrunk last region holds it, instead of failing the corridor. Obstacles are
+  // written out explicitly: a flat wall across the path at y = wall_y.
+  const auto wallAcross = [](double wall_y) {
+    std::vector<Eigen::Vector3d> pts;
+    for (double x = -1.0; x <= 1.0 + 1e-9; x += 0.1) {
+      for (double z = 0.5; z <= 1.5 + 1e-9; z += 0.1) pts.emplace_back(x, wall_y, z);
+    }
+    return pts;
+  };
+
+  // Nothing near the end: the path is kept exactly as given.
   {
-    const auto obs = wallPoints(1.0, 1, -1.0, 1.0, 0.5, 1.5);  // wall at y = 1
-    std::vector<Eigen::Vector3d> r2;
-    std::vector<ConvexRegion> c2;
-    if (drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r2, c2) ||
-        !r2.empty() || !c2.empty()) {
-      std::cerr << "FAIL: corridor through a wall did not fail cleanly\n";
+    const auto obs = wallAcross(4.0);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r, c, &why,
+                                             nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: clear corridor rejected (" << why << ")\n";
       ++failures;
+    } else if (pullback != 0.0 || (r.back() - Eigen::Vector3d(0, 2, 1)).norm() > 1e-9) {
+      std::cerr << "FAIL: an end with room was moved (pullback " << pullback << " m)\n";
+      ++failures;
+    }
+  }
+
+  // The bench failure: the end sits 0.3 m before a wall, inside the 0.4 m margin
+  // of the last region's face. It must come back to just inside the face (~1.9)
+  // and no further, the whole corridor must keep the margin, and it must fly.
+  {
+    const auto obs = wallAcross(2.3);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r, c, &why,
+                                             nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: end near a wall was not pulled back (" << why << ")\n";
+      ++failures;
+    } else {
+      if (pullback < 0.1 - kTol || pullback > 0.2 + kTol) {
+        std::cerr << "FAIL: end pulled back " << pullback << " m, expected 0.1-0.2 m\n";
+        ++failures;
+      }
+      if (std::abs((Eigen::Vector3d(0, 2, 1) - r.back()).norm() - pullback) > kTol) {
+        std::cerr << "FAIL: reported pullback " << pullback << " m does not match the end moving "
+                  << (Eigen::Vector3d(0, 2, 1) - r.back()).norm() << " m\n";
+        ++failures;
+      }
+      if (!c.back().contains(r.back())) {
+        std::cerr << "FAIL: pulled-back end is still outside the last region\n";
+        ++failures;
+      }
+      failures += checkRegionClearance(c, obs, {-1.5, -0.5, 0.5}, {1.5, 3.0, 1.5}, params.margin,
+                                       "end-pullback");
+      Trajectory pt;
+      if (!opt.optimizeTrajectory(r, c, pt)) {
+        std::cerr << "FAIL: no trajectory fits the pulled-back corridor\n";
+        ++failures;
+      } else {
+        failures += checkTrajectory(pt, restAt(r.front()), r.back(), c, limits, "end-pullback");
+      }
+    }
+  }
+
+  // A last segment too short to keep anything of is dropped with its region, and
+  // the end moves to the previous junction, which the previous region holds.
+  {
+    CorridorParams dp = params;
+    dp.start_relax_dist = 0.0;  // no split: the segments are exactly the ones given
+    const auto obs = wallAcross(2.1);  // last region's face lands at ~1.7
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 1.6, 1}, {0, 1.8, 1}}, dp, r,
+                                             c, &why, nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: droppable last segment failed the corridor (" << why << ")\n";
+      ++failures;
+    } else if (c.size() != 1 || r.size() != 2 ||
+               (r.back() - Eigen::Vector3d(0, 1.6, 1)).norm() > kTol ||
+               std::abs(pullback - 0.2) > kTol) {
+      std::cerr << "FAIL: last segment not dropped cleanly (regions " << c.size() << ", end y "
+                << r.back().y() << ", pullback " << pullback << " m)\n";
+      ++failures;
+    }
+  }
+
+  // A path driven straight into a wall must never yield a corridor through it.
+  // With the pull-back it is not refused either: the corridor stops the margin
+  // short of the wall, every region still clears it, and the end is reported.
+  {
+    const auto obs = wallAcross(1.0);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    double pullback = -1.0;
+    if (!drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 2, 1}}, params, r, c, &why,
+                                             nullptr, nullptr, &pullback)) {
+      std::cerr << "FAIL: path into a wall gave no corridor short of it (" << why << ")\n";
+      ++failures;
+    } else {
+      if (r.back().y() > 1.0 - params.margin + kTol) {
+        std::cerr << "FAIL: corridor into a wall ends at y " << r.back().y()
+                  << ", inside the margin of the wall at y 1\n";
+        ++failures;
+      }
+      if (std::abs(pullback - (2.0 - r.back().y())) > kTol) {
+        std::cerr << "FAIL: into-wall pullback " << pullback << " m does not match the end\n";
+        ++failures;
+      }
+      failures += checkRegionClearance(c, obs, {-1.5, -0.5, 0.5}, {1.5, 3.0, 1.5}, params.margin,
+                                       "into-wall");
+    }
+  }
+
+  // Nothing beyond the start fits (face ~0.1 m ahead of it): refused cleanly,
+  // not turned into a trajectory of a few centimetres.
+  {
+    CorridorParams dp = params;
+    dp.start_relax_dist = 0.0;
+    const auto obs = wallAcross(0.5);
+    std::vector<Eigen::Vector3d> r;
+    std::vector<ConvexRegion> c;
+    std::string why;
+    if (drone_core::planning::buildCorridor(obs, {{0, 0, 1}, {0, 0.4, 1}}, dp, r, c, &why) ||
+        !r.empty() || !c.empty() || why.empty()) {
+      std::cerr << "FAIL: a corridor with no room past the start was not refused cleanly\n";
+      ++failures;
+    }
+  }
+
+  // Joint repairs. Two roomy stretches meet in a thin horizontal squeeze (a slab
+  // above and below the path, 1.1 m apart) right where the resampled path puts
+  // its joint (y = 2). Each region reaches into the squeeze, but their shared
+  // space is only ~0.55 m deep there, and the margin shrink lowers that depth by
+  // the full 0.44 m pull-in — so the plain build fails the overlap check, and the
+  // repairs must find a corridor that still keeps full margin everywhere.
+  {
+    const auto squeeze = [](double half_gap) {
+      std::vector<Eigen::Vector3d> pts;
+      // Wider than the region-growth window (lateral 2 m + pull-in), so no region
+      // can get around the squeeze instead of through it.
+      for (double x = -3.0; x <= 3.0 + 1e-9; x += 0.1) {
+        for (double y = -1.0; y <= 5.0 + 1e-9; y += 0.1) {
+          pts.emplace_back(x, y, -0.2);  // floor and ceiling of the roomy stretches
+          pts.emplace_back(x, y, 2.2);
+          if (std::abs(y - 2.0) <= 0.1 + 1e-9) {
+            pts.emplace_back(x, y, 1.0 - half_gap);
+            pts.emplace_back(x, y, 1.0 + half_gap);
+          }
+        }
+      }
+      return pts;
+    };
+    CorridorParams sp;
+    sp.margin = 0.4;
+    sp.start_relax_dist = 0.0;
+    sp.max_segment_len = 2.0;
+    const std::vector<Eigen::Vector3d> path = {{0, 0, 1}, {0, 4, 1}};
+    const auto obs = squeeze(0.55);
+
+    // Bridge: one extra region spliced in at the joint, no rebuild needed.
+    {
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      std::string why;
+      CorridorRepairs rep;
+      if (!drone_core::planning::buildCorridor(obs, path, sp, r, c, &why, nullptr, nullptr,
+                                               nullptr, &rep)) {
+        std::cerr << "FAIL: bridge did not repair the squeezed joint (" << why << ")\n";
+        ++failures;
+      } else {
+        if (rep.bridges < 1 || rep.split_rounds != 0 || c.size() != 3 ||
+            r.size() != c.size() + 1) {
+          std::cerr << "FAIL: squeezed joint repaired unexpectedly (bridges " << rep.bridges
+                    << ", split rounds " << rep.split_rounds << ", " << c.size() << " regions, "
+                    << r.size() << " waypoints)\n";
+          ++failures;
+        }
+        failures += checkRegionClearance(c, obs, {-1.5, -1.0, -0.2}, {1.5, 5.0, 2.2}, sp.margin,
+                                         "bridged");
+        Trajectory bt;
+        if (!opt.optimizeTrajectory(r, c, bt)) {
+          std::cerr << "FAIL: no trajectory through the bridged corridor\n";
+          ++failures;
+        } else {
+          failures += checkTrajectory(bt, restAt(r.front()), r.back(), c, limits, "bridged");
+        }
+      }
+    }
+
+    // Bridges off (the pinned-waypoint case): splitting the segments around the
+    // joint must repair it instead, with the extra points on the path itself.
+    {
+      CorridorParams np = sp;
+      np.bridge_joints = false;
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      std::string why;
+      CorridorRepairs rep;
+      if (!drone_core::planning::buildCorridor(obs, path, np, r, c, &why, nullptr, nullptr,
+                                               nullptr, &rep)) {
+        std::cerr << "FAIL: splitting did not repair the squeezed joint (" << why << ")\n";
+        ++failures;
+      } else {
+        bool on_path = true;
+        for (const auto& w : r) on_path = on_path && std::abs(w.x()) < kTol && std::abs(w.z() - 1.0) < kTol;
+        if (rep.bridges != 0 || rep.split_rounds < 1 || r.size() != c.size() + 1 || !on_path) {
+          std::cerr << "FAIL: split repair wrong (bridges " << rep.bridges << ", split rounds "
+                    << rep.split_rounds << ", waypoints on path " << on_path << ")\n";
+          ++failures;
+        }
+        failures += checkRegionClearance(c, obs, {-1.5, -1.0, -0.2}, {1.5, 5.0, 2.2}, np.margin,
+                                         "split");
+      }
+    }
+
+    // A squeeze with a few millimetres over the pull-in (0.45 vs 0.443 m) may get
+    // a corridor, but only one that keeps the margin.
+    {
+      const auto tight = squeeze(0.45);
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      if (drone_core::planning::buildCorridor(tight, path, sp, r, c)) {
+        failures += checkRegionClearance(c, tight, {-1.5, -1.0, -0.2}, {1.5, 5.0, 2.2}, sp.margin,
+                                         "tight squeeze");
+      }
+    }
+
+    // A squeeze narrower than the margin is still refused: no repair may buy a
+    // corridor by giving up clearance.
+    {
+      std::vector<Eigen::Vector3d> r;
+      std::vector<ConvexRegion> c;
+      std::string why;
+      if (drone_core::planning::buildCorridor(squeeze(0.40), path, sp, r, c, &why) ||
+          !r.empty() || !c.empty() || why.empty()) {
+        std::cerr << "FAIL: a squeeze thinner than the margin was not refused cleanly\n";
+        ++failures;
+      }
     }
   }
 
@@ -626,10 +1160,12 @@ int main() {
     }
 
     // The ramp distance is decoupled from the margin for a reason: ramping over
-    // the margin makes the requirement climb at 1 m/m and it meets the shrinking
-    // clearance almost immediately; ramping over 1 m commits measurably further.
+    // the margin makes the requirement climb at 1 m/m and it meets the slowly
+    // rising clearance almost immediately; ramping over 1 m commits measurably
+    // further. The start sits inside the margin (clearance 0.5) and the path
+    // climbs away at ~0.1 m/m, so neither the floor nor the cap decides it.
     {
-      const std::vector<Eigen::Vector3d> path = {{0, 0.8, 1}, {0, 3, 1}};
+      const std::vector<Eigen::Vector3d> path = {{0, 1.5, 1}, {-4, 1.1, 1}};
       const auto harsh = drone_core::planning::truncatePath(conservative, path,
                                                             frontier_margin, frontier_margin);
       const auto gentle =
@@ -637,9 +1173,9 @@ int main() {
       if (harsh.size() < 2 || gentle.size() < 2) {
         std::cerr << "FAIL: ramp comparison truncated to nothing\n";
         ++failures;
-      } else if (gentle.back().y() <= harsh.back().y() + kTol) {
+      } else if (gentle.back().x() >= harsh.back().x() - kTol) {
         std::cerr << "FAIL: 1 m ramp did not commit further than a margin-length ramp ("
-                  << gentle.back().y() << " vs " << harsh.back().y() << ")\n";
+                  << gentle.back().x() << " vs " << harsh.back().x() << ")\n";
         ++failures;
       } else if (conservative(gentle.back().x(), gentle.back().y(), 1.0) <= 0.0) {
         std::cerr << "FAIL: gentle ramp committed into occupied/unknown space\n";
@@ -658,6 +1194,61 @@ int main() {
     }
   }
 
+  // The ramp is floored at the start's own clearance less the more lenient of a
+  // slack (one voxel here, as the host passes) and a fraction of it: from 0.2 m
+  // off a wall a path straight at it stops within the slack (the bare ramp let
+  // it reach ~0.07 m), while one sliding along it at constant clearance commits
+  // until the ramp itself overtakes 0.2 m.
+  {
+    const drone_core::planning::CorridorClearanceFn wall = [](double x, double, double) {
+      return std::max(0.0, 2.0 - x);
+    };
+    const auto toward = drone_core::planning::truncatePath(
+        wall, {{1.8, 0, 1}, {2.5, 0, 1}}, 0.5, 1.0, 0.05, {}, nullptr, 0.05, 0.05);
+    if (toward.size() >= 2 && wall(toward.back().x(), 0, 1) < 0.2 - 0.05 - kTol) {
+      std::cerr << "FAIL: truncation let a close start approach the wall (clearance "
+                << wall(toward.back().x(), 0, 1) << ")\n";
+      ++failures;
+    }
+    const auto along = drone_core::planning::truncatePath(
+        wall, {{1.8, 0, 1}, {1.8, 3, 1}}, 0.5, 1.0, 0.05, {}, nullptr, 0.05, 0.05);
+    if (along.size() < 2 || std::abs(along.back().y() - 0.4) > 0.06) {
+      std::cerr << "FAIL: slide along a close wall cut wrong (end y="
+                << (along.size() >= 2 ? along.back().y() : -1.0) << ")\n";
+      ++failures;
+    }
+
+    // The bench case (2026-09-28): the drone reads 0.5 and the path dips to
+    // 0.4743 about 0.3 m out, i.e. the next value on the 5 cm distance grid. A
+    // half-voxel slack put the floor at 0.475 and cut it — then committed it
+    // whole on the ticks VIO jitter moved the drone into a 0.4743 cell. One
+    // voxel keeps it committed either way.
+    // It then bears away from the wall, so only the floor near the root decides.
+    const std::vector<Eigen::Vector3d> dip = {{1.5, 0, 1}, {1.5257, 0.296, 1}, {1.2, 1.0, 1},
+                                              {1.2, 2, 1}};
+    for (const double root_x : {1.5, 1.5257}) {
+      std::vector<Eigen::Vector3d> p = dip;
+      p.front().x() = root_x;
+      const auto t = drone_core::planning::truncatePath(wall, p, 0.475, 1.0, 0.05, {}, nullptr,
+                                                        0.05, 0.05);
+      if (t.size() < 2 || (t.back() - p.back()).norm() > kTol) {
+        std::cerr << "FAIL: a 2.6 cm dip below a " << wall(root_x, 0, 1)
+                  << " m root was cut — one grid step flips the result\n";
+        ++failures;
+      }
+    }
+
+    // Far from the wall the relative tolerance is the more lenient one: from
+    // 1.5 m (margin 2.0) the floor is 1.5 - max(0.05, 5% = 0.075) = 1.425.
+    const auto rel = drone_core::planning::truncatePath(
+        wall, {{0.5, 0, 1}, {0.6, 0, 1}}, 2.0, 1.0, 0.01, {}, nullptr, 0.05, 0.05);
+    if (rel.size() < 2 || std::abs(wall(rel.back().x(), 0, 1) - 1.43) > 0.011) {
+      std::cerr << "FAIL: relative floor tolerance not applied (end clearance "
+                << (rel.size() >= 2 ? wall(rel.back().x(), 0, 1) : -1.0) << ", want ~1.43)\n";
+      ++failures;
+    }
+  }
+
   // A start below the collision margin above a mapped floor roots via the ramp;
   // the climb-out survives whole.
   {
@@ -668,6 +1259,273 @@ int main() {
     const auto t = drone_core::planning::truncatePath(floor, path, 0.5);
     if (t.size() < 2 || (t.back() - path.back()).norm() > kTol) {
       std::cerr << "FAIL: floor-parked start truncated its climb-out\n";
+      ++failures;
+    }
+  }
+
+  // The box clips every region: with a floor at z = 0.9 a corridor through open
+  // space, however roomy, stays above it, and the box grows to hold a start that
+  // is already below it.
+  {
+    std::vector<Eigen::Vector3d> flat_obstacles;  // none: the window is otherwise unbounded
+    flat_obstacles.emplace_back(50.0, 50.0, 50.0);
+    const std::vector<Eigen::Vector3d> path = {{0, 0, 1.0}, {2, 0, 1.0}, {4, 0, 1.0}};
+    drone_core::planning::CorridorParams cp;
+    cp.max_segment_len = 2.0;
+    cp.margin = 0.3;
+    cp.local_bbox = Eigen::Vector3d(1.0, 2.0, 2.0);
+    cp.bounds_lo = Eigen::Vector3d(-10, -10, 0.9);
+    cp.bounds_hi = Eigen::Vector3d(10, 10, 2.5);
+    std::vector<Eigen::Vector3d> resampled;
+    std::vector<ConvexRegion> regs;
+    std::string why;
+    if (!drone_core::planning::buildCorridor(flat_obstacles, path, cp, resampled, regs, &why)) {
+      std::cerr << "FAIL: box-clipped corridor was not built (" << why << ")\n";
+      ++failures;
+    } else {
+      // The lowest z any region admits: maximise -z over the region by LP is
+      // overkill; probing the region's own sample points below the floor suffices.
+      bool leaks = false;
+      for (const auto& r : regs) {
+        if (r.contains(Eigen::Vector3d(2.0, 0.0, 0.85))) leaks = true;   // under the floor
+        if (r.contains(Eigen::Vector3d(2.0, 0.0, 2.6))) leaks = true;    // over the ceiling
+      }
+      if (leaks) {
+        std::cerr << "FAIL: a region admits points outside the box\n";
+        ++failures;
+      }
+    }
+    // A path that starts below the floor grows the box to include it: the start
+    // stays inside region 0.
+    const std::vector<Eigen::Vector3d> low = {{0, 0, 0.8}, {2, 0, 1.0}, {4, 0, 1.0}};
+    resampled.clear();
+    regs.clear();
+    if (!drone_core::planning::buildCorridor(flat_obstacles, low, cp, resampled, regs, &why) ||
+        !regs.front().contains(low.front())) {
+      std::cerr << "FAIL: a start below the box floor was excluded from region 0 (" << why << ")\n";
+      ++failures;
+    }
+  }
+
+  // -------------------------------------------------- trajectory monitor -----
+  // checkTrajectory holds a trajectory to the margins it was built with, less
+  // the tolerance, and flags an emergency only for a close pass near the start
+  // of the checked window.
+  {
+    using drone_core::planning::checkTrajectory;
+    using drone_core::planning::TrajectoryCheckParams;
+    // Straight line along x at 0.5 m/s for 10 s, two 5 s segments, from t0 = 50.
+    Trajectory line;
+    line.t0 = 50.0;
+    line.segment_times = {5.0, 5.0};
+    line.total_duration = 10.0;
+    Eigen::VectorXd c0 = Eigen::VectorXd::Zero(8), c1 = Eigen::VectorXd::Zero(8);
+    c0(1) = 0.5;
+    c1(0) = 2.5;
+    c1(1) = 0.5;
+    Eigen::VectorXd zero = Eigen::VectorXd::Zero(8), one = Eigen::VectorXd::Zero(8);
+    one(0) = 1.0;
+    line.coeffs_x = {c0, c1};
+    line.coeffs_y = {zero, zero};
+    line.coeffs_z = {one, one};
+    const Eigen::Isometry3d I = Eigen::Isometry3d::Identity();
+    TrajectoryCheckParams p;
+    p.margin = 0.4;
+    p.start_margin = 0.4;
+    p.first_segment_end = 55.0;
+    p.max_speed = 0.5;
+    // Wide open: passes.
+    const auto open = [](double, double, double) { return 1.0; };
+    if (!checkTrajectory(open, {}, line, I, 50.0, 0.0, p).ok) {
+      std::cerr << "FAIL: trajectory in open space failed its check\n";
+      ++failures;
+    }
+    // An obstacle 0.3 m off the line between x = 3 and 4 (t = 56..58 s).
+    const auto pinch = [](double x, double, double) { return (x >= 3.0 && x <= 4.0) ? 0.3 : 1.0; };
+    const auto early = checkTrajectory(pinch, {}, line, I, 50.0, 0.0, p);
+    if (early.ok || early.emergency) {
+      std::cerr << "FAIL: pinch 6 s ahead should fail without an emergency\n";
+      ++failures;
+    }
+    const auto near = checkTrajectory(pinch, {}, line, I, 55.0, 0.0, p);
+    if (near.ok || !near.emergency) {
+      std::cerr << "FAIL: pinch 1 s ahead below 0.7 x margin is not an emergency\n";
+      ++failures;
+    }
+    // Stopping the window before the pinch (the next trajectory takes over) passes.
+    if (!checkTrajectory(pinch, {}, line, I, 50.0, 55.5, p).ok) {
+      std::cerr << "FAIL: the window end was not respected\n";
+      ++failures;
+    }
+    // Inside the first segment the relaxed start margin applies: 0.3 m clears a
+    // 0.3 m start margin less its tolerance, but not the full 0.4 m margin.
+    const auto tight_start = [](double x, double, double) { return x < 2.0 ? 0.3 : 1.0; };
+    p.start_margin = 0.3;
+    if (!checkTrajectory(tight_start, {}, line, I, 50.0, 0.0, p).ok) {
+      std::cerr << "FAIL: relaxed start margin not applied in the first segment\n";
+      ++failures;
+    }
+    p.start_margin = 0.4;
+    if (checkTrajectory(tight_start, {}, line, I, 50.0, 0.0, p).ok) {
+      std::cerr << "FAIL: 0.3 m passed a 0.4 m margin\n";
+      ++failures;
+    }
+    // Never-observed space fails, and is an emergency when close.
+    const auto unknown = [](double x, double, double) { return x > 0.5 && x < 0.7; };
+    const auto u = checkTrajectory(open, unknown, line, I, 50.0, 0.0, p);
+    if (u.ok || !u.emergency || !u.unknown) {
+      std::cerr << "FAIL: never-observed space 1 s ahead not an unsafe emergency\n";
+      ++failures;
+    }
+  }
+
+  // ----------------------------------------------------- region overlap -----
+  // regionOverlapDepth is exact: the radius of the largest ball inside both.
+  {
+    using drone_core::planning::regionOverlapDepth;
+    const ConvexRegion unit = boxRegion({0, 0, 0}, {1, 1, 1});
+    const double slab = regionOverlapDepth(unit, boxRegion({0.5, 0, 0}, {1.5, 1, 1}));
+    if (std::abs(slab - 0.25) > kTol) {
+      std::cerr << "FAIL: overlap of a 0.5 m slab should be a 0.25 m ball, got " << slab << "\n";
+      ++failures;
+    }
+    const double apart = regionOverlapDepth(unit, boxRegion({2, 0, 0}, {3, 1, 1}));
+    if (std::abs(apart + 0.5) > kTol) {
+      std::cerr << "FAIL: boxes 1 m apart should read -0.5, got " << apart << "\n";
+      ++failures;
+    }
+    // Open along z (no z faces at all): a redundant row in the LP. The overlap
+    // is limited by x and y only.
+    auto prism = [](double x0, double x1) {
+      ConvexRegion r;
+      r.A.resize(4, 3);
+      r.b.resize(4);
+      r.A << 1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1, 0;
+      r.b << x1, -x0, 1.0, 0.0;
+      return r;
+    };
+    const double open_z = regionOverlapDepth(prism(0.0, 1.0), prism(0.5, 1.5));
+    if (std::abs(open_z - 0.25) > kTol) {
+      std::cerr << "FAIL: prisms open along z should share a 0.25 m ball, got " << open_z << "\n";
+      ++failures;
+    }
+    const double touching = regionOverlapDepth(unit, boxRegion({1, 0, 0}, {2, 1, 1}));
+    if (std::abs(touching) > kTol) {
+      std::cerr << "FAIL: boxes sharing only a face should read 0, got " << touching << "\n";
+      ++failures;
+    }
+
+    // Regression from the bench, 2026-09-17: the first two shrunk regions of a
+    // real corridor (half-spaces recovered from /planner/corridor). They share
+    // a ball of radius 0.8148 m (checked independently by enumerating every
+    // 4-face vertex of the LP), but away from the path, and the junction
+    // waypoint lies 9 cm outside the first region — so the old check, which only
+    // sampled the lines from that waypoint to the segment midpoints, rejected
+    // the corridor. The exact check must find the overlap.
+    auto region = [](std::initializer_list<std::array<double, 4>> faces) {
+      ConvexRegion r;
+      r.A.resize(static_cast<int>(faces.size()), 3);
+      r.b.resize(static_cast<int>(faces.size()));
+      int i = 0;
+      for (const auto& f : faces) {
+        r.A.row(i) << f[0], f[1], f[2];
+        r.b(i++) = f[3];
+      }
+      return r;
+    };
+    const ConvexRegion bench0 = region({
+        {0.253633, 0.964975, -0.067031, 0.385608},
+        {-0.819543, 0.496981, -0.285237, 0.370587},
+        {0.934736, 0.355342, 0.0, 1.984638},
+        {-0.934736, -0.355342, 0.0, 2.015362},
+        {-0.241592, 0.635515, 0.733317, 1.985221},
+        {0.241592, -0.635515, -0.733317, 1.014779},
+        {0.260578, -0.685458, 0.679887, 2.014106},
+    });
+    const ConvexRegion bench1 = region({
+        {0.438368, 0.395336, -0.807182, -0.371501},
+        {-0.548961, -0.136269, -0.824665, -0.316022},
+        {-0.365535, 0.656330, -0.660011, 0.473293},
+        {0.934736, 0.355342, 0.0, 1.984638},
+        {-0.934736, -0.355342, 0.0, 2.015362},
+        {-0.241592, 0.635515, 0.733317, 2.365489},
+        {0.241592, -0.635515, -0.733317, 0.014779},
+        {0.260578, -0.685458, 0.679887, 2.014106},
+    });
+    const Eigen::Vector3d junction(-0.249, 0.611, 0.732);
+    if (bench0.contains(junction)) {
+      std::cerr << "FAIL: bench regression fixture no longer has the junction outside region 0\n";
+      ++failures;
+    }
+    const double bench = regionOverlapDepth(bench0, bench1);
+    if (std::abs(bench - 0.8148) > 2e-3) {
+      std::cerr << "FAIL: bench regions should share a 0.8148 m ball, got " << bench << "\n";
+      ++failures;
+    }
+  }
+
+  // The LP inside regionOverlapDepth is a hand-written simplex, so check it
+  // against brute force on random polyhedra: the optimum of a 4-variable LP sits
+  // where 4 constraints are active, so enumerating every 4-face combination and
+  // keeping the best feasible one is exact (just too slow for the flight path).
+  // Covers overlapping, touching-ish and disjoint pairs, degenerate faces included.
+  {
+    using drone_core::planning::regionOverlapDepth;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> unif(-1.0, 1.0);
+    auto randomRegion = [&](const Eigen::Vector3d& centre, int faces) {
+      ConvexRegion r;
+      r.A.resize(faces, 3);
+      r.b.resize(faces);
+      for (int f = 0; f < faces; ++f) {
+        Eigen::Vector3d nrm(unif(rng), unif(rng), unif(rng));
+        if (f < 6) nrm = Eigen::Vector3d::Unit(f / 2) * (f % 2 ? -1.0 : 1.0);  // keep it bounded
+        nrm.normalize();
+        r.A.row(f) = nrm;
+        r.b(f) = nrm.dot(centre) + 0.3 + 0.7 * (unif(rng) + 1.0);
+      }
+      return r;
+    };
+    auto bruteForce = [](const ConvexRegion& a, const ConvexRegion& b) {
+      const int m = static_cast<int>(a.A.rows() + b.A.rows());
+      Eigen::MatrixXd M(m, 4);
+      Eigen::VectorXd rhs(m);
+      M << a.A, Eigen::VectorXd::Ones(a.A.rows()), b.A, Eigen::VectorXd::Ones(b.A.rows());
+      rhs << a.b, b.b;
+      double best = -std::numeric_limits<double>::infinity();
+      for (int i = 0; i < m; ++i)
+        for (int j = i + 1; j < m; ++j)
+          for (int k = j + 1; k < m; ++k)
+            for (int l = k + 1; l < m; ++l) {
+              Eigen::Matrix4d S;
+              S << M.row(i), M.row(j), M.row(k), M.row(l);
+              if (std::abs(S.determinant()) < 1e-10) continue;
+              const Eigen::Vector4d z = S.inverse() * Eigen::Vector4d(rhs(i), rhs(j), rhs(k), rhs(l));
+              if (((M * z - rhs).array() <= 1e-9).all()) best = std::max(best, z(3));
+            }
+      return best;
+    };
+    int mismatches = 0;
+    for (int trial = 0; trial < 200; ++trial) {
+      const Eigen::Vector3d ca(unif(rng), unif(rng), unif(rng));
+      const Eigen::Vector3d cb = ca + 2.5 * Eigen::Vector3d(unif(rng), unif(rng), unif(rng));
+      const ConvexRegion ra = randomRegion(ca, 6 + trial % 5);
+      ConvexRegion rb = randomRegion(cb, 6 + (trial / 5) % 5);
+      if (trial % 7 == 0) {  // duplicate a face of `a` into `b`: parallel, coincident rows
+        rb.A.row(0) = ra.A.row(0);
+        rb.b(0) = ra.b(0);
+      }
+      const double expected = bruteForce(ra, rb);
+      const double got = regionOverlapDepth(ra, rb);
+      if (std::abs(got - expected) > 1e-6) {
+        if (mismatches++ < 3) {
+          std::cerr << "FAIL: overlap LP " << got << " vs brute force " << expected << " (trial "
+                    << trial << ")\n";
+        }
+      }
+    }
+    if (mismatches > 0) {
+      std::cerr << "FAIL: overlap LP disagreed with brute force on " << mismatches << "/200 pairs\n";
       ++failures;
     }
   }

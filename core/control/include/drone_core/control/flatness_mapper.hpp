@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "drone_core/common/types.hpp"
 
 namespace drone_core::control {
@@ -18,6 +20,11 @@ public:
     double heading_rate_max{1.5};
     // Speeds below this are treated as a standstill (heading undefined).
     double speed_eps{0.05};
+    // A trajectory with an end heading (Trajectory::end_yaw) turns to it over
+    // its last end_yaw_lead seconds and holds it after, at no more than
+    // end_yaw_rate [rad/s].
+    double end_yaw_lead{1.5};
+    double end_yaw_rate{0.8};
   };
 
   FlatnessMapper() = default;
@@ -34,6 +41,7 @@ public:
 private:
   Params params_;
   double last_yaw_{0.0};
+  double last_now_{std::numeric_limits<double>::quiet_NaN()};  // for the end-yaw rate limit
 };
 
 }  // namespace drone_core::control

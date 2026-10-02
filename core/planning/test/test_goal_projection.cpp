@@ -11,6 +11,7 @@
 #include "drone_core/planning/geometric_planner.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <memory>
@@ -175,6 +176,69 @@ int main() {
       const auto& end = path.back();
       expect(block(end[0], end[1], end[2]) > margin,
              "best-effort path to a buried goal entered the collision margin");
+    }
+  }
+
+  // 10. The escape ramp is floored at the start's own clearance: a drone already
+  //     inside the margin may move away or slide along, but never closer. Start
+  //     0.2 m off the wall; the floor is 0.2 less half a voxel (0.05 here).
+  //     Checked with isPathValid, which needs no solve.
+  {
+    GeometricPlanner planner(empty, /*planning_time=*/0.1);
+    planner.setClearance(wall, /*weight=*/1.0, /*threshold=*/1.0);
+    // 0.1 m toward the wall ends at clearance 0.1: the bare ramp asks only 0.05
+    // there, so this passed before the floor.
+    expect(!planner.isPathValid({{1.8, 0.0, 1.0}, {1.9, 0.0, 1.0}}),
+           "a path from 0.2 m off a wall was allowed to approach it");
+    expect(planner.isPathValid({{1.8, 0.0, 1.0}, {0.0, 0.0, 1.0}}),
+           "a path moving away from a close wall was refused");
+    expect(planner.isPathValid({{1.8, 0.0, 1.0}, {1.8, 0.3, 1.0}}),
+           "a short slide along a close wall at constant clearance was refused");
+  }
+
+  // 11. Short searches must respect their budget. With a clearance cost the
+  //     informed set used to be sampled by rejection from the whole space; with
+  //     start and goal close it was so small that EIT* and ABIT* spun for over a
+  //     minute ignoring the stop condition (bench 2026-09-28/29, improve searches
+  //     with the vehicle near the end of its path). The clearance field keeps the
+  //     cost above path length so the planners keep refining instead of
+  //     stopping at a provably optimal first solution. Coincident start and goal
+  //     must not reach OMPL at all.
+  {
+    const auto near_wall = [](double x, double, double) { return std::max(0.0, 2.0 - x); };
+    for (const PlannerType type : {PlannerType::EITstar, PlannerType::ABITstar, PlannerType::RRTstar}) {
+      for (const double sep : {0.0, 0.02, 0.3}) {
+        GeometricPlanner planner(empty, /*planning_time=*/0.3);
+        planner.setPlannerType(type);
+        planner.setBestEffort(true);
+        planner.setClearance(near_wall, /*weight=*/1.0, /*threshold=*/1.0);
+        std::vector<std::vector<double>> path;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = planner.planPath({1.0, 0.0, 1.0}, {1.0 + sep, 0.0, 1.0}, path);
+        const double took =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        expect(ok && !path.empty(), "short search produced no path");
+        if (took > 1.5) {
+          std::cerr << "FAIL: " << toString(type) << " with start and goal " << sep
+                    << " m apart took " << took << " s against a 0.3 s budget\n";
+          ++failures;
+        }
+      }
+    }
+  }
+
+  // 12. A start outside the search box (bench 2026-09-29: a vehicle at z = -1.62
+  //     under a z >= -1.5 floor) used to be refused by OMPL, so nothing could ever
+  //     be planned from it. The box now grows to hold the start.
+  {
+    GeometricPlanner planner(empty, /*planning_time=*/0.3);
+    planner.setClearance(boxClearance(20, -10, -10, 30, 10, 10), 1.0, 1.0);
+    planner.setBestEffort(true);
+    std::vector<std::vector<double>> path;
+    expect(planner.planPath({0.0, 0.0, -1.62}, {1.0, 0.0, 0.5}, path) && path.size() >= 2,
+           "no path from a start below the search box");
+    if (!path.empty()) {
+      expect(std::abs(path.front()[2] + 1.62) < 1e-6, "path does not start at the given start");
     }
   }
 

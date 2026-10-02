@@ -28,4 +28,10 @@ if(DRONE_CORE_BUILD_TESTS)
   add_executable(test_autonomy_core test/test_autonomy_core.cpp)
   target_link_libraries(test_autonomy_core PRIVATE drone_core_autonomy)
   add_test(NAME autonomy_core COMMAND test_autonomy_core)
+
+  # Goal-directed exploration end to end on synthetic maps (threaded search,
+  # short budgets). A few seconds.
+  add_executable(test_exploration_mission test/test_exploration_mission.cpp)
+  target_link_libraries(test_exploration_mission PRIVATE drone_core_autonomy)
+  add_test(NAME exploration_mission COMMAND test_exploration_mission)
 endif()

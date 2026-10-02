@@ -5,6 +5,7 @@
 #include "drone_core/autonomy/autonomy_core.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -34,7 +35,7 @@ int main() {
   // Synchronous path: drive the core with a controllable clock.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 0.5;
+    cfg.health_timeout = 0.5;
     autonomy::AutonomyCore core(cfg);
 
     double fake_time = 100.0;
@@ -77,6 +78,107 @@ int main() {
     check(core.inHoverHold(), "watchdog fell back to hover-hold when guidance went stale");
   }
 
+  // Divergence: the reference stays fresh by the clock, but the vehicle has
+  // been knocked far away from it. This must trip hover-hold on its own
+  // (independent of stale_timeout, set generously large here so only the
+  // distance check can fire) and, critically, must make the NEXT plan root at
+  // the vehicle's real position rather than splicing onto the abandoned
+  // trajectory's reference.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.health_timeout = 5.0;
+    cfg.max_tracking_error = 1.0;
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    core.setMap(octree);
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+    check(core.planOnce(), "planOnce produced a trajectory");
+
+    fake_time += 0.1;
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.stepControl(0.02);
+    check(!core.inHoverHold(), "tracking right after engaging, undiverged");
+
+    // Knock the vehicle 5 m sideways of the reference without advancing time,
+    // so stale_timeout cannot be what trips this.
+    const Eigen::Vector3d diverged_pos(0.0, 5.0, 1.0);
+    core.setVehicleState(airborneAt(diverged_pos));
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "divergence alone falls back to hover-hold");
+
+    // The next plan must root at the vehicle's ACTUAL position, not wherever
+    // the abandoned trajectory's reference had got to (near the original
+    // start, (0,0,1)) — that would be exactly the bug this fix closes.
+    check(core.planOnce(), "replan after divergence still produces a trajectory");
+    const auto path = core.sampledPlannedPath();
+    check(!path.empty(), "replanned path is sampleable");
+    if (!path.empty()) {
+      const Eigen::Vector3d front(path.front()[0], path.front()[1], path.front()[2]);
+      check((front - diverged_pos).norm() < 0.2,
+            "replan after divergence starts at the real position, not the stale reference");
+    }
+
+    // Still holding before the recovery trajectory's t0: the divergence must be
+    // acted on once, not on every held tick, or this would discard the recovery
+    // trajectory it is waiting for.
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "still holding before the recovery trajectory engages");
+    check(!core.sampledPlannedPath().empty(), "recovery trajectory kept while holding");
+
+    fake_time += 0.1;
+    core.stepControl(0.02);
+    check(!core.inHoverHold(), "recovery trajectory from the real position is tracked");
+  }
+
+  // Bench replan flag. Nothing flies the trajectory, so the drone stays at its
+  // start while the clock runs. A normal replan splices onto where the
+  // trajectory says the drone is by now (further along); with the flag it must
+  // start at the measured position. Both run, so the check proves a difference.
+  for (const bool bench : {false, true}) {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.health_timeout = 5.0;
+    cfg.rrt_solve_time = 0.2;
+    cfg.bench_replan_from_state = bench;
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    core.setMap(octree);
+    const Eigen::Vector3d start(0.0, 0.0, 1.0);
+    core.setVehicleState(airborneAt(start));
+    core.reset();
+
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+    check(core.planOnce(), "bench-flag case: first plan");
+
+    fake_time += 1.5;  // the unflown trajectory has moved on; the drone has not
+    check(core.planOnce(), "bench-flag case: replan");
+    const auto path = core.sampledPlannedPath();
+    check(!path.empty(), "bench-flag case: replan is sampleable");
+    if (!path.empty()) {
+      const double off = (Eigen::Vector3d(path.front()[0], path.front()[1], path.front()[2]) -
+                          start).norm();
+      if (bench) {
+        check(off < 0.05, "BENCH_TEST_REPLAN_DISABLER: replan starts at the measured position");
+      } else {
+        check(off > 0.2, "without the bench flag the replan splices ahead (test contrast)");
+      }
+    }
+  }
+
   // A start at rest is re-anchored to after the solve. The clock jumps 2 s
   // straight after its first read inside planOnce (the splice anchor), as if the
   // solve took that long: with t0 fixed at the anchor, the trajectory would be
@@ -84,7 +186,7 @@ int main() {
   // tick.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 0.5;
+    cfg.health_timeout = 0.5;
     autonomy::AutonomyCore core(cfg);
 
     double fake_time = 100.0;
@@ -135,7 +237,7 @@ int main() {
   //    is sampled in world and converted into map before solving.
   {
     autonomy::AutonomyCore::Config cfg;
-    cfg.stale_timeout = 2.0;
+    cfg.health_timeout = 2.0;
     cfg.rrt_solve_time = 0.2;
     cfg.require_map_to_world = true;
     autonomy::AutonomyCore core(cfg);
@@ -163,6 +265,12 @@ int main() {
 
     check(core.planOnce(), "frames: plans once the transform is set");
     const auto first = core.sampledPlannedPath(0.01);
+    // Plain min-snap has no speed limits, so this trajectory can end before the
+    // splice instant; sampling past the end holds its final (rest) state, so the
+    // splice then lands on its last sample.
+    std::size_t splice_idx = static_cast<std::size_t>(
+        std::lround((0.46 + autonomy::AutonomyCore::kTrajgenLead) / 0.01));
+    if (!first.empty()) splice_idx = std::min(splice_idx, first.size() - 1);
     check(first.size() > 60, "frames: trajectory long enough to splice into");
     if (first.size() > 60) {
       const Eigen::Vector3d start(first.front()[0], first.front()[1], first.front()[2]);
@@ -176,7 +284,8 @@ int main() {
     }
 
     // Engage it (rest start: t0 = 100.04), then replan half a second in while
-    // it is being tracked. The new t0 is 100.54, i.e. 0.50 s into the old one.
+    // it is being tracked. The new t0 is 100.5 + kTrajgenLead, i.e.
+    // 0.46 s + kTrajgenLead into the old one.
     core.stepControl(0.02);
     fake_time += 0.1;
     core.setVehicleState(airborneAt(p_world));
@@ -188,11 +297,77 @@ int main() {
     check(core.planOnce(), "frames: replan while tracking");
     const auto second = core.sampledPlannedPath(0.01);
     if (first.size() > 60 && !second.empty()) {
-      const Eigen::Vector3d old_at_splice(first[50][0], first[50][1], first[50][2]);
+      const Eigen::Vector3d old_at_splice(first[splice_idx][0], first[splice_idx][1],
+                                          first[splice_idx][2]);
       const Eigen::Vector3d new_start(second.front()[0], second.front()[1], second.front()[2]);
       check((new_start - old_at_splice).norm() < 1e-4,
             "frames: replan starts where the outgoing world trajectory is at the splice");
     }
+  }
+
+  // Distance fields are built by setMap, before the map is published, never by
+  // a planner thread. A new map used to make whichever planner asked first build
+  // the field under edt_mutex_, stalling trajectory generation for the length of
+  // the build (bench 2026-09-25: 1.36 s of a 2.10 s replan, past STALE_TIMEOUT).
+  // With a DISTINCT conservative view so both fields (search validity/cost, and
+  // truncation/corridor) are exercised. A live saturation-distance change must
+  // still take effect, which is the one case a planner builds on its own.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.use_corridor_qp = true;
+    cfg.rrt_solve_time = 0.5;
+    autonomy::AutonomyCore core(cfg);
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    for (int ix = -10; ix <= 40; ++ix) {
+      for (int iy = -10; iy <= 10; ++iy) {
+        const double x = ix * 0.1, y = iy * 0.1;
+        octree->updateNode(octomap::point3d(x, y, 0.0), true);
+        for (int iz = 1; iz <= 20; ++iz) {
+          octree->updateNode(octomap::point3d(x, y, iz * 0.1), false);
+        }
+      }
+    }
+    // A conservative grid mirroring the map (no shell), as the node would build.
+    Eigen::Vector3d crop_lo, crop_hi;
+    core.mapCrop(crop_lo, crop_hi);
+    const auto mirror = [&](const octomap::OcTree& t) {
+      return std::make_shared<const planning::ConservativeGrid>(
+          t, octomap::point3d(0, 0, 1), 0.5, crop_lo, crop_hi, /*shell=*/false);
+    };
+    auto conservative = mirror(*octree);
+    core.setMap(octree, conservative);
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+
+    check(core.planOnce(), "prebuilt fields: planOnce produced a trajectory");
+    check(core.plannerFieldBuildCount() == 0,
+          "prebuilt fields: no planner thread built a distance field");
+
+    // A second map arrives: again built before publication, not by the planner.
+    auto octree2 = std::make_shared<octomap::OcTree>(*octree);
+    auto conservative2 = mirror(*octree);
+    core.setMap(octree2, conservative2);
+    fake_time += 1.0;
+    core.planOnce();
+    check(core.plannerFieldBuildCount() == 0,
+          "prebuilt fields: a new map is not built on a planner thread either");
+
+    // Changing the saturation distance live must still rebuild (it used to be
+    // keyed on the map alone and never applied on a static scene) — that is the
+    // fallback, and the only time a planner builds.
+    autonomy::AutonomyCore::Config wider = cfg;
+    wider.clearance_threshold = cfg.clearance_threshold + 0.5;
+    core.applyConfig(wider);
+    fake_time += 1.0;
+    core.planOnce();
+    check(core.plannerFieldBuildCount() > 0,
+          "prebuilt fields: a live CLEARANCE_THRESHOLD change still rebuilds the field");
   }
 
   // Corridor-QP mode: planOnce must route trajgen through the corridor
@@ -251,6 +426,110 @@ int main() {
       if (p[2] < 0.45) above_floor = false;  // corridor margin (0.5) minus tolerance
     }
     check(above_floor, "corridor trajectory keeps the collision margin off the floor");
+  }
+
+  // Config reaches each thread on its own. Planning must see a change without
+  // stepControl ever running (a disarmed bench never calls it), and control must
+  // see one on its first tick. Before the per-thread split, cfg_ was only updated
+  // inside stepControl, so on a disarmed bench no planning parameter ever
+  // changed after launch.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.health_timeout = 5.0;
+    cfg.rrt_solve_time = 0.2;
+    cfg.require_map_to_world = true;  // and no transform is ever set
+    autonomy::AutonomyCore core(cfg);
+
+    double fake_time = 100.0;
+    core.setClock([&fake_time]() { return fake_time; });
+    core.setMap(std::make_shared<octomap::OcTree>(0.1));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.reset();
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(3.0, 0.0, 1.0);
+    core.setGoal(goal);
+    check(!core.planOnce(), "config case: refuses to plan without a map->world transform");
+
+    autonomy::AutonomyCore::Config relaxed = cfg;
+    relaxed.require_map_to_world = false;
+    core.applyConfig(relaxed);
+    check(core.planOnce(), "planning picks up a config change without any stepControl");
+
+    // Control: a tighter stale timeout must be in force from the first tick.
+    autonomy::AutonomyCore::Config tight = relaxed;
+    tight.health_timeout = 0.05;
+    core.applyConfig(tight);
+    core.stepControl(0.02);  // installs the trajectory, stamped now
+    fake_time += 0.1;
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    core.stepControl(0.02);
+    check(core.inHoverHold(), "control picks up a config change on its first tick");
+  }
+
+  // Same for the background worker, on a real clock and without stepControl.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.rrt_solve_time = 0.2;
+    cfg.require_map_to_world = true;
+    autonomy::AutonomyCore core(cfg);
+    core.setMap(std::make_shared<octomap::OcTree>(0.1));
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(2.0, 0.0, 1.0);
+    core.setGoal(goal);
+    core.startPlanner();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    check(!core.hasCommittedPath(), "worker idles while the config requires a transform");
+
+    autonomy::AutonomyCore::Config relaxed = cfg;
+    relaxed.require_map_to_world = false;
+    core.applyConfig(relaxed);
+    bool planned = false;
+    for (int i = 0; i < 40 && !planned; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      planned = core.hasCommittedPath();
+    }
+    core.stopPlanner();
+    check(planned, "worker picks up a config change without any stepControl");
+  }
+
+  // Search and trajgen run on SEPARATE threads: a slow geometric search must not
+  // stop a trajectory from being produced. And with the trajectory monitor, a
+  // trajectory is then FOLLOWED rather than regenerated on a timer: with nothing
+  // changing (no new plan, nothing unsafe, no stop point to advance), only the
+  // improve timer can produce another, and only once per traj_improve_period.
+  {
+    autonomy::AutonomyCore::Config cfg;
+    cfg.require_map_to_world = false;
+    cfg.plan_trajectory = true;
+    cfg.use_corridor_qp = false;      // plain min-snap: trajgen itself stays cheap
+    cfg.treat_unknown_as_hazard = false;
+    cfg.bench_replan_from_state = true;  // no stepControl here, so never splice ahead
+    cfg.rrt_solve_time = 1.0;         // each search takes about a second
+    cfg.rrt_monitor_period = 0.05;
+    cfg.rrt_improve_period = 0.05;    // improve every tick => a search is ~always running
+    cfg.traj_improve_period = 60.0;   // no trajectory improve inside this test
+    autonomy::AutonomyCore core(cfg);
+
+    auto octree = std::make_shared<octomap::OcTree>(0.1);
+    octree->updateNode(octomap::point3d(1.0f, 2.0f, 1.0f), true);  // improve needs obstacles
+    core.setMap(octree);
+    core.setVehicleState(airborneAt(Eigen::Vector3d(0.0, 0.0, 1.0)));
+    common::Goal goal;
+    goal.pos = Eigen::Vector3d(2.0, 0.0, 1.0);
+    core.setGoal(goal);
+    core.startPlanner();
+
+    // Wait for the first search to produce a committed path and the first
+    // trajectory off it, while the search thread stays busy.
+    bool staged = false;
+    for (int i = 0; i < 60 && !staged; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      staged = core.stagedTrajectoryCount() > 0;
+    }
+    core.stopPlanner();
+    check(staged, "split threads: a trajectory is staged while the search thread is busy");
   }
 
   // Background planner thread: should plan and stage without help.

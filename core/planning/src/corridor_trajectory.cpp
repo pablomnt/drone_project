@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
-#include <nlopt.hpp>
 #include <osqp.h>
 
 #include "drone_core/common/logging.hpp"
@@ -131,7 +134,9 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
                                           const std::vector<ConvexRegion>& regions,
                                           common::Trajectory& out,
                                           double* cost_out,
-                                          const std::vector<Eigen::Vector3d>* pin_waypoints) const {
+                                          const std::vector<Eigen::Vector3d>* pin_waypoints,
+                                          const std::vector<Eigen::Vector3d>* path_waypoints,
+                                          double* path_cost_out, std::string* status_out) const {
   const int S = static_cast<int>(times.size());
   if (S < 1 || regions.size() != times.size()) return false;
   // Pinning needs one waypoint per segment boundary. A mismatched list is a
@@ -169,6 +174,82 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
     const Eigen::MatrixXd Qs = 2.0 * snapCostBlock(1.0) / std::pow(times[s], 7);
     for (int ax = 0; ax < kAxes; ++ax) {
       P.block(idx(s, ax), idx(s, ax), kCoeffs, kCoeffs) = Qs;
+    }
+  }
+
+  // Bezier position control points as a linear map of the scaled coefficients:
+  // control point j of a segment is G_pos.row(j) . ct. Hoisted here because both
+  // the corridor face rows below and the path term just under it need it.
+  const Eigen::MatrixXd G_pos = bezierControlRows(0, 1.0);
+
+  // Linear term. Zero for pure minimum-snap; the path term below is the only
+  // thing that ever writes it, since every other cost here is a pure quadratic
+  // form in the coefficients.
+  Eigen::VectorXd q_vec = Eigen::VectorXd::Zero(n);
+
+  // Path-following term (see setPathWeight). Pull each segment's position
+  // control points toward the straight chord between its two waypoints:
+  //
+  //   lambda * sum_j || G_pos.row(j) . ct  -  chord(j) ||^2
+  //
+  // Expanded into OSQP's 0.5 x'Px + q'x that is P += 2*lambda*G'G and
+  // q += -2*lambda*G'chord, per segment per axis. The dropped constant
+  // lambda*||chord||^2 does not move the minimiser; the reported cost below is
+  // recomputed from the solution rather than read off obj_val, so it is not
+  // missing from the numbers either.
+  //
+  // Divided by kCoeffs so the weight means "per unit of MEAN squared deviation"
+  // and does not silently change meaning if the polynomial degree ever does, and
+  // weighted by each segment's CHORD LENGTH so the sum approximates the integral
+  // of squared deviation over path length. Without that length factor the term
+  // is extensive in the number of segments rather than in distance: every
+  // segment contributes eight control points whether it spans 2 m or 15 cm, so
+  // splitting a segment in two would double its share of the penalty. That is
+  // not hypothetical here — MAX_SEGMENT_LEN, the start relaxation's split at
+  // ESCAPE_RAMP_DIST and the thin-joint repair all change the segment count for
+  // reasons that have nothing to do with how direct the trajectory should be, and
+  // the weight would otherwise have to be retuned every time they did. Snap and
+  // the time penalty are both extensive in time, so this also makes all three
+  // terms scale consistently with the size of the problem.
+  //
+  // What this does NOT buy: a result invariant to how the path is chopped. More
+  // waypoints genuinely say more about the intended shape — each segment's eight
+  // targets cluster along its own chord — so a finely split corridor is pulled
+  // harder toward the plan at the same weight (measured: 0.19 m of corner
+  // deviation over two segments against 0.05 m over four). That is the term
+  // working, not a scaling bug. What the length factor fixes is the penalty
+  // DENSITY: cost per metre of path rather than per segment, so the weight keeps
+  // one meaning rather than drifting with the segment count.
+  //
+  // Note also that the targets are points along the chord, not the chord as a
+  // set, so the term penalises being at the wrong place ALONG the path as well as
+  // off it — it pulls toward a roughly uniform traversal of each segment too.
+  const bool use_path = path_weight_ > 0.0 && path_waypoints != nullptr &&
+                        static_cast<int>(path_waypoints->size()) == S + 1;
+  const double path_lambda = use_path ? path_weight_ / kCoeffs : 0.0;
+  // Per-segment weight, chord length included. Also read back after the solve to
+  // report the term, so it is computed once here.
+  std::vector<double> path_seg_lambda(use_path ? S : 0, 0.0);
+  if (use_path) {
+    const std::vector<Eigen::Vector3d>& wp = *path_waypoints;
+    // Same for every segment and axis: only the chord targets and length differ.
+    const Eigen::MatrixXd GtG = G_pos.transpose() * G_pos;
+    for (int s = 0; s < S; ++s) {
+      // A zero-length segment gets no pull, which is right: it has no chord to
+      // be pulled toward. resamplePath never emits consecutive duplicates, so
+      // this is a guard rather than a case.
+      path_seg_lambda[s] = path_lambda * (wp[s + 1] - wp[s]).norm();
+      if (path_seg_lambda[s] <= 0.0) continue;
+      for (int ax = 0; ax < kAxes; ++ax) {
+        Eigen::VectorXd chord(kCoeffs);
+        for (int j = 0; j < kCoeffs; ++j) {
+          const double u = static_cast<double>(j) / (kCoeffs - 1);
+          chord(j) = wp[s](ax) + u * (wp[s + 1](ax) - wp[s](ax));
+        }
+        P.block(idx(s, ax), idx(s, ax), kCoeffs, kCoeffs) += 2.0 * path_seg_lambda[s] * GtG;
+        q_vec.segment(idx(s, ax), kCoeffs) -=
+            2.0 * path_seg_lambda[s] * G_pos.transpose() * chord;
+      }
     }
   }
 
@@ -257,7 +338,6 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   // every face A_f . r_j <= b_f — one row per (face, control point) spanning
   // the three axis blocks. The Bezier hull property lifts the control-point
   // bound to the whole curve.
-  const Eigen::MatrixXd G_pos = bezierControlRows(0, 1.0);
   for (int s = 0; s < S; ++s) {
     for (int f = 0; f < regions[s].A.rows(); ++f) {
       for (int j = 0; j < kCoeffs; ++j) {
@@ -293,7 +373,7 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
                    const_cast<OSQPFloat*>(Pc.x.data()), static_cast<OSQPInt>(Pc.x.size()), -1, 0};
   OSQPCscMatrix Am{m, n, const_cast<OSQPInt*>(Ac.p.data()), const_cast<OSQPInt*>(Ac.i.data()),
                    const_cast<OSQPFloat*>(Ac.x.data()), static_cast<OSQPInt>(Ac.x.size()), -1, 0};
-  const std::vector<OSQPFloat> q(n, 0.0);
+  const std::vector<OSQPFloat> q(q_vec.data(), q_vec.data() + n);
 
   OSQPSettings settings;
   osqp_set_default_settings(&settings);
@@ -303,7 +383,7 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   settings.eps_rel = 1e-5;
   // A well-conditioned (tau-normalized) solve converges quickly; only
   // near-infeasible probes from the outer time search grind longer. Cap them
-  // well below OSQP's 4000 default so a whole BOBYQA search stays cheap — an
+  // well below OSQP's 4000 default so a whole time search stays cheap — an
   // unconverged probe is treated as infeasible, which is what it borders on.
   settings.max_iter = 1000;
 
@@ -320,26 +400,53 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
   }
 
   bool ok = true;
-  double cost = 0.0;
   Eigen::VectorXd sol;
   if (osqp_solve(solver) != 0) {
     // API-level failure (not a solve outcome) — always worth a line.
     DRONE_LOG_ERROR("[corridor-qp] OSQP solve error");
     ok = false;
   } else if (solver->info->status_val != OSQP_SOLVED) {
+    if (status_out) *status_out = solver->info->status;
     // Primal infeasible, or unconverged at the iteration cap (which only
     // happens bordering infeasibility) — either way there is no trustworthy
     // trajectory. Silent: the outer time search probes this region on every
-    // run and scores it as a penalty; the caller's fallback does the one-line
-    // reporting if a *final* solve ends up here.
+    // run and simply rejects the allocation; it reports the status itself if
+    // no allocation is ever accepted.
     ok = false;
   } else {
     sol = Eigen::Map<const Eigen::VectorXd>(
         reinterpret_cast<const double*>(solver->solution->x), n);
-    cost = solver->info->obj_val;
   }
   osqp_cleanup(solver);
   if (!ok) return false;
+
+  // Split the objective for the caller: the time search minimises their sum,
+  // the debug line wants them apart, and obj_val gives neither (it lumps the two
+  // together and is short by the path term's dropped constant). Recomputing from
+  // the solution is a handful of 8x8 quadratic forms, so it costs nothing next to
+  // the solve itself.
+  double snap_cost = 0.0;
+  double path_cost = 0.0;
+  {
+    const Eigen::MatrixXd Q1 = snapCostBlock(1.0);
+    for (int s = 0; s < S; ++s) {
+      const double inv_t7 = 1.0 / std::pow(times[s], 7);
+      for (int ax = 0; ax < kAxes; ++ax) {
+        const Eigen::VectorXd ct = sol.segment(idx(s, ax), kCoeffs);
+        // 0.5 x'Px with P = 2Q/T^7.
+        snap_cost += inv_t7 * ct.dot(Q1 * ct);
+        if (use_path) {
+          const std::vector<Eigen::Vector3d>& wp = *path_waypoints;
+          Eigen::VectorXd chord(kCoeffs);
+          for (int j = 0; j < kCoeffs; ++j) {
+            const double u = static_cast<double>(j) / (kCoeffs - 1);
+            chord(j) = wp[s](ax) + u * (wp[s + 1](ax) - wp[s](ax));
+          }
+          path_cost += path_seg_lambda[s] * (G_pos * ct - chord).squaredNorm();
+        }
+      }
+    }
+  }
 
   out = common::Trajectory{};
   out.segment_times = times;
@@ -353,45 +460,90 @@ bool CorridorTrajectoryOptimizer::solveQP(const common::MotionState& start,
     out.coeffs_z.push_back(sol.segment(idx(s, 2), kCoeffs).cwiseProduct(rescale));
     out.total_duration += times[s];
   }
-  if (cost_out) *cost_out = cost;
+  if (cost_out) *cost_out = snap_cost;
+  if (path_cost_out) *path_cost_out = path_cost;
   return true;
 }
 
 namespace {
 
-// Context handed to the NLopt objective (mirrors TimeOptimizerContext for the
-// plain min-snap optimiser).
-struct CorridorTimeContext {
-  const CorridorTrajectoryOptimizer* solver;
-  common::MotionState start;
-  Eigen::Vector3d goal;
-  const std::vector<ConvexRegion>* regions;
-  double time_penalty;
-  double infeasible_penalty;
-  // Null when junctions are free; otherwise the waypoints the curve must pass
-  // through. The time search has to solve the SAME problem the final solve
-  // will, or it optimises an allocation for a shape that is never built.
-  const std::vector<Eigen::Vector3d>* pin_waypoints;
-};
+// Extra time a jerk-limited ramp from rest to vmax takes over covering the same
+// distance at vmax. The ramp is symmetric in acceleration, so its average speed
+// is vmax / 2 and the extra is half its duration T. With a constant-acceleration
+// phase (vmax >= amax^2 / jmax) T = vmax / amax + amax / jmax; without one the
+// acceleration peaks at sqrt(vmax * jmax) and T = 2 * sqrt(vmax / jmax).
+double restAllowance(const CorridorLimits& lim) {
+  if (lim.vmax <= 0.0 || lim.amax <= 0.0 || lim.jmax <= 0.0) return 0.0;
+  const double ramp = lim.vmax >= lim.amax * lim.amax / lim.jmax
+                          ? lim.vmax / lim.amax + lim.amax / lim.jmax
+                          : 2.0 * std::sqrt(lim.vmax / lim.jmax);
+  return 0.5 * ramp;
+}
 
-// Feasibility-aware objective: QP snap cost + time penalty for a candidate
-// allocation, or a large flat penalty when the QP is infeasible at these times
-// (too short for the limits / corridor), which pushes BOBYQA back toward the
-// feasible region the generous seed starts in.
-double corridorTimeObjective(const std::vector<double>& x, std::vector<double>& grad,
-                             void* data) {
-  (void)grad;
-  const auto* ctx = static_cast<const CorridorTimeContext*>(data);
-  double total = 0.0;
-  for (double t : x) total += t;
-
-  common::Trajectory traj;
-  double cost = 0.0;
-  if (!ctx->solver->solveQP(ctx->start, ctx->goal, x, *ctx->regions, traj, &cost,
-                            ctx->pin_waypoints)) {
-    return ctx->infeasible_penalty;
+// Partition the segments into groups that turn the same way, for the per-group
+// time cuts in optimizeTrajectory. Returns [first, last] segment index pairs
+// covering 0..S-1 in order. The decision is made at the joints (the turn from
+// one segment's direction to the next):
+//   - a joint turning at most `straight_angle` is straight, and its direction is
+//     ignored (the turn axis of a near-zero turn is noise);
+//   - a straight joint continues the group, unless that group is an arc: then
+//     the arc's last segment runs from its final turn into this straight joint,
+//     so it opens the new straight group rather than closing the arc;
+//   - a turning joint continues the group only when the joint before it was the
+//     same turn (angle within `turn_tolerance`, axis within `axis_tolerance`) —
+//     an arc. Anything else opens a new group.
+// So a sharp corner between two straights is a boundary between two straight
+// groups, and an arc's group holds the segments that lie between two of its
+// matching turns.
+std::vector<std::pair<int, int>> groupSegments(const std::vector<Eigen::Vector3d>& waypoints,
+                                               double straight_angle, double turn_tolerance,
+                                               double axis_tolerance) {
+  const int S = static_cast<int>(waypoints.size()) - 1;
+  std::vector<Eigen::Vector3d> dir(S);
+  for (int s = 0; s < S; ++s) {
+    const Eigen::Vector3d d = waypoints[s + 1] - waypoints[s];
+    const double n = d.norm();
+    dir[s] = n > 1e-9 ? Eigen::Vector3d(d / n) : Eigen::Vector3d::Zero();
   }
-  return cost + ctx->time_penalty * total;
+  struct Turn {
+    double angle;          // [rad]
+    Eigen::Vector3d axis;  // unit, zero when there is no turn to speak of
+  };
+  // Joint j sits between segments j - 1 and j.
+  const auto turnAt = [&dir](int j) {
+    const Eigen::Vector3d c = dir[j - 1].cross(dir[j]);
+    const double cn = c.norm();
+    return Turn{std::atan2(cn, dir[j - 1].dot(dir[j])),
+                cn > 1e-9 ? Eigen::Vector3d(c / cn) : Eigen::Vector3d::Zero()};
+  };
+  const auto isTurn = [straight_angle](const Turn& t) { return t.angle > straight_angle; };
+  const double cos_axis = std::cos(axis_tolerance);
+  const auto sameTurn = [&](const Turn& a, const Turn& b) {
+    return isTurn(a) && isTurn(b) && std::abs(a.angle - b.angle) <= turn_tolerance &&
+           a.axis.dot(b.axis) >= cos_axis;
+  };
+
+  std::vector<std::pair<int, int>> groups{{0, 0}};
+  enum class Kind { kSingle, kStraight, kArc } kind = Kind::kSingle;  // of groups.back()
+  for (int j = 1; j < S; ++j) {
+    const Turn t = turnAt(j);
+    if (!isTurn(t)) {
+      if (kind == Kind::kArc) {
+        --groups.back().second;  // an arc group has >= 2 segments, so this leaves one
+        groups.push_back({j - 1, j});
+      } else {
+        groups.back().second = j;
+      }
+      kind = Kind::kStraight;
+    } else if (j >= 2 && sameTurn(turnAt(j - 1), t)) {
+      groups.back().second = j;
+      kind = Kind::kArc;
+    } else {
+      groups.push_back({j, j});
+      kind = Kind::kSingle;
+    }
+  }
+  return groups;
 }
 
 }  // namespace
@@ -402,68 +554,306 @@ bool CorridorTrajectoryOptimizer::optimizeTrajectory(
     bool pin_waypoints) const {
   if (waypoints.size() < 2 || regions.size() != waypoints.size() - 1) return false;
   const int S = static_cast<int>(regions.size());
-  // Passed to every solve below, the seed-growth probe and the BOBYQA objective
-  // included: the allocation being searched has to be an allocation for the
-  // shape actually being built.
+  // Passed to every solve below: the allocation being searched has to be an
+  // allocation for the shape actually being built.
   const std::vector<Eigen::Vector3d>* pin = pin_waypoints ? &waypoints : nullptr;
+  const auto t_begin = std::chrono::steady_clock::now();
+  const auto elapsed = [&t_begin]() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_begin).count();
+  };
+  const auto since = [](std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  };
+  const auto withinBudget = [&]() {
+    if (abort_flag_ && abort_flag_->load()) return false;
+    return time_budget_ <= 0.0 || elapsed() < time_budget_;
+  };
+  const auto sum = [](const std::vector<double>& v) {
+    double t = 0.0;
+    for (double x : v) t += x;
+    return t;
+  };
+
+  // Every stage below only ever replaces `times` with an allocation the QP has
+  // just accepted, and solveQP leaves its output untouched on failure, so `best`
+  // always holds the trajectory for the current `times` — no final re-solve.
+  common::Trajectory best;
+  double best_snap = 0.0;
+  double best_path = 0.0;
+  // OSQP's own word for why the most recent solve was rejected; see the growth
+  // failure below.
+  std::string last_status;
+  const auto trySolve = [&](const std::vector<double>& t) {
+    double snap = 0.0;
+    double path = 0.0;
+    last_status.clear();
+    if (!solveQP(start, waypoints.back(), t, regions, best, &snap, pin, &waypoints, &path,
+                 &last_status)) {
+      return false;
+    }
+    best_snap = snap;
+    best_path = path;
+    return true;
+  };
 
   // Velocity-consistent seed: long enough to traverse each segment at vmax with
-  // some slack. BOBYQA must start on the feasible side (the infeasible region
-  // scores a flat penalty, so a search started inside it is blind), and
-  // "len/vmax + buffer" alone can still be infeasible once the accel/jerk ramps
-  // and the conservative Bezier hull bite — so grow the whole allocation
-  // geometrically until the QP accepts it before searching.
+  // some slack. "len/vmax + buffer" alone can still be infeasible once the
+  // accel/jerk ramps and the conservative Bezier hull bite, so the whole
+  // allocation is then grown geometrically until the QP accepts it.
   std::vector<double> times(S);
   for (int s = 0; s < S; ++s) {
     times[s] = (waypoints[s + 1] - waypoints[s]).norm() / limits_.vmax + kSeedBuffer;
   }
-  // A moving start needs time to shed that speed on top of the traversal, and
-  // the seed above knows nothing about it — at the old rest start this term was
-  // always zero. Charge the whole braking time to the first segment: it is only
-  // a seed, and BOBYQA redistributes it. Without this a fast replan starts the
-  // search inside the infeasible region and burns growth iterations getting out.
-  times[0] += limits_.amax > 0.0 ? start.vel.cwiseAbs().maxCoeff() / limits_.amax : 0.0;
+  // Starting from or stopping at rest costs time the len/vmax seed knows nothing
+  // about. The seed's proportions matter more than its total: growth and
+  // bisection scale every segment alike, so an end segment seeded too short sets
+  // the factor for all of them and slows the middle down with it. The cost is
+  // what a jerk-limited ramp from rest to vmax takes over cruising the same
+  // distance — half the ramp's duration, since its average speed is vmax / 2
+  // (about 0.58 s at vmax 1, amax 1.5, jmax 3). Nearly all of it falls in the
+  // first ~0.3 m, where the vehicle is slowest, so it goes wholly to the end
+  // segment however short that is. The last segment always ends at rest; the
+  // first only starts there when the start is (near) stationary.
+  if (start_boost_len_ > 0.0) {
+    double arc = 0.0;
+    for (int s = 0; s < S; ++s) {
+      if (arc < start_boost_len_ - 1e-9) times[s] *= start_boost_factor_;
+      arc += (waypoints[s + 1] - waypoints[s]).norm();
+    }
+  }
+  const double rest_allowance = restAllowance(limits_);
+  times.back() += rest_allowance;
+  if (start.vel.norm() < kRestSpeed) {
+    times[0] += rest_allowance;
+  } else if (limits_.amax > 0.0) {
+    // A moving start needs time to shed that speed on top of the traversal.
+    // Charge the whole braking time to the first segment: it is only a seed.
+    // Without this a fast replan starts inside the infeasible region and burns
+    // growth iterations getting out.
+    times[0] += start.vel.cwiseAbs().maxCoeff() / limits_.amax;
+  }
+
+  // Debug accounting for the one-line breakdown below (debug_ only).
+  const double seed_total = sum(times);
+  int grow_solves = 0;
+  int shrink_steps = 0;  // x1/1.5 steps accepted when the seed was feasible at once
+  double grow_time = 0.0;
+  double grown_total = 0.0;
+  int bisect_solves = 0;
+  double bisect_time = 0.0;
+  double bisected_total = 0.0;
+  double bisect_gap = 0.0;  // final (hi - lo) / lo of the bracket
+  struct PassLog {
+    double cut = 0.0;  // middle-segment fraction tried
+    int tried = 0;
+    int accepted = 0;
+    double before = 0.0;
+    double after = 0.0;
+    double time = 0.0;
+    // Per group, in path order: 1 accepted, 0 rejected, -1 not tried (budget).
+    std::vector<int> outcome;
+  };
+  std::vector<std::pair<int, int>> groups;
+  std::vector<PassLog> passes;
+  bool budget_hit = false;
+  const auto report = [&](const std::string& outcome, const common::Trajectory* result) {
+    if (!debug_) return;
+    std::ostringstream os;
+    os << "[corridor-qp] " << S << " segments | stage 1: " << grow_time << " s, " << grow_solves
+       << " QP solve(s), seed " << seed_total << " s -> " << grown_total << " s";
+    if (shrink_steps > 0) os << " (shrunk " << shrink_steps << "x)";
+    os << " | ";
+    if (bisect_solves == 0) {
+      os << "bisect: not run | ";
+    } else {
+      os << "bisect: " << bisect_time << " s, " << bisect_solves << " QP solve(s) -> "
+         << bisected_total << " s (bracket " << 100.0 * bisect_gap << "%) | ";
+    }
+    if (groups.empty()) {
+      os << "groups: not formed | ";
+    } else {
+      os << "groups: " << groups.size() << " [";
+      for (size_t g = 0; g < groups.size(); ++g) {
+        os << (g ? " " : "") << groups[g].first;
+        if (groups[g].second != groups[g].first) os << "-" << groups[g].second;
+      }
+      os << "] | ";
+    }
+    for (const auto& p : passes) {
+      os << "cut " << 100.0 * p.cut << "%: " << p.accepted << "/" << p.tried << " accepted [";
+      for (size_t g = 0; g < groups.size(); ++g) {
+        os << (g ? " " : "") << groups[g].first;
+        if (groups[g].second != groups[g].first) os << "-" << groups[g].second;
+        os << (p.outcome[g] > 0 ? " ✓" : p.outcome[g] == 0 ? " ✗" : " not tried");
+      }
+      os << "], " << p.before << " s -> " << p.after << " s, " << p.time << " s | ";
+    }
+    if (budget_hit) os << "[budget hit] | ";
+    os << "total " << elapsed() << " s | " << outcome;
+    if (result) {
+      os << ", trajectory " << result->total_duration << " s | cost: snap " << best_snap;
+      if (path_weight_ > 0.0) os << " + path " << best_path;
+    }
+    DRONE_LOG_INFO(os.str());
+  };
+
+  // Stage 1: grow until feasible. Not cut short by the budget: until a feasible
+  // allocation exists there is nothing to fall back on.
+  int grow = 0;
+  // Whether times / 1.5 is known infeasible, which is what the bisection needs.
+  bool bracketed = false;
   {
-    common::Trajectory probe;
-    int grow = 0;
-    while (grow < kMaxSeedGrowth &&
-           !solveQP(start, waypoints.back(), times, regions, probe, nullptr, pin)) {
+    const auto t_grow = std::chrono::steady_clock::now();
+    bool feasible = false;
+    while (true) {
+      ++grow_solves;
+      feasible = trySolve(times);
+      if (feasible || grow >= kMaxSeedGrowth) break;
       for (double& t : times) t *= 1.5;
       ++grow;
     }
+    bracketed = feasible && grow > 0;
     // Note this cannot rescue a corridor that is simply too SHORT to stop in:
     // braking from v0 inside distance d needs a >= v0^2/(2d) whatever the time
     // allocation, so stretching time does not help. That is a real physical
     // refusal (the committed prefix is shorter than the stopping distance) and
     // the caller must treat it as "no trajectory", not as a tuning failure.
-    if (grow == kMaxSeedGrowth) return false;  // corridor unusable at any sane duration
+    if (!feasible) {  // corridor unusable at any sane duration
+      grow_time = since(t_grow);
+      grown_total = sum(times);
+      // Say WHICH rejection it was. OSQP reporting "primal infeasible" means the
+      // corridor genuinely admits no such curve; "maximum iterations reached" or
+      // a polish failure means the solver ran out of road on a hard problem and
+      // the code's treat-as-infeasible rule fired. Those want opposite responses
+      // — look at the geometry versus loosen the solver or whatever is driving
+      // the optimum onto a constraint boundary (TRAJ_PATH_WEIGHT, a start pinned
+      // millimetres inside region 0) — and they were indistinguishable in the log.
+      report("FAILED (no feasible allocation within the seed growth; OSQP said \"" +
+                 (last_status.empty() ? std::string("unknown") : last_status) + "\")",
+             nullptr);
+      return false;
+    }
+    // A seed feasible at once gives the bisection nothing to bracket from below,
+    // and may itself be well past the shortest feasible allocation. Shrink it
+    // x1/1.5 until the QP refuses, keeping each accepted step; the refusal is the
+    // bracket's lower end. Unlike growth this is cut short by the budget — there
+    // is already a feasible allocation to fall back on.
+    if (grow == 0) {
+      std::vector<double> trial(S);
+      while (shrink_steps < kMaxSeedGrowth) {
+        if (!withinBudget()) {
+          budget_hit = true;
+          break;
+        }
+        for (int s = 0; s < S; ++s) trial[s] = times[s] / 1.5;
+        ++grow_solves;
+        if (!trySolve(trial)) {
+          bracketed = true;
+          break;
+        }
+        times = trial;
+        ++shrink_steps;
+      }
+    }
+    grow_time = since(t_grow);
+    grown_total = sum(times);
   }
 
-  CorridorTimeContext ctx{this,         start,              waypoints.back(), &regions,
-                          kTimePenalty, kInfeasiblePenalty, pin};
+  // Stage 2: bisect the growth's last step. Growth multiplies every segment by
+  // 1.5, so it can land up to 50% past the shortest feasible allocation. From
+  // rest, stretching every segment by one factor leaves the curve's shape
+  // unchanged and only scales its derivatives down, so feasibility is monotone
+  // in the factor and the bracket [previous step, this step] holds exactly one
+  // switch. With a moving start the fixed start velocity breaks the scaling
+  // slightly, so the switch is only approximately single — harmless, since `hi`
+  // is always an allocation the QP accepted and a wrongly-rejected midpoint only
+  // leaves the result a little longer. Needs a known-infeasible end: the step
+  // before growth's last, or the step shrinking refused.
+  if (bracketed) {
+    const auto t_bisect = std::chrono::steady_clock::now();
+    const std::vector<double> base = times;  // feasible, at factor 1
+    double lo = 1.0 / 1.5;                   // infeasible (growth's previous or shrink's refused step)
+    double hi = 1.0;
+    std::vector<double> trial(S);
+    while ((hi - lo) / lo > kBisectGap) {
+      if (!withinBudget()) {
+        budget_hit = true;
+        break;
+      }
+      const double mid = 0.5 * (lo + hi);
+      for (int s = 0; s < S; ++s) trial[s] = base[s] * mid;
+      ++bisect_solves;
+      if (trySolve(trial)) {
+        hi = mid;
+      } else {
+        lo = mid;
+      }
+    }
+    for (int s = 0; s < S; ++s) times[s] = base[s] * hi;
+    bisect_gap = (hi - lo) / lo;
+    bisect_time = since(t_bisect);
+  }
+  bisected_total = sum(times);
 
-  nlopt::opt optimizer(nlopt::LN_BOBYQA, S);
-  optimizer.set_min_objective(corridorTimeObjective, &ctx);
-  optimizer.set_lower_bounds(std::vector<double>(S, kMinSegmentTime));
-  optimizer.set_xtol_rel(1e-2);
-  optimizer.set_maxeval(kMaxEvals);
-
-  double min_cost = 0.0;
-  try {
-    optimizer.optimize(times, min_cost);
-  } catch (const std::exception& e) {
-    // BOBYQA trouble is not fatal: fall through and try the QP at whatever
-    // times we have (the seed if it never improved).
-    DRONE_LOG_INFO("[corridor-qp] time search failed (" << e.what()
-                   << "), using current allocation");
+  // Stage 3: per-group cuts. Uniform scaling makes every segment wait for the
+  // tightest one, so segments with slack — typically the straights either side
+  // of a corner — are left slower than they need to be. Cutting a segment on its
+  // own puts a speed step at both its joints, which the jerk limit often
+  // refuses even when cutting its neighbours with it would pass, so segments
+  // that turn alike are cut together (see groupSegments). A group's two end
+  // segments take only group_edge_factor_ of the cut, easing the speed change
+  // into its neighbours. Two passes, the full cut then half of it, each over
+  // every group, longest (in time) first so a budget cut-off drops the least
+  // valuable tries. Every try re-solves the whole trajectory, so a kept cut can
+  // never be broken by a later one.
+  if (!budget_hit && group_cut_ > 0.0) {
+    groups = groupSegments(waypoints, kGroupStraightAngle, kGroupTurnTolerance,
+                           kGroupAxisTolerance);
+    std::vector<double> trial(S);
+    for (const double cut : {group_cut_, 0.5 * group_cut_}) {
+      if (budget_hit) break;
+      PassLog log;
+      log.cut = cut;
+      log.before = sum(times);
+      log.outcome.assign(groups.size(), -1);
+      const auto t_pass = std::chrono::steady_clock::now();
+      std::vector<int> order(groups.size());
+      std::vector<double> group_time(groups.size(), 0.0);
+      for (size_t g = 0; g < groups.size(); ++g) {
+        order[g] = static_cast<int>(g);
+        for (int s = groups[g].first; s <= groups[g].second; ++s) group_time[g] += times[s];
+      }
+      std::stable_sort(order.begin(), order.end(),
+                       [&](int a, int b) { return group_time[a] > group_time[b]; });
+      for (const int g : order) {
+        if (!withinBudget()) {
+          budget_hit = true;
+          break;
+        }
+        trial = times;
+        const auto [first, last] = groups[g];
+        for (int s = first; s <= last; ++s) {
+          const bool edge = s == first || s == last;
+          const double frac = edge ? group_edge_factor_ * cut : cut;
+          trial[s] = std::max(kMinSegmentTime, times[s] * (1.0 - frac));
+        }
+        ++log.tried;
+        log.outcome[g] = 0;
+        if (trySolve(trial)) {
+          times = trial;
+          ++log.accepted;
+          log.outcome[g] = 1;
+        }
+      }
+      log.after = sum(times);
+      log.time = since(t_pass);
+      passes.push_back(log);
+    }
   }
 
-  // Final solve at the chosen allocation. The search started feasible, but
-  // BOBYQA returns its lowest evaluated point, which can sit just inside the
-  // infeasible boundary; retry once with a modest stretch before giving up.
-  if (solveQP(start, waypoints.back(), times, regions, out, nullptr, pin)) return true;
-  for (double& t : times) t *= 1.5;
-  return solveQP(start, waypoints.back(), times, regions, out, nullptr, pin);
+  out = best;
+  report("OK", &out);
+  return true;
 }
 
 }  // namespace drone_core::planning

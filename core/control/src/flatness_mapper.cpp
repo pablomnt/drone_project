@@ -1,5 +1,6 @@
 #include "drone_core/control/flatness_mapper.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include "drone_core/common/trajectory_eval.hpp"
@@ -8,10 +9,13 @@ namespace drone_core::control {
 
 void FlatnessMapper::reset(double initial_yaw) {
   last_yaw_ = initial_yaw;
+  last_now_ = std::numeric_limits<double>::quiet_NaN();
 }
 
 common::Reference FlatnessMapper::sample(const common::Trajectory& traj, double now) {
   common::Reference ref;
+  const double dt = std::isfinite(last_now_) ? std::clamp(now - last_now_, 0.0, 0.1) : 0.0;
+  last_now_ = now;
   if (traj.empty()) {
     ref.yaw = last_yaw_;
     return ref;
@@ -22,9 +26,29 @@ common::Reference FlatnessMapper::sample(const common::Trajectory& traj, double 
   ref.vel_ff = m.vel;
   ref.acc_ff = m.acc;
 
+  // A spin (Trajectory::spin_rate): turn at that rate while the trajectory
+  // runs, hold the heading reached after.
+  if (traj.spin_rate != 0.0) {
+    if (now >= traj.t0 && now <= traj.t0 + traj.total_duration) {
+      last_yaw_ = std::remainder(last_yaw_ + traj.spin_rate * dt, 2.0 * M_PI);
+    }
+    ref.yaw = last_yaw_;
+    return ref;
+  }
+
   // Yaw follows the direction of travel so the forward camera leads the motion.
   // The heading turn rate is available analytically from velocity and
   // acceleration, so the "spinning while slow" guard needs no stored history.
+  // An end heading takes over for the last end_yaw_lead seconds and after:
+  // turn toward it at a bounded rate, whatever the direction of travel.
+  if (std::isfinite(traj.end_yaw) && now >= traj.t0 + traj.total_duration - params_.end_yaw_lead) {
+    const double err = std::remainder(traj.end_yaw - last_yaw_, 2.0 * M_PI);
+    const double step = params_.end_yaw_rate * dt;
+    last_yaw_ = std::remainder(last_yaw_ + std::clamp(err, -step, step), 2.0 * M_PI);
+    ref.yaw = last_yaw_;
+    return ref;
+  }
+
   const double vx = ref.vel_ff.x();
   const double vy = ref.vel_ff.y();
   const double speed_xy = std::hypot(vx, vy);

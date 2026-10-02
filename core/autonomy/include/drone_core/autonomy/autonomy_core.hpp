@@ -2,7 +2,9 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -13,14 +15,15 @@
 #include "drone_core/control/trajectory_tracker.hpp"
 #include "drone_core/planning/corridor.hpp"
 #include "drone_core/planning/min_snap_trajectory.hpp"
+#include "drone_core/planning/conservative_grid.hpp"
+#include "drone_core/planning/distance_field.hpp"
 #include "drone_core/planning/geometric_planner.hpp"
 
-// Forward declaration (from dynamicEDT3D) so the cached distance field can be a
-// member without pulling that header into this ROS-free public interface.
-template <class TREE>
-class DynamicEDTOctomapBase;
 
 namespace drone_core::autonomy {
+
+// The conservative map view (see setMap): a dense grid, not an octree.
+using ConsGridHandle = std::shared_ptr<const planning::ConservativeGrid>;
 
 // Frames. Two frames meet in here and must not be mixed. Planning — the goal, the
 // geometric search, truncation, the corridor and the trajectory solve — works in
@@ -50,10 +53,36 @@ public:
     double int_err_limit{0.2};  // freeze the velocity integrator above this position error [m]; <= 0 disables
     double hover_thrust{0.35};
     bool enable_feedforward{false};
-    double stale_timeout{1.5};        // hover-hold fallback threshold [s]
+    // Seconds without a health signal before the tracker falls back to
+    // hover-hold. The trajectory monitor sends one every tick it re-checks the
+    // trajectory being flown against the current map and finds it safe; a newly
+    // staged trajectory counts as one too. A dead or hung planner stops them.
+    double health_timeout{2.5};
+    // Distance between the tracked reference and the measured position above
+    // which the trajectory is abandoned, even though it is still healthy: the
+    // tracker holds the vehicle's current position and the worker replans from
+    // there, starting at rest. health_timeout only catches a
+    // planner that stopped producing, not a vehicle a gust, a snag or a bad
+    // state estimate has put far from an on-time reference — and a replan
+    // splices onto the reference, not the vehicle, so without this the corridor
+    // would keep being grown around a point the vehicle is not at. <= 0 disables.
+    double max_tracking_error{1.0};   // [m]
+    // BENCH ONLY. Every replan starts from rest at the measured position instead
+    // of splicing onto the outgoing trajectory. On a disarmed bench nothing flies
+    // the trajectory, but a splice still assumes the vehicle moved along it on the
+    // wall clock, so each replan starts further along and the trajectory shrinks
+    // to nothing within its own duration. In flight this would restart every
+    // replan from zero velocity — a stutter at every new trajectory — so the node
+    // warns while it is on and the vehicle is flying.
+    bool bench_replan_from_state{false};
     double rrt_monitor_period{0.5};   // committed-path validity re-check [s]
     double rrt_improve_period{5.0};   // clearance-aware improvement search [s]
     double rrt_solve_time{3.0};       // planner optimisation budget per solve [s]
+    // Budget for a search that has to produce a path NOW — a new goal, or a
+    // committed path that is blocked or gone — rather than improve one [s]. The
+    // anytime planners have a first path well within this; the improve searches
+    // (rrt_solve_time) refine it later. Capped at rrt_solve_time.
+    double rrt_replan_solve_time{0.3};
     // Which OMPL planner the worker builds. Per-planner tunables (RRT* range/goal
     // bias, BIT*/AIT*/EIT* batch sizes, etc.) live in PlannerConfig in
     // geometric_planner.hpp, the single place to tune them.
@@ -67,6 +96,13 @@ public:
     // insists on (near-)exact arrival and holds if the goal is unreachable.
     bool best_effort_goal{true};
     double clearance_weight{4.0};     // obstacle-proximity penalty weight
+    // Weight on the frontier's proximity penalty: what running near the edge of
+    // explored space costs beyond what the nearest mapped obstacle already
+    // charges (see GeometricPlanner::setCostClearance). Only used when the cost
+    // is scored on the conservative field (treat_unknown_as_hazard +
+    // use_corridor_qp); with it equal to clearance_weight the cost is the old
+    // single penalty on that field.
+    double frontier_weight{4.0};
     double clearance_threshold{1.0};  // clearance saturation distance / EDT maxdist [m]
     // Flat extra cost charged per metre of path routed through space that has
     // never been observed. This is NOT expressible as a clearance weight: the
@@ -95,7 +131,65 @@ public:
     // the raw octree, where a cell with no node has never been observed — so
     // they should stay on whenever the operator asked for them.
     bool treat_unknown_as_hazard{true};
-    double trajgen_period{1.0};       // local trajectory replan period [s]
+    // Without treat_unknown_as_hazard, a never-seen floor reads as free and the
+    // search could route a path under it. min_altitude [m, world frame, z = 0
+    // where VIO started] is then the lowest a search point may be (relaxed to
+    // the start's height, so a drone on the ground climbs out) and the floor of
+    // the corridor's box. -inf disables it; ignored with treat_unknown_as_hazard
+    // on, where unknown space is an obstacle anyway.
+    double min_altitude{-std::numeric_limits<double>::infinity()};
+    // Keep the search's path where the camera can see it
+    // (GeometricPlanner::setUnknownSlopeLimit): the camera looks forward and
+    // roughly level (the D435's depth view is about +-29 deg vertically).
+    // Points in never-observed space steeper than max_unknown_slope [deg] from
+    // the start are invalid, and edges steeper than it through unknown space
+    // cost unknown_slope_weight per vertical metre beyond it. Through explored
+    // space any slope is allowed. Only with treat_unknown_as_hazard; <= 0
+    // disables both.
+    double max_unknown_slope{0.0};
+    double unknown_slope_weight{5.0};
+
+    // Goal-directed exploration (see explorationTick). With it on, and
+    // treat_unknown_as_hazard + use_corridor_qp and a conservative grid, the
+    // search plans only on the conservative map: toward the reachable known
+    // point nearest the goal (ADVANCE), and when there is none closer, to a
+    // viewpoint looking at where an optimistic path to the goal leaves explored
+    // space (UNCOVER), until the goal is within goal_reached_dist (DONE) or no
+    // route remains even through unknown space (NO EXITS). Off by default in
+    // the core (the tests drive the classic search); the node turns it on.
+    bool use_exploration{false};
+    double goal_reached_dist{1.0};     // the goal counts as reached within this [m]
+    double retarget_period{3.0};       // how often ADVANCE looks for a closer known point [s]
+    double retarget_min_gain{0.3};     // a new known point must be this much closer to the goal [m]
+    double view_distance{2.5};         // ideal viewpoint distance from the exit point [m]
+    double arrive_dist{0.3};           // the drone has reached its target within this [m]
+    // ...or the trajectory built for the path to it has run out with the drone
+    // at its end and that end within this of the target: the corridor pulls a
+    // path's end back when the end point falls outside its shrunk last region,
+    // and the drone then stops short however long it waits [m].
+    double arrive_short_dist{1.0};
+    double view_dwell{1.5};            // wait at a viewpoint for the map to catch up [s]
+    double exit_exclusion_radius{1.0}; // exit points looked at are avoided by this much [m]
+    // Trajectory monitor (see monitorLoop). The trajectory being flown is kept
+    // until there is a reason to replace it; the monitor looks for one this many
+    // times a second.
+    double traj_monitor_rate{5.0};     // [Hz]
+    // An improve solve is tried once this long has passed since the last
+    // generation, and adopted only if it reaches the current stop point sooner.
+    double traj_improve_period{3.0};   // [s]
+    // A new trajectory is generated when truncation's stop point on the
+    // committed path has moved this far past the current trajectory's, or moved
+    // at all once the current trajectory is within traj_extend_horizon of its
+    // end (so the drone does not start braking for an end it no longer needs).
+    double traj_extend_dist{0.5};      // [m]
+    double traj_extend_horizon{3.0};   // [s]
+    // Emergency stop: when the trajectory fails its safety check with a sample
+    // within emergency_horizon ahead below emergency_factor x its margin, the
+    // tracker holds at once instead of waiting for a replacement. Keep the
+    // horizon above kTrajgenLead: an unsafe trajectory is flown for up to that
+    // long before its replacement engages.
+    double emergency_horizon{2.0};     // [s]
+    double emergency_factor{0.7};
     // Corridor-QP trajectory generation (Stage 1). When true, runTrajgen
     // replaces plain min-snap with the safe-corridor pipeline: truncate the
     // committed path against the conservative map view (see setMap) so it never
@@ -104,16 +198,21 @@ public:
     // per-axis limits below. Any stage failing stages NOTHING — there is no
     // min-snap fallback here, since min-snap ignores obstacles and the only
     // thing that produces this path is the corridor reporting it cannot certify
-    // a safe trajectory. The tracker rides out what it has and hovers at
-    // stale_timeout. When false, trajgen is exactly the pre-corridor min-snap.
+    // a safe trajectory. The tracker rides out what it has and hovers once its
+    // health signals stop. When false, trajgen is exactly the pre-corridor min-snap.
     bool use_corridor_qp{false};
     double vmax{1.0};              // per-axis velocity limit [m/s]
     double amax{1.5};              // per-axis acceleration limit [m/s^2]
     double jmax{3.0};              // per-axis jerk limit [m/s^3]
-    // Required clearance from unknown space for the committed trajectory [m].
-    // Enforced by truncation against the conservative (frontier-stamped) map;
-    // may exceed the collision margin (unknown is riskier than a mapped wall).
+    // Truncation's required clearance [m]: how close the committed prefix may
+    // come to mapped obstacles, and to never-observed space unless
+    // unknown_margin (below) is smaller.
     double frontier_margin{0.5};
+    // Clearance from never-observed space for truncation, the corridor and the
+    // trajectory monitor [m], when smaller than their margin from mapped
+    // obstacles (frontier_margin for truncation, corridor_margin for the other
+    // two); a value at or above those leaves them as they were.
+    double unknown_margin{0.25};
     // Clearance the corridor boxes must have from obstacles AND unknown space
     // [m]. This is a strictly harder test than the planner's collision margin:
     // the search only checks its centreline (and exempts a sphere at the
@@ -131,15 +230,36 @@ public:
     // commits further before demanding full clearance. <= 0 disables the ramp.
     double escape_ramp_dist{1.0};
     double max_segment_len{2.0};   // corridor resample cap: one region per piece [m]
+    // Wall-clock budget for the corridor QP's time-allocation search [s]. When
+    // it runs out the best feasible allocation found so far is used, so a
+    // slow search yields a slower trajectory rather than a late one. Covers
+    // the QP only, not truncation or corridor building. <= 0 = unlimited.
+    double traj_solve_budget{0.8};
+    // Stage-3 group cuts of the corridor QP's time search: the fraction cut
+    // from the middle segments of each group of alike-turning segments, and the
+    // share of it applied to a group's end segments. <= 0 cut disables the stage.
+    // See CorridorTrajectoryOptimizer::setGroupCut.
+    double traj_group_cut{0.25};
+    double traj_group_edge_factor{0.6};
+    // How hard the corridor QP pulls the trajectory toward the geometric path.
+    // 0 (the default) is pure minimum-snap, which rounds corners as widely as
+    // the regions allow; raising it trades smoothness for directness without
+    // narrowing the corridor, so tight scenery keeps its options.
+    // See CorridorTrajectoryOptimizer::setPathWeight.
+    double traj_path_weight{0.0};
+    // Trajgen detail logs: where each corridor QP solve spends its time (see
+    // CorridorTrajectoryOptimizer::setDebug) and the lines of a corridor that
+    // worked (truncation cut, start margin relaxed, end pulled back, thin joints
+    // repaired, OK). Failures and the one-line solve summary always log.
+    bool debug_trajgen{false};
     // Minimum half-extents of the region-growth window in the SEGMENT-ALIGNED
     // frame (x along the segment, y/z lateral) — not world axes. A floor, not a
     // cap: buildCorridor raises it to scale with the longest segment. Pinning
     // it keeps the window from narrowing when max_segment_len is lowered, which
     // would otherwise trade a region's length for its width.
     Eigen::Vector3d corridor_bbox{1.0, 2.0, 2.0};
-    // When false the worker stops after RRT*: it stores the geometric path for
-    // visualisation but never runs min-snap or hands a trajectory to the
-    // tracker, so control keeps following the direct setpoint. Used to bring the
+    // When false the worker stops after RRT*: it commits the geometric path
+    // but never runs min-snap or hands a trajectory to the tracker, so control keeps following the direct setpoint. Used to bring the
     // planner online geometry-first, decoupled from control.
     bool plan_trajectory{true};
     // Single switch for the debug planner visualisation (search-tree capture +
@@ -155,6 +275,12 @@ public:
     // gets identity.
     bool require_map_to_world{false};
   };
+
+  // How far ahead of a solve a spliced trajectory is anchored [s]: the 0.8 s
+  // solve budget, the overrun past it (one QP solve plus corridor building), and
+  // room for the hand-over. Fixed rather than measured: solves are budgeted, so
+  // their worst case is known.
+  static constexpr double kTrajgenLead = 1.3;
 
   explicit AutonomyCore(const Config& config);
   ~AutonomyCore();
@@ -185,15 +311,31 @@ public:
   // `map` is the raw (optimistic) map: unknown space reads as free, so the
   // geometric search can chase a goal beyond the mapped frontier (informed
   // planners refuse an unreachable goal outright). `conservative` is the
-  // frontier-stamped copy — unknown space reads as occupied — used for
-  // truncation, corridor growth and trajectory safety; pass nullptr when no
-  // frontier information is available (the raw map then serves both roles and
-  // nothing guards against unknown space, matching the pre-frontier behavior).
-  // With use_corridor_qp off and a conservative map present, the search runs on
-  // the conservative view instead — the legacy single-map behavior of
-  // TREAT_FRONTIER_AS_OBSTACLE.
-  void setMap(const planning::MapHandle& map,
-              const planning::MapHandle& conservative = nullptr);
+  // conservative view — a planning::ConservativeGrid over the raw map, cropped to
+  // mapCrop(), with the ball around the drone freed and every never-observed
+  // voxel bordering free space marked shell — used for truncation, corridor
+  // growth and trajectory safety; pass nullptr when there is none (the raw map
+  // then serves both roles and nothing guards against unknown space, matching
+  // the pre-frontier behavior). With use_corridor_qp off and a conservative view
+  // present, the search's collision check reads the conservative field instead —
+  // the legacy single-map behavior of TREAT_FRONTIER_AS_OBSTACLE.
+  //
+  // BLOCKS for as long as it takes to build the new map's distance fields
+  // (over a second on a room-sized map), on the CALLER's thread, before the map
+  // becomes visible to the planners. That is deliberate: the fields used to be
+  // built lazily by whichever planner thread asked first, under edt_mutex_, so a
+  // new map stalled trajectory generation for the length of the build (bench
+  // 2026-09-25: a 2.10 s replan, 1.36 s of it the field, pushing "since last
+  // staged" past what was then STALE_TIMEOUT). The node calls this from its slow callback
+  // group, which exists for exactly this kind of blocking work. Meanwhile the
+  // planners keep running on the previous map and its fields; they switch to the
+  // new pair together, so a tick never mixes a new map with an old field.
+  void setMap(const planning::MapHandle& map, const ConsGridHandle& conservative = nullptr);
+  // The box [m, MAP frame] the host should crop the conservative grid to: the
+  // search box grown by the conservative field's saturation distance plus a
+  // voxel, so obstacles just outside the box still count. The raw field is
+  // cropped the same way internally.
+  void mapCrop(Eigen::Vector3d& lo, Eigen::Vector3d& hi) const;
   // MAP frame.
   void setGoal(const common::Goal& goal);
 
@@ -215,8 +357,12 @@ public:
   // corridor pipeline needs one); with none the request is logged and dropped.
   void firePreset(const std::vector<Eigen::Vector3d>& waypoints);
 
-  // Live reconfiguration of the controller gains, hover thrust and feed-forward
-  // flag. Applied on the control thread at the next step.
+  // Live reconfiguration of the whole Config. Each thread picks it up on its own:
+  // the planner worker at the start of its next cycle (and planOnce at its
+  // start), armed or not, and the control thread at its next stepControl. So a
+  // planning parameter changed on a disarmed bench takes effect within one
+  // planner cycle, and a control parameter changed before arming is in force on
+  // the first control tick.
   void applyConfig(const Config& config);
 
   // Re-arm the controller on (re)engagement.
@@ -236,6 +382,18 @@ public:
 
   // Introspection (call from the control thread).
   bool hasTrajectory() const;
+
+  // How many trajectories have been handed to the tracker since construction.
+  // Counts staging, not engagement, so it advances once per successful trajgen
+  // tick — which is what says the trajgen thread is still producing while a
+  // slow search runs on the other one.
+  std::uint64_t stagedTrajectoryCount() const { return staged_count_.load(); }
+  // How many distance fields a PLANNER thread has had to build itself. setMap
+  // builds a new map's fields before publishing it, so this stays at zero in
+  // steady state; it moves only on the fallback path (a live change of the
+  // fields' saturation distance, or a map that did not come through setMap).
+  // Test hook, and the reason a stalled replan would show a large `field` time.
+  std::uint64_t plannerFieldBuildCount() const { return planner_field_builds_.load(); }
   bool inHoverHold() const;
   const control::PositionControl& controller() const { return tracker_.controller(); }
 
@@ -243,15 +401,30 @@ public:
   // WORLD frame: this is the trajectory as handed to the tracker.
   std::vector<std::vector<double>> sampledPlannedPath(double sample_dt = 0.1) const;
 
-  // Raw waypoints of the most recent RRT* geometric plan (start..goal), for
-  // visualisation, MAP frame (as are the search tree, clearance samples and
-  // corridor snapshot below). Independent of trajectory generation, so it is populated even
-  // when plan_trajectory is false.
-  std::vector<std::vector<double>> geometricPath() const;
+  // Whether the search has committed a path (it is cleared when the goal
+  // changes or the trajectory is abandoned). Independent of trajectory
+  // generation, so it works with plan_trajectory false.
+  bool hasCommittedPath() const { return !committedPath().empty(); }
 
-  // Snapshot of the most recent RRT* search tree (nodes + edges), for debug
-  // visualisation. Empty unless cfg.debug_planner_viz is set. Thread-safe copy.
-  planning::GeometricPlanner::SearchTree searchTree() const;
+  // The exploration's current state, for logs and visualisation (map frame).
+  enum class MissionMode { kIdle, kTurn, kAdvance, kUncover, kSpin, kDone, kNoExits };
+  struct MissionView {
+    MissionMode mode = MissionMode::kIdle;
+    bool has_target = false;
+    Eigen::Vector3d target = Eigen::Vector3d::Zero();  // where the drone is heading
+    double target_yaw = std::numeric_limits<double>::quiet_NaN();  // heading to arrive with
+    bool has_exit = false;
+    Eigen::Vector3d exit = Eigen::Vector3d::Zero();    // the exit point being looked at (UNCOVER)
+    // The best-effort known point nearest the goal found so far (kept while
+    // uncovering), the conservative path to the target being flown, and the
+    // optimistic path the exit point came from (UNCOVER).
+    bool has_best_known = false;
+    Eigen::Vector3d best_known = Eigen::Vector3d::Zero();
+    std::vector<Eigen::Vector3d> path;
+    std::vector<Eigen::Vector3d> optimistic_path;
+  };
+  MissionView missionView() const;
+  static const char* toString(MissionMode m);
 
   // Coarse samples of the cached clearance (EDT) field as {x, y, z, distance}
   // (distance clamped at clearance_threshold), for debug visualisation. Empty
@@ -263,9 +436,7 @@ public:
   // solver — its last point is the intermediate goal inside known-safe space,
   // which ratchets toward the real goal as the map grows — and `regions` are
   // the convex free polyhedra grown along it (one per resampled segment), i.e.
-  // the volume the trajectory is provably confined to. Comparing `committed`
-  // against geometricPath() shows exactly where truncation cut the optimistic
-  // path. Empty unless cfg.debug_planner_viz AND cfg.use_corridor_qp are set,
+  // the volume the trajectory is provably confined to. Empty unless cfg.debug_planner_viz AND cfg.use_corridor_qp are set,
   // and cleared whenever a trajgen tick truncates to nothing or fails to build
   // a corridor, so a stale corridor is never drawn as if it were current.
   // Thread-safe copy.
@@ -280,6 +451,9 @@ public:
   // at a glance: raw has volume, shrunk has none, so the margin ate it.
   struct CorridorSnapshot {
     std::vector<Eigen::Vector3d> committed;
+    // The path handed to truncation, filled only when truncation cut it short
+    // (or to nothing), so the viz can show what was cut next to what was kept.
+    std::vector<Eigen::Vector3d> untruncated;
     std::vector<planning::ConvexRegion> raw;     // as decomposed, before the margin
     std::vector<planning::ConvexRegion> shrunk;  // after the margin pull-in
     bool accepted{false};
@@ -292,15 +466,15 @@ private:
                      const planning::MapHandle& map,
                      std::vector<std::vector<double>>& path);
   // Trajectory generation for the committed path. cons_edt is the distance
-  // field of the conservative map view and cons_map the octree it was built
-  // from (nullptr when unavailable): with use_corridor_qp set the field drives
-  // truncation and the octree supplies the windowed obstacle points the
-  // polyhedral corridor decomposition consumes; without them (or with the flag
-  // off) trajgen is plain min-snap over the waypoints.
+  // field of the conservative view, and the obstacle points the polyhedral
+  // corridor decomposition consumes come from `cons_grid` (occupied + shell
+  // cells), or from the raw `map`'s occupied voxels when there is no grid: with
+  // use_corridor_qp set the field drives truncation and the points the corridor;
+  // without them (or with the flag off) trajgen is plain min-snap.
   //
   // is_unknown, when non-empty, makes truncation stop at the first point in
-  // never-observed space — a check the distance field cannot make, because the
-  // stamped shell it measures against has gaps. The CALLER decides whether to
+  // never-observed space, read from the stamped view (the ball around the drone
+  // free, the unknown shell occupied). The CALLER decides whether to
   // supply it, and supplies it only when a conservative map view exists (i.e.
   // TREAT_FRONTIER_AS_OBSTACLE is on). Passed as the predicate rather than as a
   // map handle so that decision is visible at the call site next to the
@@ -311,13 +485,24 @@ private:
   // waypoint instead of only its two ends. False for planning, where the
   // waypoints are a hint and letting the QP smooth across them is the whole
   // point of having a corridor. True for a preset, where they are the intent.
+  //
+  // `root_shift` is how far the caller moved path.front() off the point the
+  // search started from [m], reported in the truncation log; < 0 omits it.
+  // What runTrajgen learned that the trajectory monitor needs later.
+  struct TrajgenInfo {
+    bool corridor{false};             // built by the corridor pipeline (else plain min-snap)
+    double start_margin{0.0};         // clearance the first region kept (see buildCorridor)
+    Eigen::Vector3d trunc_end{0, 0, 0};  // truncation's stop point on the path, MAP frame
+  };
   bool runTrajgen(const std::vector<std::vector<double>>& path, double t0,
                   const common::MotionState& start,
-                  const std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>>& cons_edt,
-                  const planning::MapHandle& cons_map,
+                  const std::shared_ptr<const planning::DistanceField>& cons_edt,
+                  const planning::MapHandle& map, const ConsGridHandle& cons_grid,
                   const planning::CorridorUnknownFn& is_unknown,
                   common::Trajectory& traj,
-                  bool pin_waypoints = false);
+                  bool pin_waypoints = false,
+                  double root_shift = -1.0,
+                  TrajgenInfo* info = nullptr);
   void stagePending(const common::Trajectory& traj);
   // Build and stage a one-shot preset trajectory through `waypoints` (see
   // firePreset), splice-anchored at rest on the current state, and arm the
@@ -326,9 +511,53 @@ private:
   // Worker thread only.
   void runPreset(const common::State& state, const Eigen::Isometry3d& world_from_map,
                  const planning::MapHandle& map,
-                 const planning::MapHandle& conservative,
+                 const ConsGridHandle& conservative,
                  const std::vector<Eigen::Vector3d>& waypoints);
-  void plannerLoop();
+  // The two planner threads. They are deliberately separate: a geometric search
+  // can take tens of seconds (EIT* overrunning its budget has been measured at
+  // 59 s on the bench), and while they shared one loop that stalled trajectory
+  // generation too, so the tracker lost its guidance and latched hover-hold. Now
+  // a slow search only delays a BETTER path; the trajectory being flown keeps
+  // being checked against the CURRENT map by the monitor meanwhile.
+  void searchLoop();
+  // The solver: runs the one trajectory solve the monitor asks for at a time
+  // (see SolveJob), stops at its checkpoints if cancelled, and hands the result
+  // back. It decides nothing about adopting it. Also runs presets.
+  void trajgenLoop();
+  // The trajectory monitor (traj_monitor_rate, and at once when a result or a
+  // hand-over is due): works out the Needs of the trajectory being flown, judges
+  // solver results and the waiting room against them, hands trajectories to the
+  // tracker, sends health signals and emergency stops, and decides at the end of
+  // each tick whether to start, cancel or leave a solve. See the .cpp.
+  void monitorLoop();
+
+  // The committed path, shared between the two threads: written by the search
+  // loop when it adopts, read (by copy, never held across a solve) by trajgen.
+  std::vector<std::vector<double>> committedPath(std::uint64_t* version = nullptr) const;
+  // `end_yaw` (map frame, NaN for none): the heading to end the path facing,
+  // carried into the trajectory built on it (Trajectory::end_yaw).
+  void setCommittedPath(std::vector<std::vector<double>> path,
+                        double end_yaw = std::numeric_limits<double>::quiet_NaN());
+  double committedEndYaw() const;
+
+  // Goal-directed exploration (see Config::use_exploration).
+  bool explorationActive(const ConsGridHandle& cons) const;
+  // One search tick of it: `start` is where to plan from (the predicted splice
+  // point, as for the classic search), `drone` the measured position, both map
+  // frame; `drone_yaw` the measured heading, world frame.
+  // min_altitude in the map frame (maps are gravity-aligned, so only the
+  // transform's height offset matters), or -inf when it does not apply.
+  static double floorInMap(const Config& c, const Eigen::Isometry3d& world_from_map);
+  void explorationTick(const planning::MapHandle& map, const ConsGridHandle& cons,
+                       const Eigen::Vector3d& goal, const Eigen::Vector3d& start,
+                       const Eigen::Vector3d& drone, double drone_yaw,
+                       const Eigen::Isometry3d& map_from_world, double t);
+
+  // Which map the debug clearance samples were taken from. Guarded by
+  // edt_mutex_ with the fields it belongs to, since clearanceField clears it on
+  // a rebuild and that rebuild can happen on either planner thread.
+  planning::MapHandle vizSampledMap() const;
+  void setVizSampledMap(const planning::MapHandle& map);
 
   // Where a replan must begin, so that engaging it does not step the reference.
   struct SpliceAnchor {
@@ -356,8 +585,11 @@ private:
   // `world_from_map`. Sampling a map-frame copy instead would place the splice
   // wherever the map said the vehicle was when that copy was planned, which is not
   // where it is once a correction has landed since.
+  //
+  // `min_t0` is a lower bound on the anchor time: a trajectory must engage at
+  // least kStageGap after the one staged before it, which may still be waiting.
   SpliceAnchor spliceAnchor(const common::State& state, double t_now,
-                            const Eigen::Isometry3d& world_from_map) const;
+                            const Eigen::Isometry3d& world_from_map, double min_t0 = 0.0) const;
 
   // Re-anchor a solved trajectory's start time to after the solve, for a start
   // at rest only (anchor.from_trajectory false). The lead exists so a splice
@@ -376,6 +608,25 @@ private:
   // and stage it. Returns the staged world-frame trajectory. Worker thread only.
   common::Trajectory stagePlanned(const SpliceAnchor& anchor, const common::Trajectory& map_traj,
                                   const Eigen::Isometry3d& world_from_map);
+
+  // A trajectory as the monitor tracks it: what was staged (WORLD frame), what
+  // it must be checked against, and which plan it belongs to.
+  struct TrajRecord {
+    common::Trajectory traj;          // WORLD frame, as staged
+    double first_segment_end{0.0};    // wall clock
+    double start_margin{0.0};
+    bool corridor{false};
+    std::uint64_t path_version{0};
+    double trunc_end_arc{0.0};        // truncation stop point, as arc length along the path [m]
+  };
+  // Record a just-staged trajectory for the monitor. Keeps the last two: the one
+  // being flown and the one staged after it (the monitor checks each over the
+  // stretch it will actually be flown).
+  void recordStaged(const common::Trajectory& staged, const TrajgenInfo& info,
+                    std::uint64_t path_version, const std::vector<std::vector<double>>& path);
+  // The monitor's check, with the corridor's margins and truncation's tolerance.
+  static planning::TrajectoryCheckParams checkParams(const Config& c, double start_margin,
+                                                     double first_segment_end, double resolution);
 
   // Configure `planner` with the shared clearance-aware objective used by BOTH
   // the monitor and improve passes, so a forced replan and an improvement
@@ -399,33 +650,47 @@ private:
   // no obstacles (clearance is then uniform and the EDT meaningless).
   bool applyClearanceObjective(planning::GeometricPlanner& planner,
                                const planning::MapHandle& map,
-                               const planning::MapHandle& cons);
+                               const ConsGridHandle& cons);
 
   // Return the cached Euclidean distance field for `map`, rebuilding it only when
   // the map has actually changed (octomap hands us a fresh tree per message). A
   // static scene therefore reuses one EDT instead of rebuilding it every tick.
   // Returns nullptr (and clears the cache) when the map is empty / has no
-  // obstacles. Called only from the planner worker thread.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> clearanceField(
-      const planning::MapHandle& map);
+  // obstacles. `maxdist` is the field's saturation distance; it is passed in
+  // rather than read from a config member because both planner threads call
+  // this and each owns its own Config copy. The cache is guarded by edt_mutex_,
+  // which is held only for the rebuild and the pointer hand-back — never across
+  // a solve.
+  std::shared_ptr<const planning::DistanceField> clearanceField(
+      const planning::MapHandle& map, double maxdist);
 
-  // Cached distance field over the conservative map view, for truncation and
-  // corridor growth. Mirrors clearanceField's rebuild-on-map-change caching;
-  // when the conservative and search maps are the same object (no frontier
-  // information), the search field is reused instead of building a second EDT.
-  // Worker thread only.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> conservativeField(
-      const planning::MapHandle& map);
+  // Cached distance field over the conservative view, for truncation and
+  // corridor growth. Mirrors clearanceField's rebuild-on-map-change caching,
+  // keyed on the grid; with no grid (no frontier information) the search field
+  // over `map` is reused instead of building a second one. Same edt_mutex_ and
+  // same reason for the explicit maxdist as clearanceField.
+  std::shared_ptr<const planning::DistanceField> conservativeField(
+      const planning::MapHandle& map, const ConsGridHandle& grid, double maxdist);
 
   // Sample the cached EDT on a coarse grid over the map's bounding box. Samples
   // whichever field the cost objective is scored against — the conservative one
   // when it is a distinct view, the search one otherwise — so the published
-  // cloud shows what the objective actually sees. Called only from the planner
-  // worker thread (it reads edt_ / cons_edt_ and their source maps, which the
-  // worker owns), and only when debug_planner_viz is set.
-  std::vector<std::array<double, 4>> sampleClearanceField() const;
+  // cloud shows what the objective actually sees. Takes edt_mutex_ to pick up
+  // the field, then samples outside it. Search thread only, and only when
+  // debug_planner_viz is set.
+  std::vector<std::array<double, 4>> sampleClearanceField(double maxdist) const;
 
+  // One copy of the config per thread, so none of them reads memory another is
+  // writing. cfg_ belongs to the trajgen thread (and to planOnce, which is not
+  // run alongside the threads); search_cfg_ to the search thread; control_cfg_
+  // to the thread calling stepControl. All three are refreshed from
+  // pending_config_ under io_mutex_, each on its own dirty flag. (There used to
+  // be one cfg_, assigned whole by stepControl while the worker read it
+  // unlocked — a data race — and only refreshed once the host started calling
+  // stepControl, i.e. once armed.)
   Config cfg_;
+  Config search_cfg_;
+  Config control_cfg_;
   std::function<double()> clock_;
 
   control::TrajectoryTracker tracker_;
@@ -435,7 +700,7 @@ private:
   Eigen::Isometry3d world_from_map_{Eigen::Isometry3d::Identity()};
   bool has_map_to_world_{false};          // set by the first setMapToWorld
   planning::MapHandle map_;               // optimistic view (unknown = free)
-  planning::MapHandle conservative_map_;  // frontier-stamped view; may be null
+  ConsGridHandle conservative_map_;       // conservative view (shell grid); may be null
   common::Goal goal_;
   bool has_goal_{false};
   bool new_goal_{false};  // raised by setGoal, consumed by the worker to force a replan
@@ -451,8 +716,37 @@ private:
   bool preset_pending_{false};
   std::atomic<bool> preset_active_{false};
   std::atomic<double> preset_end_{0.0};
+  // The mission's TURN (see explorationTick) stages a hold-in-place trajectory
+  // the monitor knows nothing about, so nothing sends health signals for it.
+  // While it is the latest staged trajectory (turn_hold_active_, cleared by
+  // stagePending), the search thread keeps pushing turn_fresh_until_ a second
+  // ahead and stepControl keeps the trajectory fresh until then — so a dead
+  // search thread still ends in the usual hover-hold.
+  std::atomic<bool> turn_hold_active_{false};
+  // The first goal of a flight starts with a 360 deg look around (see
+  // explorationTick); reset() — disarm, leaving offboard, the transfer tester
+  // switching — makes the next goal the first again.
+  std::atomic<bool> flight_spin_done_{false};
+  std::atomic<double> turn_fresh_until_{0.0};
+  // Raised by stepControl when the tracker abandons a trajectory for divergence.
+  // One flag per planner thread, because both have to react and each consumes
+  // its own: the search thread drops the committed path and re-searches from the
+  // vehicle, the trajgen side regenerates from the vehicle's position.
+  std::atomic<bool> search_replan_requested_{false};
+  std::atomic<bool> trajgen_replan_requested_{false};
+  // Raised by the solver when a splice solve failed with the anchor far off the
+  // committed path: the path is stale, so the search thread drops it and re-plans.
+  std::atomic<bool> search_stale_path_{false};
   Config pending_config_;
-  bool config_dirty_{false};
+  bool search_config_dirty_{false};
+  bool trajgen_config_dirty_{false};
+  bool monitor_config_dirty_{false};
+  bool control_config_dirty_{false};
+  Config monitor_cfg_;  // the monitor thread's copy
+
+  // Guards the two cached distance fields below and everything derived from
+  // them, now that both planner threads use them.
+  mutable std::mutex edt_mutex_;
 
   mutable std::mutex traj_mutex_;
   common::Trajectory pending_;
@@ -460,44 +754,158 @@ private:
   common::Trajectory last_planned_;  // WORLD frame; retained for visualisation and as the splice source
   double last_planned_at_{0.0};      // when it was staged, for the staleness check
   bool has_last_planned_{false};     // cleared on reset() — see spliceAnchor
-  std::vector<std::vector<double>> last_geometric_path_;  // raw RRT* result, for viz
-  planning::GeometricPlanner::SearchTree last_search_tree_;  // debug viz; empty unless enabled
   std::vector<std::array<double, 4>> last_clearance_samples_;  // debug viz; {x,y,z,dist}
   CorridorSnapshot last_corridor_;  // debug viz; empty unless corridor QP + viz on
 
-  std::thread worker_;
+  std::thread search_worker_;
+  std::thread trajgen_worker_;
+  std::thread monitor_worker_;
   std::atomic<bool> running_{false};
-  std::vector<std::vector<double>> cached_path_;
-  double last_trajgen_{-1.0e9};
 
-  // Replan lead time (worker thread only). How far ahead of "now" a replan is
-  // anchored, so it is ready by the time it is due to engage. Measured rather
-  // than guessed: the corridor QP runs a BOBYQA search over cold OSQP solves and
-  // its cost swings with the number of regions, so a fixed number would be
-  // either wasteful or routinely wrong. Held as a decaying max of observed solve
-  // times, times a safety factor — a one-off slow solve raises it, and it falls
-  // back down if that was not representative.
-  //
-  // Overrunning the lead costs a small transient (the trajectory engages
-  // slightly past its start); overshooting it costs nothing at all, because the
-  // tracker holds a staged trajectory until its t0. So this is deliberately
-  // biased high.
-  static constexpr double kLeadSafetyFactor = 1.5;
-  static constexpr double kLeadMaxDecay = 0.9;   // per trajgen tick
-  static constexpr double kLeadMin = 0.04;       // two 50 Hz control ticks [s]
-  static constexpr double kLeadMax = 0.5;        // [s]
-  double trajgen_solve_max_{0.0};
-  double trajgen_lead_{kLeadMin};
+  // The committed path (see committedPath/setCommittedPath).
+  mutable std::mutex path_mutex_;
+  std::vector<std::vector<double>> committed_path_;
+  double committed_end_yaw_{std::numeric_limits<double>::quiet_NaN()};  // guarded by path_mutex_
+  // Consecutive failed NEW_PLAN / OBSTACLE_EVASION solves on committed-path
+  // version path_fail_version_ (the solver writes, the exploration reads: a
+  // path the corridor cannot be built along twice is given up). Guarded by
+  // path_mutex_.
+  std::uint64_t path_fail_version_{0};
+  int path_fail_count_{0};
+  int trajgenFailures(std::uint64_t version) const;
+
+  // Exploration state, search thread only (missionView copies it under traj_mutex_).
+  struct Mission {
+    MissionMode mode = MissionMode::kIdle;
+    bool has_target = false;
+    Eigen::Vector3d target = Eigen::Vector3d::Zero();
+    double target_yaw = std::numeric_limits<double>::quiet_NaN();
+    double best_gap = std::numeric_limits<double>::infinity();  // nearest the goal a known target got
+    bool need_retarget = true;
+    bool need_viewpoint = false;
+    double last_retarget = -1.0e9;
+    double last_improve = -1.0e9;
+    double arrived_at = std::numeric_limits<double>::quiet_NaN();
+    bool has_exit = false;
+    Eigen::Vector3d exit = Eigen::Vector3d::Zero();
+    std::vector<Eigen::Vector3d> tried_exits;
+    int failed_exits = 0;
+    int failed_searches = 0;  // optimistic searches in a row that found no route (NO EXITS at 3)
+    // Targets given up because no trajectory could be built along the path to
+    // them; the ADVANCE search avoids them (setExclusions, 0.5 m).
+    std::vector<Eigen::Vector3d> failed_targets;
+    bool has_best_known = false;
+    Eigen::Vector3d best_known = Eigen::Vector3d::Zero();
+    std::vector<Eigen::Vector3d> optimistic_path;
+    double last_status = -1.0e9;
+    double no_exits_at = 0.0;
+    double turn_until = 0.0;  // TURN / SPIN: when the turn and the wait after it end
+    bool spun = false;     // the 360 deg look around after the first NO EXITS is done
+    bool spin_then_turn = false;  // SPIN before the flight's first goal: TURN to it after
+    bool settled = false;  // NO EXITS after it: parked at the best known point for good
+  } mission_;
+  MissionView mission_view_;  // guarded by traj_mutex_
+  std::uint64_t path_version_{0};  // bumped on every setCommittedPath; guarded by path_mutex_
+
+  // What the trajectory being flown lacks, worked out by the monitor at the
+  // start of every tick (see monitorLoop).
+  struct Needs {
+    bool evasion{false};   // OBSTACLE_EVASION: it runs too close to an obstacle on the current map
+    bool new_plan{false};  // NEW_PLAN: it was built for an older committed path (or there is none)
+    bool waypoint{false};  // WAYPOINT_ADVANCED: truncation's stop point has moved on enough
+    bool any() const { return evasion || new_plan || waypoint; }
+  };
+  // A solve the monitor has asked for, with the needs it was asked for — so a
+  // result can later be judged by what it was meant to fix. `new_plan` is
+  // cleared if a newer plan arrives while it runs, so it no longer counts as
+  // satisfying NEW_PLAN.
+  struct SolveJob {
+    std::uint64_t id{0};
+    Needs needs;
+    std::uint64_t version{0};  // committed-path version when asked
+  };
+  struct SolveResult {
+    SolveJob job;
+    bool ok{false};
+    bool cancelled{false};
+    SpliceAnchor anchor;
+    common::Trajectory traj;  // MAP frame
+    TrajgenInfo info;
+    Eigen::Isometry3d world_from_map{Eigen::Isometry3d::Identity()};
+    std::uint64_t version{0};  // committed-path version actually solved on
+    std::uint64_t epoch{0};
+    std::vector<std::vector<double>> path;
+  };
+  // Monitor -> solver (job) and solver -> monitor (result), guarded by job_mutex_.
+  std::mutex job_mutex_;
+  bool has_job_{false};
+  SolveJob job_;
+  bool has_result_{false};
+  SolveResult result_;
+  std::atomic<bool> solve_cancel_{false};  // stop the solve in flight and discard it
+  std::atomic<bool> solve_abort_{false};   // makes the QP time search return early (see setAbortFlag)
+  std::atomic<bool> heartbeat_{false};          // monitor -> control: health signal
+  std::atomic<bool> emergency_request_{false};  // monitor -> control: stop now
+  std::atomic<bool> tracker_holding_{false};    // control -> solver: hovering, do not splice
+  // Bumped whenever the trajectories in flight stop meaning anything (divergence,
+  // emergency, re-engage): a solve or waiting-room entry from an older epoch was
+  // spliced onto a reference that has been abandoned and is thrown away.
+  std::atomic<std::uint64_t> splice_epoch_{0};
+  std::vector<TrajRecord> records_;  // guarded by traj_mutex_
+
+  // How the last geometric search went, for the trajgen log line: it can no
+  // longer time the search itself, since the search runs on the other thread.
+  std::atomic<std::uint64_t> staged_count_{0};
+  std::atomic<std::uint64_t> planner_field_builds_{0};  // see plannerFieldBuildCount
+  std::atomic<bool> search_running_{false};
+  std::atomic<double> last_search_time_{0.0};
+
+  // Minimum gap between the start of a trajectory and the start of the one
+  // staged before it [s], so the earlier one has engaged and been superseded
+  // cleanly; and how long before its start a trajectory must still be when it
+  // is handed to the tracker [s], or it is thrown away and re-solved.
+  static constexpr double kStageGap = 0.3;
+  static constexpr double kStageMargin = 0.2;
+  // Rest starts (nothing to splice onto) begin this soon after hand-over.
+  static constexpr double kLeadMin = 0.04;  // two 50 Hz control ticks [s]
+
+  // Where the last runTrajgen call spent its time, for the per-replan timing log
+  // (worker thread only). Corridor covers truncation, obstacle gathering and the
+  // decomposition; QP is the trajectory solve. Zero for a stage not reached.
+  double trajgen_corridor_time_{0.0};
+  // Length of the braking stub leading the path of the solve in progress [m], 0
+  // for none; its segments get a doubled seed time (trajgen thread only).
+  double trajgen_stub_len_{0.0};
+  double trajgen_qp_time_{0.0};
 
   // Cached distance field and the map it was built from — the single obstacle
   // model for both collision validity and the clearance cost. See clearanceField.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> edt_;
+  std::shared_ptr<const planning::DistanceField> edt_;
   planning::MapHandle edt_source_map_;
+  double edt_maxdist_{0.0};  // clearance_threshold the field was built with
   // Second cached field over the conservative map view (truncation + corridor).
   // See conservativeField.
-  std::shared_ptr<DynamicEDTOctomapBase<octomap::OcTree>> cons_edt_;
-  planning::MapHandle cons_edt_source_map_;
+  std::shared_ptr<const planning::DistanceField> cons_edt_;
+  ConsGridHandle cons_edt_source_grid_;     // the grid it was built from, or
+  planning::MapHandle cons_edt_source_map_;  // the raw map, when built without one
+  double cons_edt_maxdist_{0.0};
   planning::MapHandle viz_sampled_map_;  // map the debug clearance samples were taken from
+
+  // Maps whose field has since been REPLACED by one built for a newer map, per
+  // kind. setMap builds the fields for a new map before publishing it, so a
+  // planner that snapshotted the previous map just before the swap asks for a
+  // field the cache no longer holds. Rebuilding it would put the whole build
+  // back on the planner thread — the stall this design exists to remove — so a
+  // request for a superseded map is served the newer field instead, which only
+  // knows about more obstacles, never fewer. weak_ptr rather than raw pointers
+  // so a freed map's address being reused by a new one can never match.
+  std::vector<std::weak_ptr<octomap::OcTree>> edt_superseded_;
+  std::vector<std::weak_ptr<octomap::OcTree>> cons_edt_superseded_;
+  std::vector<std::weak_ptr<const planning::ConservativeGrid>> cons_grid_superseded_;
+  static constexpr std::size_t kSupersededHistory = 8;
+
+  // Build the fields a new map will need, OFF the planner threads (see setMap).
+  void prebuildFields(const planning::MapHandle& map, const ConsGridHandle& conservative);
 };
 
 }  // namespace drone_core::autonomy
