@@ -2,6 +2,7 @@ import launch
 import launch_ros.actions
 import launch_ros.substitutions
 import launch.actions
+import launch.conditions
 import launch.substitutions
 import os
 
@@ -9,20 +10,27 @@ def generate_launch_description():
 
     config_file = os.path.expandvars('$HOME/ws_paramio/src/ros2/third_party/okvis2/config/realsense_D435i.yaml')
     cpu_script_path = os.path.expandvars('$HOME/ws_paramio/src/ros2/tools/system_monitor_pkg/system_monitor_pkg/cpu_monitor.py')
+    # Read from the source tree, not the installed share, so saving the config in
+    # RViz (Ctrl+S) writes straight back to the versioned file.
+    rviz_config = os.path.expandvars('$HOME/ws_paramio/src/ros2/autonomy_node/rviz/planning_drone.rviz')
 
     return launch.LaunchDescription([
 
-        # The only RViz in this stack is the one okvis's own launch file starts for
-        # its VIO mesh/trajectory view; both okvis launch XMLs gate that node on an
-        # `rviz` arg we simply never passed. Forward it so it can be turned off on
-        # the NUC, where RViz is a meaningful share of the CPU budget and the same
-        # data is already reachable over the Foxglove bridge from another machine.
-        # Defaults true so the launch behaves exactly as before unless asked:
+        # The stack's only RViz, with the planning view (VIO, map, planner, corridor,
+        # trajectory). It can be turned off on the NUC, where RViz is a meaningful
+        # share of the CPU budget and the same data is already reachable over the
+        # Foxglove bridge from another machine:
         #     ros2 launch autonomy_node autonomy_vision_launch.py rviz:=false
         launch.actions.DeclareLaunchArgument(
             'rviz',
             default_value='true',
-            description="Start okvis's RViz view. Set false to save CPU on the NUC."
+            description="Start RViz with the planning view. Set false to save CPU on the NUC."
+        ),
+
+        launch.actions.ExecuteProcess(
+            cmd=['rviz2', '-d', rviz_config],
+            condition=launch.conditions.IfCondition(launch.substitutions.LaunchConfiguration('rviz')),
+            output='screen'
         ),
 
         # Start the autonomy node (wraps the drone_core stack).
@@ -98,20 +106,14 @@ def generate_launch_description():
         # OKVIS logs through glog (the 'I0629 ...' lines: pose-init, RANSAC, large
         # reprojection error), which floods the terminal. GLOG_minloglevel=1 drops
         # its INFO chatter while keeping warnings/errors, so the planning logs stay
-        # readable. This launch also owns the stack's only rviz2 (for the VIO
-        # mesh/trajectory view), gated on the `rviz` launch argument above.
-        #
-        # The command is built as a LIST of substitution fragments rather than an
-        # f-string: `rviz` is a LaunchConfiguration resolved at launch time, not a
-        # Python value, so it cannot be interpolated into a string here.
+        # readable. Its own RViz is always off: the planning view started above
+        # already shows the VIO displays.
         launch.actions.ExecuteProcess(
             cmd=[
                 'bash', '-c',
-                [
-                    'GLOG_minloglevel=2 ros2 launch okvis okvis_node_subscriber.launch.xml ',
-                    f'config_filename:={config_file} ',
-                    'rviz:=', launch.substitutions.LaunchConfiguration('rviz'),
-                ]
+                'GLOG_minloglevel=2 ros2 launch okvis okvis_node_subscriber.launch.xml '
+                f'config_filename:={config_file} '
+                'rviz:=false'
             ],
             output='screen'
         ),
